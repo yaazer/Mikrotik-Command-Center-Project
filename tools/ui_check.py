@@ -348,6 +348,17 @@ def sc_update(d: Demo, c: Check) -> None:
         c(b.until("window.__marker === undefined && !!document.querySelector('#pairs')", 10),
           "different build: the tab reloads itself onto the new code, same page")
         c(b.eval("location.hash") == "#/traffic", "and stays on the page you were on")
+        # a dropped live feed reconnects without rebuilding the page: the globe and its particles survive
+        b.nav(d.url + "#/overview")
+        b.until("VIEWS.overview.map && VIEWS.overview.map.stats && VIEWS.overview.map.stats().parts > 0", 10)
+        b.eval("VIEWS.overview.map.__marker = 42")
+        b.eval("es.close(); connectStream()")
+        c(b.until("S.reconnects >= 1", 10), "the live feed reconnected")
+        b.wait(1.0)
+        c(b.eval("VIEWS.overview.map.__marker") == 42, "same globe after a reconnect (page not rebuilt)")
+        c(b.eval("VIEWS.overview.map.stats().parts") > 0, "its particles kept flying")
+        b.nav(d.url + "#/traffic")
+        b.until("!!document.querySelector('#pairs')", 8)
         # an MCC whose files were updated but which wasn't restarted says so, instead of looking broken
         c(not b.eval("!!document.querySelector('#update-bar')"), "no update bar when the server runs the current files")
         b.eval("checkSkew({ build: S.build, build_disk: 'ffffffffffffffff' })")

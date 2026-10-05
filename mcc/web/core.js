@@ -178,10 +178,18 @@ const Types = {
   focus: null,
   def(id) { return (S.categories || []).find((c) => c.id === id) || { id, label: id, hue: 0, c: 0 }; },
   label(id) { return this.def(id).label; },
+  // the map and globe ask for a colour per particle per frame: compute each once (cleared on a theme
+  // change or new category definitions), never per call
+  _cache: new Map(),
   color(id, alpha) {
+    const key = alpha === undefined ? id : id + "|" + alpha;
+    let c = this._cache.get(key);
+    if (c) return c;
     const d = this.def(id), light = document.documentElement.dataset.theme === "light";
     const l = d.c === 0 ? (light ? 0.55 : 0.62) : d.c < 0.05 ? (light ? 0.5 : 0.7) : (light ? 0.58 : 0.76);
-    return `oklch(${l} ${d.c} ${d.hue}${alpha === undefined ? "" : " / " + alpha})`;
+    c = `oklch(${l} ${d.c} ${d.hue}${alpha === undefined ? "" : " / " + alpha})`;
+    this._cache.set(key, c);
+    return c;
   },
   setBy(by) {
     this.by = by;
@@ -218,7 +226,8 @@ const Types = {
         <i style="background:${this.color(t.id)}"></i>${esc(t.label)}</button>`).join("") + '<span><i style="background:var(--crit)"></i>threat</span>';
   },
 };
-on("state", () => emit("types"));
+on("state", () => { Types._cache.clear(); emit("types"); });
+on("theme", () => Types._cache.clear());
 
 /* MCC restarted on different code? This tab is running the old JavaScript: reload it (the URL,
    and with it the page you're on, is kept). True when a reload is under way. */
@@ -604,9 +613,29 @@ function route() {
   main.innerHTML = "";
   current = { name: page, view: VIEWS[page], params };
   if (S.snap) current.view.render(main, params); else main.innerHTML = '<div class="empty"><b>Connecting to MCC…</b></div>';
+  rendered = !!S.snap;
   Theme.frameWatch();  // Auto rendering: notice a machine that draws slowly
 }
-on("state", () => { if (current) { const m = $("#main"); m.innerHTML = ""; current.view.render(m, current.params); } });
+/* "state" arrives on the first connect and again on every reconnect. The first time the page is
+   drawn; after that it is refreshed in place -- rebuilding it would throw away the globe and the
+   map, and every particle in flight with them (a visible restart on any connection hiccup). */
+let rendered = false;
+on("state", () => {
+  if (!current) return;
+  if (!rendered) {
+    const m = $("#main");
+    m.innerHTML = "";
+    current.view.render(m, current.params);
+    rendered = true;
+    return;
+  }
+  S.reconnects = (S.reconnects || 0) + 1;
+  const v = current.view;
+  if (v.tick) v.tick();
+  if (v.onThreat) v.onThreat();
+  if (v.onAction) v.onAction();
+  if (v.onLogs) v.onLogs([]);
+});
 on("tick", () => {
   renderHeader();
   if (current && current.view.tick && S.snap) current.view.tick();

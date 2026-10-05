@@ -1238,6 +1238,35 @@ def t_service_mode():
 
 
 @test
+def t_live_feed_backpressure():
+    """A burst of threat updates is coalesced into the 1 s tick, and a browser that can't keep up
+    loses stale ticks instead of being forced to resync (which rebuilt its page)."""
+    with Env() as e:
+        q = e.hub.bus.subscribe()
+        try:
+            now = time.time()
+            for i in range(300):  # a scan hammering one threat
+                e.hub.detector.raise_threat("scan", "203.0.113.200", "high", "Port scan", "x", now + i * 0.001,
+                                            subject="203.0.113.200", role="attacker", evidence=[(now, "probe {}".format(i))])
+            time.sleep(2.5)
+            events = []
+            while not q.empty():
+                events.append(q.get_nowait())
+            threat_events = [d for ev, d in events if ev == "threat" and d.get("key") == "203.0.113.200"]
+            ok(1 <= len(threat_events) <= 3, "300 updates -> {} coalesced threat events".format(len(threat_events)))
+            eq(threat_events[-1]["count"], 300, "the coalesced event carries the latest state")
+            # now stop reading: ticks pile up to the backlog limit, then are skipped -- no resync
+            time.sleep(14)
+            st = e.hub.status()["server"]
+            ok(st["ticks_skipped"] > 0, "stale ticks skipped for a slow client ({})".format(st))
+            eq(st["resyncs"], 0, "no forced resync")
+            ok(q.qsize() <= e.hub.bus.TICK_BACKLOG + 5, "backlog stays bounded ({})".format(q.qsize()))
+            ok(st["tick_ms"] > 0, "tick time is reported")
+        finally:
+            e.hub.bus.unsubscribe(q)
+
+
+@test
 def t_setup_offers_to_remove_old_flow_target():
     """Moving MCC (PC -> VM): the router still exports to the old address. The plan offers, unticked,
     to remove IPFIX targets on MCC's port pointing elsewhere."""

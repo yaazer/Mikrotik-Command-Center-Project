@@ -64,12 +64,14 @@ const Globe = (() => {
     let home = null, homeV = null, nodes = [], parts = [], hover = null, centred = false;
 
     function readColors() {
+      // (fonts too: getComputedStyle per label per frame is a style recalculation every time)
       const cs = getComputedStyle(document.documentElement);
       const g = (n) => cs.getPropertyValue(n).trim();
       colors = { in: g("--in"), out: g("--out"), crit: g("--crit"), med: g("--med"), text: g("--text"), muted: g("--muted"),
         faint: g("--faint"), line: g("--line"), soft: g("--line-soft"), accent: g("--accent"), bg: g("--bg"),
         panel: g("--panel-hi"), mono: g("--mono"), light: document.documentElement.dataset.theme === "light",
-        oceanA: g("--globe-ocean-a"), oceanB: g("--globe-ocean-b"), land: g("--globe-land") };
+        oceanA: g("--globe-ocean-a"), oceanB: g("--globe-ocean-b"), land: g("--globe-land"),
+        sans: getComputedStyle(document.body).fontFamily };
     }
     readColors();
     on("theme", () => { if (alive) { readColors(); resize(); } });
@@ -190,6 +192,7 @@ const Globe = (() => {
       if (!alive) return;
       if (!wrap.isConnected) { destroy(); return; }
       raf = requestAnimationFrame(frame);
+      if (last && now - last < 15) return;  // ~60 fps cap (high-refresh screens would draw 2x for nothing)
       const dt = Math.min(0.1, last ? (now - last) / 1000 : 0.016);
       last = now;
       if (!dragging) {
@@ -274,14 +277,25 @@ const Globe = (() => {
       if (LAND) {
         const ds = Math.max(0.9, Math.min(2.4, r / 230));
         ctx.fillStyle = colors.land || (colors.light ? "oklch(0.55 0.06 240)" : "oklch(0.80 0.08 215)");
+        // limb darkening in 6 brightness bands: one path and one fill per band instead of an alpha
+        // change and a fill per dot (5,400 dots, every frame)
+        const BANDS = 6;
+        for (let b = 0; b < BANDS; b++) bands[b].length = 0;
         for (let i = 0; i < LAND.length; i += 3) {
           const x1 = LAND[i] * cx0 - LAND[i + 2] * sx0;
           const z1 = LAND[i] * sx0 + LAND[i + 2] * cx0;
           const z2 = LAND[i + 1] * sy0 + z1 * cy0;
           if (z2 <= 0.02) continue;
           const y2 = LAND[i + 1] * cy0 - z1 * sy0;
-          ctx.globalAlpha = 0.18 + 0.55 * z2;
-          ctx.fillRect(cx + x1 * r - ds / 2, cy - y2 * r - ds / 2, ds, ds);
+          bands[Math.min(BANDS - 1, (z2 * BANDS) | 0)].push(cx + x1 * r - ds / 2, cy - y2 * r - ds / 2);
+        }
+        for (let b = 0; b < BANDS; b++) {
+          const pts = bands[b];
+          if (!pts.length) continue;
+          ctx.globalAlpha = 0.18 + 0.55 * ((b + 0.5) / BANDS);
+          ctx.beginPath();
+          for (let k = 0; k < pts.length; k += 2) ctx.rect(pts[k], pts[k + 1], ds, ds);
+          ctx.fill();
         }
         ctx.globalAlpha = 1;
       }
@@ -349,7 +363,7 @@ const Globe = (() => {
       // wherever it doesn't collide with one already drawn (otherwise it waits for hover)
       const placed = [];
       const free = (bx) => !placed.some((p) => bx[0] < p[0] + p[2] && bx[0] + bx[2] > p[0] && bx[1] < p[1] + p[3] && bx[1] + bx[3] > p[1]);
-      const font = getComputedStyle(document.body).fontFamily;
+      const font = colors.sans;
       let homeLabel = null;
       if (homeV) {
         const v = proj(homeV);
@@ -425,6 +439,7 @@ const Globe = (() => {
       ctx.stroke();
     }
     const latCache = {}, lonCache = {};
+    const bands = [[], [], [], [], [], []];  // reused land-dot buckets (see draw)
     function lineOfLat(lat) {
       if (!latCache[lat]) { latCache[lat] = []; for (let lon = -180; lon <= 180; lon += 4) latCache[lat].push(W(lat, lon)); }
       return latCache[lat];

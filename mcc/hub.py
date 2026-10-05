@@ -3,6 +3,7 @@ events out to every open console over server-sent events."""
 
 from __future__ import annotations
 
+import copy
 import ipaddress
 import queue
 import socket
@@ -32,6 +33,8 @@ class Broadcaster:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.clients: Set["queue.Queue[Tuple[str, Any]]"] = set()
+        self.ticks_skipped = 0
+        self.resyncs = 0
 
     def subscribe(self) -> "queue.Queue[Tuple[str, Any]]":
         q: "queue.Queue[Tuple[str, Any]]" = queue.Queue(maxsize=400)
@@ -43,14 +46,22 @@ class Broadcaster:
         with self.lock:
             self.clients.discard(q)
 
+    # a client this far behind gets no new ticks until it catches up: each tick is a full snapshot that
+    # supersedes the last, so dropping stale ones loses nothing -- forcing a resync would rebuild its page
+    TICK_BACKLOG = 8
+
     def publish(self, event: str, data: Any) -> None:
         with self.lock:
             dead = []
             for q in self.clients:
+                if event == "tick" and q.qsize() >= self.TICK_BACKLOG:
+                    self.ticks_skipped += 1
+                    continue
                 try:
                     q.put_nowait((event, data))
                 except queue.Full:
                     dead.append(q)  # a stalled browser tab; it reconnects and resyncs
+            self.resyncs += len(dead)
             for q in dead:
                 self.clients.discard(q)
                 try:
@@ -104,7 +115,12 @@ class Hub:
         self.started = time.time()
 
         self.traffic = TrafficModel(self.lan_nets, lambda: self.router_addrs, self.name_of)
-        self.detector = Detector(cfg, self.is_lan, self.data_dir, on_change=lambda t: self.publish("threat", t))
+        # Threat updates are coalesced and sent with the tick: during a scan or a busy torrent swarm a
+        # threat can be updated hundreds of times a second, and each update carries its evidence.
+        self._threat_dirty: Dict[str, Dict[str, Any]] = {}
+        self._dirty_lock = threading.Lock()
+        self.tick_ms = 0.0
+        self.detector = Detector(cfg, self.is_lan, self.data_dir, on_change=self._threat_changed)
         self.detector.on_suppressions = lambda lst: self.publish("ignore", lst)
         self.actions = ActionEngine(self, self.data_dir)
         self.setup = SetupPlanner(self, self.data_dir)
@@ -664,6 +680,11 @@ class Hub:
     # ------------------------------------------------------------------------------------------
     # snapshots
     # ------------------------------------------------------------------------------------------
+    def _threat_changed(self, t: Dict[str, Any]) -> None:
+        # its own lock: this runs inside the detector's lock, and snapshot() takes hub -> detector
+        with self._dirty_lock:
+            self._threat_dirty[t["id"]] = t
+
     def _tick_loop(self) -> None:
         while not self._stop.is_set():
             t0 = time.time()
@@ -673,12 +694,21 @@ class Hub:
                 self.detector.on_hosts(snap["traffic"]["hosts"], t0)
                 with self.lock:
                     logs, self._log_pending = self._log_pending, []
+                with self._dirty_lock:
+                    dirty, self._threat_dirty = self._threat_dirty, {}
+                if dirty:
+                    with self.detector.lock:  # a stable copy: the detector keeps updating the originals
+                        changed = [copy.deepcopy(t) for t in dirty.values()]
+                    for t in changed:
+                        self.publish("threat", t)
                 if logs:
                     self.publish("logs", logs[-300:])
                 self.publish("tick", snap)
             except Exception as e:
                 self.router_status["tasks"]["tick"] = "{}: {}".format(type(e).__name__, e)
-            self._stop.wait(max(0.1, 1.0 - (time.time() - t0)))
+            took = time.time() - t0
+            self.tick_ms = self.tick_ms * 0.8 + took * 1000 * 0.2
+            self._stop.wait(max(0.1, 1.0 - took))
 
     def flow_rate(self, now: float) -> float:
         recent = [n for t, n in self._flow_rate if now - t <= 60]
@@ -698,6 +728,9 @@ class Hub:
             "syslog": dict(self.syslog_col.status(), live=now - self.syslog_at < 120),
             "traffic_source": self.traffic.source(now),
             "mcc_ip": self.mcc_ip() if self.ros else "",
+            # how hard the server is working: a tick near 1000 ms means this machine can't keep up
+            "server": {"tick_ms": round(self.tick_ms, 1), "clients": len(self.bus.clients),
+                       "ticks_skipped": self.bus.ticks_skipped, "resyncs": self.bus.resyncs},
         }
 
     def snapshot(self, now: Optional[float] = None) -> Dict[str, Any]:

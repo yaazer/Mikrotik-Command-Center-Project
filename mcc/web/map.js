@@ -8,7 +8,7 @@
 function motionOffNote(ctx, x, y, colors) {
   ctx.save();
   ctx.globalAlpha = 1;
-  ctx.font = "600 11.5px " + getComputedStyle(document.body).fontFamily;
+  ctx.font = "600 11.5px " + (colors.sans || getComputedStyle(document.body).fontFamily);
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   const text = "Motion is off: traffic particles paused · Theme Studio › Motion";
@@ -40,11 +40,12 @@ const TrafficMap = (() => {
     const router = { id: "router", kind: "router", x: 0, y: 0, r: 26, alpha: 1, label: "router" };
 
     function readColors() {
+      // (fonts too: getComputedStyle per label per frame is a style recalculation every time)
       const cs = getComputedStyle(document.documentElement);
       const g = (n) => cs.getPropertyValue(n).trim();
       colors = { in: g("--in"), out: g("--out"), crit: g("--crit"), high: g("--high"), med: g("--med"), text: g("--text"),
         muted: g("--muted"), faint: g("--faint"), line: g("--line"), soft: g("--line-soft"), panel: g("--panel-hi"),
-        bg: g("--bg"), accent: g("--accent"), mono: g("--mono") };
+        bg: g("--bg"), accent: g("--accent"), mono: g("--mono"), sans: getComputedStyle(document.body).fontFamily };
     }
     function resize() {
       dpr = Math.min(lite() ? 1 : 2, window.devicePixelRatio || 1);
@@ -130,6 +131,7 @@ const TrafficMap = (() => {
       if (!alive) return;
       if (!wrap.isConnected) { destroy(); return; }
       raf = requestAnimationFrame(frame);
+      if (last && now - last < 15) return;  // ~60 fps cap (high-refresh screens would draw 2x for nothing)
       const dt = Math.min(0.1, last ? (now - last) / 1000 : 0.016);
       last = now;
       // ease nodes
@@ -253,7 +255,7 @@ const TrafficMap = (() => {
         const lx = n.x + (left ? -(n.r + 7) : n.r + 7);
         ctx.textAlign = left ? "right" : "left";
         ctx.textBaseline = "alphabetic";
-        ctx.font = "600 12px " + getComputedStyle(document.body).fontFamily;
+        ctx.font = "600 12px " + colors.sans;
         ctx.fillStyle = n.threat ? colors.crit : colors.text;
         const max = narrow() ? 13 : 26;
         const lbl = n.label.length > max ? n.label.slice(0, max - 1) + "…" : n.label;
@@ -279,7 +281,7 @@ const TrafficMap = (() => {
       ctx.lineWidth = 1.8;
       ctx.beginPath(); ctx.moveTo(router.x - 10, router.y - 2); ctx.lineTo(router.x - 3, router.y - 10); ctx.lineTo(router.x + 3, router.y - 4); ctx.lineTo(router.x + 10, router.y - 12); ctx.stroke();
       ctx.textAlign = "center";
-      ctx.font = "600 12px " + getComputedStyle(document.body).fontFamily;
+      ctx.font = "600 12px " + colors.sans;
       ctx.fillStyle = colors.text;
       ctx.fillText(router.label, router.x, router.y + rr + 16);
       ctx.font = "11px " + colors.mono;

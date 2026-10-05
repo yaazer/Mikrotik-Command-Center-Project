@@ -841,6 +841,8 @@ VIEWS.setup = {
       ${st.flows.last_error || st.syslog.last_error ? `<div class="callout bad" style="margin-top:10px">${esc(st.flows.last_error || st.syslog.last_error)}</div>` : ""}
       ${rej.length ? `<div class="callout warn" style="margin-top:10px"><b>Ignored packets from other senders.</b> MCC only accepts telemetry from the router. If one of these is your router's other address, accept it:
         ${rej.map(([ip, n]) => `<div class="btnrow" style="margin-top:6px"><span class="mono">${esc(ip)}</span><span class="faint">${n} packets</span><button class="btn sm" data-accept="${esc(ip)}">Accept from ${esc(ip)}</button></div>`).join("")}</div>` : ""}
+      ${st.server ? `<div class="note" style="margin-top:10px">Server load: each update takes <b>${st.server.tick_ms} ms</b> of its 1 s budget${st.server.tick_ms > 600 ? ' — <b style="color:var(--high)">this machine is struggling; give the VM more CPU</b>' : ""} ·
+        ${st.server.clients} open console${st.server.clients === 1 ? "" : "s"}${st.server.ticks_skipped ? ` · ${st.server.ticks_skipped} updates skipped for slow consoles` : ""}${st.server.resyncs ? ` · ${st.server.resyncs} resyncs` : ""}</div>` : ""}
       <div class="note" style="margin-top:10px">Telemetry source: <b>${esc(st.traffic_source)}</b>. Flow records arrive in batches (active flows every minute); live rates come from the connection table.</div>`;
     $$("[data-accept]", el).forEach((b) => (b.onclick = async () => {
       const cur = ((S.config.collectors || {}).accept_from || []).concat([b.dataset.accept]);
