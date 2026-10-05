@@ -38,7 +38,9 @@ const Globe = (() => {
     if (ring.length) COAST.push(ring);
   }
 
-  function create(wrap) {
+  function create(wrap, opts) {
+    // fadeS: how long a place that went quiet stays on the globe, fading out, before it's dropped
+    opts = Object.assign({ fadeS: 30 }, opts || {});
     geography();
     const cv = document.createElement("canvas");
     wrap.appendChild(cv);
@@ -86,31 +88,47 @@ const Globe = (() => {
       home = geo.home || null;
       homeV = home ? W(home.lat, home.lon) : null;
       if (home && !centred) { clat = Math.max(-60, Math.min(60, home.lat * 0.6)); clon = home.lon + 25; centred = true; }
-      const byLoc = new Map();
+      // Places are long-lived objects, updated in place: particles hold a reference to their place,
+      // so replacing the objects on every refresh would cut every particle off mid-flight.
+      const hk = homeKey();
+      const seen = new Set();
       for (const p of s.traffic.peers) {
         if (!p.geo) continue;
         const key = p.geo.lat.toFixed(1) + "," + p.geo.lon.toFixed(1);
-        let n = byLoc.get(key);
+        let n = places.get(key);
         if (!n) {
-          const old = nodes.find((x) => x.key === key);
-          n = { key, lat: p.geo.lat, lon: p.geo.lon, v: W(p.geo.lat, p.geo.lon), city: p.geo.city, country: p.geo.country,
-            cc: p.geo.cc, precision: p.geo.precision, peers: [], up: 0, down: 0, threat: "", blocked: 0,
-            acc: old ? old.acc : { in: 0, out: 0 }, arc: old && old.homeKey === homeKey() ? old.arc : null, homeKey: homeKey(),
-            alpha: old ? old.alpha : 0 };
-          byLoc.set(key, n);
+          n = { key, lat: p.geo.lat, lon: p.geo.lon, v: W(p.geo.lat, p.geo.lon), acc: { in: 0, out: 0 }, arc: null,
+            homeKey: null, alpha: 0 };
+          places.set(key, n);
+        }
+        if (!seen.has(key)) {
+          seen.add(key);
+          Object.assign(n, { city: p.geo.city, country: p.geo.country, cc: p.geo.cc, precision: p.geo.precision,
+            peers: [], up: 0, down: 0, threat: "", blocked: 0, gone: false, talpha: 1 });
         }
         n.peers.push(p);
         n.up += p.up; n.down += p.down;
         if (p.blocked) n.blocked++;
         if (p.threat && (TrafficMap.SEV_RANK[p.threat] || 0) > (TrafficMap.SEV_RANK[n.threat] || -1)) n.threat = p.threat;
       }
-      nodes = [...byLoc.values()].sort((a, b) => rate(b) - rate(a));
-      for (const n of nodes) {
+      for (const n of places.values()) {
+        if (!seen.has(n.key) && !n.gone) {
+          // Gone quiet: keep it on the globe for opts.fadeS seconds, fading out gradually (see frame()).
+          // It stops spawning particles; those already in flight finish their trip. Its last peers,
+          // direction and threat are kept so the fading point still says what it was.
+          Object.assign(n, { gone: true, goneAt: performance.now(), goneAlpha: Math.max(n.alpha, 0.05),
+            wasDown: n.down >= n.up, lastRate: rate(n), up: 0, down: 0 });
+        }
+        if (n.homeKey !== hk) {
+          n.arc = homeV ? arcPoints(homeV, n.v) : null;
+          n.homeKey = hk;
+        }
         n.peers.sort((a, b) => rate(b) - rate(a));
-        if (!n.arc && homeV) n.arc = arcPoints(homeV, n.v);
       }
+      nodes = [...places.values()].sort((a, b) => (a.gone - b.gone) || rate(b) - rate(a));
       overlays(geo);
     }
+    const places = new Map();
     const homeKey = () => (home ? home.lat + "," + home.lon : "");
 
     function arcPoints(a, b) {
@@ -178,7 +196,22 @@ const Globe = (() => {
           if (spin && Math.abs(vlon) < 1 && now - lastTouch > 2500) clon += 4 * dt;
         }
       }
-      for (const n of nodes) n.alpha += (1 - n.alpha) * Math.min(1, dt * 3);
+      let expired = false;
+      for (const n of nodes) {
+        if (n.gone) {
+          // cosine ease: holds near full brightness at first, then fades away smoothly to nothing
+          const e = (now - n.goneAt) / 1000 / opts.fadeS;
+          n.alpha = e >= 1 ? 0 : n.goneAlpha * 0.5 * (1 + Math.cos(Math.PI * e));
+          if (e >= 1) expired = true;
+        } else {
+          n.alpha += (1 - n.alpha) * Math.min(1, dt * 3);
+        }
+      }
+      if (expired) {
+        const keep = (n) => !(n.gone && n.alpha === 0 && !parts.some((p) => p.n === n));
+        nodes = nodes.filter(keep);
+        for (const [k, n] of places) if (!keep(n)) places.delete(k);
+      }
       spawn(dt);
       setView();
       draw(now / 1000);
@@ -200,7 +233,7 @@ const Globe = (() => {
         }
       }
       for (const p of parts) p.t += p.v * dt;
-      parts = parts.filter((p) => p.t < 1 && nodes.includes(p.n));
+      parts = parts.filter((p) => p.t < 1 && places.get(p.n.key) === p.n);
       if (parts.length > 1500) parts.splice(0, parts.length - 1500);
     }
 
@@ -251,7 +284,8 @@ const Globe = (() => {
       for (const n of nodes) {
         if (!n.arc) continue;
         const rel = !live || live === n;
-        const col = n.threat ? colors.crit : n.blocked === n.peers.length ? colors.faint : n.down >= n.up ? colors.in : colors.out;
+        const col = n.threat ? colors.crit : n.blocked === n.peers.length ? colors.faint
+          : (n.gone ? n.wasDown : n.down >= n.up) ? colors.in : colors.out;
         ctx.strokeStyle = col;
         ctx.globalAlpha = n.alpha * (rel ? (live ? 0.95 : 0.55) : 0.12);
         ctx.lineWidth = 0.8 + Math.min(3, Math.log10(1 + rate(n) / 2e4));
@@ -286,7 +320,7 @@ const Globe = (() => {
         n.screen = [x, y, rad];
         const col = n.threat ? colors.crit : n.precision === "country" ? colors.med : colors.accent;
         ctx.globalAlpha = n.alpha * (!live || live === n ? 1 : 0.35) * (0.4 + 0.6 * v[2]);
-        if (n.threat && !reduced) {
+        if (n.threat && !reduced && !n.gone) {
           const ph = (t * 1.1 + idx * 0.13) % 1;
           ctx.strokeStyle = colors.crit;
           ctx.lineWidth = 1.5;
@@ -397,7 +431,7 @@ const Globe = (() => {
       if (homeScreen && Math.hypot(mx - homeScreen[0], my - homeScreen[1]) < 9) return "home";
       let best = null, bd = 1e9;
       for (const n of nodes) {
-        if (!n.screen) continue;
+        if (!n.screen || n.alpha < 0.08) continue;
         const d = Math.hypot(mx - n.screen[0], my - n.screen[1]);
         if (d < n.screen[2] + 7 && d < bd) { best = n; bd = d; }
       }
@@ -430,8 +464,10 @@ const Globe = (() => {
       if (hover === "home") return tip.show(`<b>${esc((snap.router && snap.router.identity) || "Router")}</b>${esc(home.label || "")}<br><span class="muted">${esc(home.source || "")}</span>`, e.clientX, e.clientY);
       const n = hover;
       const where = [n.city, n.country].filter(Boolean).join(", ") || n.cc;
+      const quiet = n.gone ? Math.round((performance.now() - n.goneAt) / 1000) : 0;
       tip.show(`<b>${esc(where)}</b>${n.precision === "country" ? '<span class="muted">country-level location</span><br>' : ""}
-        <span class="in">↓ ${fmt.bps(n.down)}</span> · <span class="out">↑ ${fmt.bps(n.up)}</span>
+        ${n.gone ? `<span class="muted">No traffic now · quiet for ${quiet}s · fading out (was ${fmt.bps(n.lastRate)})</span><div class="faint" style="font-size:11px">last seen talking:</div>`
+          : `<span class="in">↓ ${fmt.bps(n.down)}</span> · <span class="out">↑ ${fmt.bps(n.up)}</span>`}
         ${n.peers.slice(0, 6).map((p) => `<div class="mono" style="font-size:11.5px">${esc(p.name || p.ip)} <span class="muted">${fmt.bps(p.up + p.down)}</span>${p.threat ? ' <span style="color:var(--crit)">⚠</span>' : ""}</div>`).join("")}
         ${n.peers.length > 6 ? `<span class="muted">+${n.peers.length - 6} more</span>` : ""}
         ${n.threat ? `<br><span style="color:var(--crit)">⚠ ${esc(n.threat)} threat</span>` : ""}`, e.clientX, e.clientY);
@@ -489,7 +525,10 @@ const Globe = (() => {
       ro.disconnect();
     }
     raf = requestAnimationFrame(frame);
-    return { update, destroy };
+    // for the UI checks: how far the oldest particle has travelled (0..1) and how many there are
+    const stats = () => ({ parts: parts.length, oldest: parts.reduce((m, p) => Math.max(m, p.t), 0), places: places.size,
+      list: [...places.values()].map((n) => ({ key: n.key, gone: !!n.gone, alpha: n.alpha })) });
+    return { update, destroy, stats };
   }
   return { create };
 })();

@@ -243,6 +243,13 @@ def sc_layout(d: Demo, c: Check) -> None:
         # globe / flow map switch
         c(b.until("document.querySelector('#live.globe-wrap canvas') !== null", 5), "overview shows the globe")
         c(b.until("/peers located/.test(document.querySelector('#map-src').innerText)", 8), "says how many peers are located")
+        # particles must survive the 1 s data refreshes and finish their trips (they used to restart)
+        b.until("VIEWS.overview.map.stats && VIEWS.overview.map.stats().parts > 5", 10)
+        oldest, end = 0.0, time.time() + 5
+        while time.time() < end:
+            oldest = max(oldest, b.eval("VIEWS.overview.map.stats().oldest") or 0)
+            time.sleep(0.1)
+        c(oldest > 0.8, "globe particles fly through data refreshes (furthest trip {:.0%})".format(oldest))
         click(b, '#live-kind [data-k="map"]')
         c(b.until("document.querySelector('#live.map-wrap canvas') !== null", 3), "switches to the flow map")
         click(b, '#live-kind [data-k="globe"]')
@@ -270,6 +277,59 @@ def sc_layout(d: Demo, c: Check) -> None:
         c(d.hub.geo.home([])["label"] == "London", "server uses it")
         click(b, "#h-clear")
         c(b.until("document.querySelector('#geo-panel').innerText.includes('Dallas')", 5), "and cleared back to the router's address")
+        c(not b.errors, "no console errors: {}".format(b.errors[:3]))
+
+
+GLOBE_FADE_JS = r"""
+(async () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const div = document.createElement('div');
+  div.className = 'globe-wrap';
+  div.style.cssText = 'position:fixed;left:0;top:0;width:500px;height:360px;z-index:99';
+  document.body.appendChild(div);
+  const g = Globe.create(div, { fadeS: 2 });
+  const peer = (ip, lat, lon) => ({ ip, name: '', up: 1e6, down: 5e6, conns: 1, hosts: ['192.168.88.10'], ports: [443],
+    blocked: false, threat: '', geo: { lat, lon, cc: 'XX', country: 'X', city: 'C' + ip, precision: 'city' } });
+  const snap = (peers) => ({ router: { identity: 'r' }, traffic: { peers },
+    geo: { home: { lat: 32.8, lon: -96.8, label: 'Home' }, source: 'demo', countries: [] } });
+  const NY = peer('1.1.1.1', 40.7, -74), LON = peer('2.2.2.2', 51.5, -0.1), PAR = peer('3.3.3.3', 48.9, 2.35);
+  const st = (key) => g.stats().list.find((n) => n.key === key);
+  const out = {};
+  g.update(snap([NY, LON, PAR]));
+  await sleep(700);
+  g.update(snap([NY]));                        // London and Paris go quiet
+  await sleep(500);
+  out.early = st('51.5,-0.1');                 // just gone: still clearly visible
+  g.update(snap([NY]));                        // a data refresh must not restart the fade
+  await sleep(500);
+  out.mid = st('51.5,-0.1');
+  g.update(snap([NY, PAR]));                   // Paris comes back before it faded out
+  await sleep(700);
+  out.paris = st('48.9,2.4') || st('48.9,2.3');
+  await sleep(600);
+  out.late = st('51.5,-0.1');                  // past fadeS: gone (or invisible while its last pips land)
+  await sleep(6000);
+  out.after = st('51.5,-0.1') || null;
+  out.places = g.stats().places;
+  g.destroy(); div.remove();
+  return out;
+})()
+"""
+
+
+def sc_globe_fade(d: Demo, c: Check) -> None:
+    with Browser(1200, 800) as b:
+        b.nav(d.url + "#/overview")
+        b.until("typeof Globe !== 'undefined' && !!document.querySelector('#kpis .kpi')", 10)
+        r = b.eval(GLOBE_FADE_JS) or {}
+        early, mid, late, paris = r.get("early") or {}, r.get("mid") or {}, r.get("late") or {}, r.get("paris") or {}
+        c(early.get("gone") and early.get("alpha", 0) > 0.6, "a place that goes quiet stays, still bright at first ({})".format(early))
+        c(mid.get("gone") and 0.05 < mid.get("alpha", 0) < early.get("alpha", 0),
+          "it fades gradually, and refreshes don't restart the fade ({} -> {})".format(early.get("alpha"), mid.get("alpha")))
+        c(not late or late.get("alpha", 1) == 0, "fully faded after the fade time ({})".format(late))
+        c(r.get("after") is None, "then dropped from the globe")
+        c(paris and not paris.get("gone") and paris.get("alpha", 0) > 0.5, "a place whose traffic resumes comes back ({})".format(paris))
+        c(r.get("places") == 2, "the live places remain ({} places)".format(r.get("places")))
         c(not b.errors, "no console errors: {}".format(b.errors[:3]))
 
 
@@ -317,7 +377,7 @@ def sc_light(d: Demo, c: Check) -> None:
         c(not b.errors, "no console errors: {}".format(b.errors[:3]))
 
 
-SCENARIOS = {"pages": sc_pages, "setup": sc_setup, "respond": sc_respond, "ignore": sc_ignore, "layout": sc_layout, "drawer": sc_drawer, "phone": sc_phone,
+SCENARIOS = {"pages": sc_pages, "setup": sc_setup, "respond": sc_respond, "ignore": sc_ignore, "layout": sc_layout, "globe-fade": sc_globe_fade, "drawer": sc_drawer, "phone": sc_phone,
              "light": sc_light}
 
 
