@@ -166,11 +166,18 @@ Every panel on every page is resizable:
 
 Layouts are saved in your browser, per page. On a phone, panels stack full-width.
 
-## The switch (SwOS)
+## The switch (RouterOS or SwOS)
 
-SwOS has no API. MCC reads the same status files the switch's own web page loads (`link.b`, `stats.b`, `sys.b`) over HTTP digest auth, and **never writes to it**.
+CRS switches can boot either RouterOS or SwOS. In Setup, the switch type defaults to **Auto-detect**. It works this out from how the switch refuses an unauthenticated request: RouterOS's REST API answers with JSON, and SwOS asks for a digest login. Either way, MCC **only reads the switch**.
 
-Those files are undocumented and their field names vary a little between SwOS releases. If a column reads "—", **Setup › Switch probe** shows the raw data, and `switch.fields` in `data/config.json` can remap a field.
+- **RouterOS:** MCC uses the same REST API as the router: per-port counters, link state, link rate (`/interface/ethernet/monitor`), model, version and temperature.
+  - Enable the `www` or `www-ssl` service.
+  - A user with `read` and `rest-api` policies is enough.
+- **SwOS:** SwOS has no API, so MCC reads the status files the switch's own web page loads (`link.b`, `stats.b`, `sys.b`) over HTTP digest auth.
+  - Those files are undocumented, and their field names vary a little between SwOS releases.
+  - If a column reads "—", **Setup › Switch probe** shows the raw data, and `switch.fields` in `data/config.json` can remap a field.
+
+If you force a type that doesn't match the switch, MCC says so rather than showing an empty port list.
 
 To act on a switch port, disable the router port facing it, or quarantine the hosts behind it.
 

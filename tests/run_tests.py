@@ -891,6 +891,52 @@ def t_switch_polling():
            "switch port link loss detected")
 
 
+@test
+def t_switch_os_detection():
+    """CRS switches run RouterOS or SwOS. Auto-detect must pick the right reader, and a switch that
+    serves no SwOS files must be an error, not 'connected' with no ports (the reported bug)."""
+    from mcc.rosswitch import detect_os
+    with Env() as e:
+        sw_world = sim.World(seed=9, script=False).start()
+        ros_switch = sim.serve(sim.make_router(sw_world))  # a "switch" running RouterOS
+        try:
+            ros_host = "127.0.0.1:{}".format(ros_switch.server_address[1])
+            swos_host = "127.0.0.1:{}".format(e.switch.server_address[1])
+            eq(detect_os(ros_host), "routeros", "RouterOS answers REST with a JSON 401")
+            eq(detect_os(swos_host), "swos", "SwOS asks for digest auth")
+            eq(detect_os("127.0.0.1:1"), "unknown", "nothing listening")
+            res = e.hub.connect_switch(ros_host, "admin", "demo")
+            eq(res["kind"], "routeros", "auto-detected RouterOS")
+            eq(e.hub.switch_status["kind"], "routeros", "status says RouterOS")
+            names = [p["name"] for p in e.hub.switch_ports]
+            eq(names, ["ether1", "ether2", "ether3", "ether4", "ether5", "sfp-sfpplus1"], "physical ports only, no bridge")
+            sfp = e.hub.switch_ports[-1]
+            eq((sfp["link"], sfp["speed"]), (True, "10G"), "link and rate from ethernet/monitor")
+            ok(wait_for(lambda: any(p.get("rx_bps") for p in e.hub.switch_ports), 15), "port rates computed from counters")
+            ok("RouterOS" in e.hub.switch_sys["version"], "model/version from the switch")
+            probe = e.hub.swos.probe()
+            ok(probe["os"] == "routeros" and isinstance(probe["/interface"], list), "probe shows the raw REST data")
+            try:
+                e.hub.connect_switch(ros_host, "admin", "wrong")
+                raise AssertionError("bad switch password accepted")
+            except SwOSError as err:
+                ok("RouterOS" in str(err) and "refused" in str(err), "clear auth error: {}".format(err))
+            try:
+                e.hub.connect_switch(ros_host, "admin", "demo", kind="swos")
+                raise AssertionError("forced SwOS on a RouterOS switch accepted")
+            except SwOSError as err:
+                ok("link.b" in str(err) and "RouterOS" in str(err), "missing SwOS files explained: {}".format(err))
+            try:
+                e.hub.connect_switch("127.0.0.1:1", "admin", "")
+                raise AssertionError("unreachable switch accepted")
+            except SwOSError as err:
+                ok("couldn't reach" in str(err), "unreachable explained")
+            eq(e.hub.connect_switch(swos_host, "admin", "")["kind"], "swos", "SwOS still works")
+        finally:
+            ros_switch.shutdown()
+            sw_world.stop()
+
+
 # ============================================================================================
 # web server
 # ============================================================================================

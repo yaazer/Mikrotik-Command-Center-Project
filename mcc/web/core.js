@@ -200,7 +200,7 @@ function renderHeader() {
     chip("Syslog", st.syslog.live ? "ok" : st.syslog.packets ? "warn" : "",
       st.syslog.live ? `receiving on UDP ${st.syslog.port}` : "No syslog arriving — MCC reads the router's memory log instead", "#/setup"),
     chip("Switch", st.switch.state === "ok" ? "ok" : st.switch.state === "off" ? "" : "bad",
-      st.switch.state === "ok" ? "SwOS polling OK" : (st.switch.error || "no switch connected"), "#/interfaces"),
+      st.switch.state === "ok" ? `${st.switch.kind === "routeros" ? "RouterOS REST" : "SwOS"} polling OK` : (st.switch.error || "no switch connected"), "#/interfaces"),
   ];
   $("#chips").innerHTML = chips.join("");
   const lvl = s.level || "calm";

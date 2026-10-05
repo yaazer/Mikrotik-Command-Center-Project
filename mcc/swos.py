@@ -141,6 +141,10 @@ class SwOS:
                 return parse_js(r.read().decode("utf-8", "replace"))
         except urllib.error.HTTPError as e:
             if e.code == 401:
+                if "digest" not in (e.headers.get("WWW-Authenticate") or "").lower():
+                    # SwOS always challenges for digest login; anything else is another OS
+                    raise SwOSError("this isn't a SwOS web UI (no SwOS login, no link.b). If the switch runs "
+                                    "RouterOS, choose RouterOS (or Auto-detect) as the switch type in Setup.")
                 raise SwOSError("the switch refused the user name or password")
             if e.code == 404:
                 return None
@@ -166,7 +170,10 @@ class SwOS:
         return out
 
     def read(self) -> Dict[str, Any]:
-        link = self._get("link.b") or {}
+        link = self._get("link.b")
+        if not isinstance(link, dict):
+            raise SwOSError("the switch has no SwOS status file (link.b). If it runs RouterOS, choose RouterOS "
+                            "(or Auto-detect) as the switch type in Setup.")
         try:
             stats = self._get("stats.b") or {}
         except SwOSError:

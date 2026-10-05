@@ -262,7 +262,7 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840) -> Tuple[Se
             if not s.get("host"):
                 raise ApiError(400, "switch address required")
             return hub.connect_switch(str(s["host"]), str(s.get("user") or "admin"), str(s.get("password") or ""),
-                                      str(s.get("scheme") or "http"))
+                                      str(s.get("scheme") or "http"), str(s.get("kind") or "auto"))
         if path == "/api/disconnect":
             if b.get("what") == "switch":
                 hub.disconnect_switch()

@@ -13,7 +13,8 @@ DATA_DIR = ROOT / "data"
 
 DEFAULTS: Dict[str, Any] = {
     "router": {"host": "", "scheme": "https", "port": 0, "user": "", "verify_tls": False, "pinned_sha256": ""},
-    "switch": {"host": "", "scheme": "http", "user": "admin", "fields": {}},
+    # kind: auto (detect) | swos | routeros -- CRS switches can boot either OS
+    "switch": {"host": "", "scheme": "http", "user": "admin", "kind": "auto", "fields": {}},
     "ui": {"bind": "127.0.0.1", "port": 8840},
     "collectors": {
         "bind": "0.0.0.0",

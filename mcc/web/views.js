@@ -6,6 +6,11 @@ const SEV_ORDER = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
 const STATUS_PILL = { open: "red", acknowledged: "amber", mitigated: "green", quiet: "", resolved: "", ignored: "blue" };
 const IGNORE_FOR = { "24h": "24 hours", "7d": "7 days", "30d": "30 days", "0": "Forever" };
 
+function switchKindLabel() {
+  const k = S.snap && S.snap.status.switch.kind;
+  return k === "routeros" ? "RouterOS" : k === "swos" ? "SwOS" : "switch";
+}
+
 function connected() { return S.snap && S.snap.status.router.state === "ok"; }
 
 function connectBanner() {
@@ -55,7 +60,8 @@ function bindRows(root) {
 function portsHtml(ports) {
   if (!ports || !ports.length) {
     const sw = S.snap.status.switch;
-    return `<div class="empty"><b>${sw.state === "error" ? "Switch unreachable" : "No switch connected"}</b>${sw.error ? esc(sw.error) : 'Add your SwOS switch in <a href="#/setup">Setup</a> (read-only).'}</div>`;
+    const title = sw.state === "error" ? "Switch unreachable" : sw.state === "ok" ? "Switch connected — waiting for port data" : "No switch connected";
+    return `<div class="empty"><b>${title}</b>${sw.error ? esc(sw.error) : sw.state === "ok" ? 'If this doesn\'t fill in, open <a href="#/setup">Setup › Switch probe</a>.' : 'Add your switch in <a href="#/setup">Setup</a> (RouterOS or SwOS, read-only).'}</div>`;
   }
   const cap = (sp) => ({ "10G": 1e10, "1G": 1e9, "2.5G": 2.5e9, "5G": 5e9, "100M": 1e8, "10M": 1e7, "25G": 2.5e10 }[sp] || 1e9);
   const threats = [...S.threats.values()].filter((t) => t.rule === "link_down" && t.status === "open" && t.role === "switch").map((t) => t.target);
@@ -254,7 +260,7 @@ VIEWS.overview = {
     $("#ports").innerHTML = portsHtml(s.switch.ports);
     $$("[data-port]", $("#ports")).forEach((p) => (p.onclick = () => go("interfaces", { port: p.dataset.port })));
     const sys = s.switch.sys || {};
-    $("#sw-id").textContent = [sys.identity, sys.model, sys.version && "SwOS " + sys.version].filter(Boolean).join(" · ");
+    $("#sw-id").textContent = [sys.identity, sys.model, sys.version && (sys.os === "routeros" ? sys.version : "SwOS " + sys.version)].filter(Boolean).join(" · ");
     $("#talkers").innerHTML = hostsTable(tr.hosts, "host", 10);
     $("#dests").innerHTML = hostsTable(tr.peers, "peer", 10);
     $("#svcs").innerHTML = servicesHtml(tr.services);
@@ -542,8 +548,8 @@ VIEWS.interfaces = {
       <section class="panel s12"><header><h2 id="ch-title">Select an interface</h2><span class="grow"></span><span class="legend"><span><i style="background:var(--in)"></i>in</span><span><i style="background:var(--out)"></i>out</span></span></header>
         <div class="body"><div class="chart"><canvas id="if-chart"></canvas></div></div></section>
       <section class="panel s7"><header><h2>Router interfaces</h2></header><div class="body flush scroll" id="ifs"></div></section>
-      <section class="panel s5"><header><h2>Switch ports</h2><span class="grow"></span><span class="hint">SwOS · read-only</span></header><div class="body" id="ports"></div>
-        <div class="body note" style="padding-top:0">SwOS has no API, so MCC can watch the switch but not change it. To act on a switch port, disable the router port facing it, or quarantine the hosts behind it.</div></section>
+      <section class="panel s5"><header><h2>Switch ports</h2><span class="grow"></span><span class="hint">${switchKindLabel()} · read-only</span></header><div class="body" id="ports"></div>
+        <div class="body note" style="padding-top:0">MCC watches the switch but doesn't change it. To act on a switch port, disable the router port facing it, or quarantine the hosts behind it.</div></section>
     </div>`;
     this.tick();
   },
@@ -644,15 +650,18 @@ VIEWS.setup = {
 /ip service set www-ssl disabled=no          # needs a certificate; or use www (HTTP) on a trusted LAN only</pre>
           It can read everything and change firewall/interface settings — what MCC needs to act — but can't log in interactively, reboot or manage users. Restricting it to this PC's address limits damage if the password leaks.</details>
       </div></section>
-      <section class="panel s6"><header><h2>Switch (SwOS)</h2><span class="grow"></span>${this.stateChip(st.switch.state === "off" ? "disconnected" : st.switch.state)}</header><div class="body">
+      <section class="panel s6"><header><h2>Switch${st.switch.kind ? " (" + switchKindLabel() + ")" : ""}</h2><span class="grow"></span>${this.stateChip(st.switch.state === "off" ? "disconnected" : st.switch.state)}</header><div class="body">
         <form class="form" id="f-switch" autocomplete="off">
           <label for="s-host">Address</label><input type="text" id="s-host" value="${esc(sw.host || "")}" placeholder="192.168.88.2" required>
+          <label for="s-kind">Runs</label><select id="s-kind">${[["auto", "Auto-detect"], ["routeros", "RouterOS (REST API)"], ["swos", "SwOS"]]
+            .map(([k, l]) => `<option value="${k}" ${(sw.kind || "auto") === k ? "selected" : ""}>${l}</option>`).join("")}</select>
+          <label for="s-scheme">Protocol</label><select id="s-scheme"><option value="http" ${sw.scheme !== "https" ? "selected" : ""}>HTTP</option><option value="https" ${sw.scheme === "https" ? "selected" : ""}>HTTPS (RouterOS www-ssl)</option></select>
           <label for="s-user">User</label><input type="text" id="s-user" value="${esc(sw.user || "admin")}">
           <label for="s-pass">Password</label><input type="password" id="s-pass" placeholder="kept in memory only">
           <span></span><div class="btnrow"><button class="btn primary" type="submit">Connect</button>${st.switch.state === "ok" ? '<button class="btn" type="button" id="s-off">Disconnect</button>' : ""}<button class="btn ghost" type="button" id="s-probe">Switch probe</button></div>
         </form>
         ${st.switch.error ? `<div class="callout bad" style="margin-top:12px">${esc(st.switch.error)}</div>` : ""}
-        <div class="note" style="margin-top:12px">SwOS has no API; MCC reads the same status files its web page uses (read-only). If a column shows "—", open <b>Switch probe</b> to see the raw fields.</div>
+        <div class="note" style="margin-top:12px">CRS switches can run RouterOS or SwOS; Auto-detect works out which. On RouterOS MCC uses the REST API (enable the <span class="mono">www</span> or <span class="mono">www-ssl</span> service; a read-only user is enough). SwOS has no API, so MCC reads the status files its web page uses. Either way MCC only reads. If a column shows "—", open <b>Switch probe</b> to see the raw data.</div>
         <pre class="evidence hidden" id="probe"></pre>
       </div></section>
 
@@ -711,9 +720,10 @@ VIEWS.setup = {
     $("#f-switch", m).onsubmit = async (e) => {
       e.preventDefault();
       try {
-        const res = await api.post("/api/connect/switch", { switch: { host: $("#s-host").value, user: $("#s-user").value, password: $("#s-pass").value } });
+        const res = await api.post("/api/connect/switch", { switch: { host: $("#s-host").value, user: $("#s-user").value, password: $("#s-pass").value,
+          kind: $("#s-kind").value, scheme: $("#s-scheme").value } });
         $("#s-pass").value = "";
-        toast("Switch connected", `${res.sys.model || ""} · ${res.ports} ports`, { good: true });
+        toast("Switch connected", `${res.kind === "routeros" ? "RouterOS" : "SwOS"} · ${res.sys.model || ""} · ${res.ports} ports`, { good: true });
         S.config = (await api.get("/api/state")).config;
         setTimeout(() => this.render($("#main")), 300);
       } catch (err) { toast("Couldn't reach the switch", err.message, { bad: true, ms: 12000 }); }

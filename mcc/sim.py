@@ -752,6 +752,15 @@ def make_router(world: World, user: str = "admin", password: str = "demo", bind:
             if path == "/system/health":
                 return 200, world.health()
             return 200, dict(world.single[path])
+        if method == "POST" and path == "/interface/ethernet/monitor":
+            names = str(body.get("numbers", "")).split(",")
+            out = []
+            for r in world.tables["/interface"]:
+                if r["name"] in names:
+                    up = r["running"] == "true" and r["disabled"] == "false"
+                    out.append({"name": r["name"], "status": "link-ok" if up else "no-link",
+                                **({"rate": "10Gbps" if r["name"].startswith("sfp") else "1Gbps", "full-duplex": "true"} if up else {})})
+            return 200, out
         if method == "POST":
             menu, _, cmd = path.rpartition("/")
             if cmd == "set" and menu in world.single:

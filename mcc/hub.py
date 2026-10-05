@@ -19,6 +19,7 @@ from .detect import RULES, Detector
 from .geo import Geo
 from .routeros import CertificateChanged, RouterOS, RouterOSError, local_ip_toward
 from .setup_plan import SetupPlanner
+from .rosswitch import RouterOSSwitch, detect_os
 from .swos import SwOS, SwOSError
 from .traffic import TrafficModel
 from .util import in_networks, is_local_scope, ip_obj, parse_duration, parse_networks, to_bool, to_float, to_int
@@ -204,20 +205,45 @@ class Hub:
                 r.close()
         self.publish("status", self.status())
 
-    def connect_switch(self, host: str, user: str, password: str, scheme: str = "http") -> Dict[str, Any]:
-        sw = SwOS(host, user or "admin", password or "", scheme, fields=self.cfg.get("switch.fields") or {})
-        data = sw.read()  # raises SwOSError
-        self.cfg.update({"switch": {"host": host, "user": user or "admin", "scheme": scheme}})
-        self.swos = sw
+    def connect_switch(self, host: str, user: str, password: str, scheme: str = "http",
+                       kind: str = "auto") -> Dict[str, Any]:
+        """kind: 'auto' (detect), 'swos' or 'routeros'. CRS switches can run either OS."""
+        host = host.strip()
+        if kind not in ("auto", "swos", "routeros"):
+            raise SwOSError("switch type must be auto, swos or routeros")
+        detected = detect_os(host, scheme) if kind == "auto" else kind
+        if detected == "unknown":
+            raise SwOSError("couldn't reach {} over {}, or it isn't a MikroTik switch (no RouterOS REST API "
+                            "and no SwOS web UI answered)".format(host, scheme.upper()))
+        if detected == "routeros":
+            sw: Any = RouterOSSwitch(host, user or "admin", password or "", scheme)
+            try:
+                data = sw.read()
+            except RouterOSError as e:
+                sw.close()
+                raise SwOSError("the switch runs RouterOS; its REST API said: {}{}".format(
+                    e, " (the www or www-ssl service must be enabled, and the user needs the rest-api policy)"
+                    if e.status in (0, 403) else ""))
+        else:
+            sw = SwOS(host, user or "admin", password or "", scheme, fields=self.cfg.get("switch.fields") or {})
+            data = sw.read()  # raises SwOSError
+        if not data["ports"]:
+            raise SwOSError("connected to the switch but found no ports in its data -- open Switch probe")
+        self.cfg.update({"switch": {"host": host, "user": user or "admin", "scheme": scheme, "kind": kind}})
+        old, self.swos = self.swos, sw
+        if old is not None and hasattr(old, "close"):
+            old.close()
         self._sw_prev.clear()
-        self.switch_status.update({"state": "ok", "error": "", "last_ok": time.time()})
+        self.switch_status.update({"state": "ok", "error": "", "last_ok": time.time(), "kind": detected})
         self._ingest_switch(data, time.time())
         self.publish("status", self.status())
-        return {"ports": len(data["ports"]), "sys": data["sys"]}
+        return {"ports": len(data["ports"]), "sys": data["sys"], "kind": detected}
 
     def disconnect_switch(self) -> None:
-        self.swos = None
-        self.switch_status.update({"state": "off", "error": ""})
+        old, self.swos = self.swos, None
+        if old is not None and hasattr(old, "close"):
+            old.close()
+        self.switch_status.update({"state": "off", "error": "", "kind": ""})
         self.switch_ports = []
 
     # ------------------------------------------------------------------------------------------
@@ -604,7 +630,7 @@ class Hub:
                 data = sw.read()
                 self._ingest_switch(data, now)
                 self.switch_status.update({"state": "ok", "error": "", "last_ok": now})
-            except SwOSError as e:
+            except (SwOSError, RouterOSError) as e:
                 self.switch_status.update({"state": "error", "error": str(e)})
             except Exception as e:
                 self.switch_status.update({"state": "error", "error": "{}: {}".format(type(e).__name__, e)})
