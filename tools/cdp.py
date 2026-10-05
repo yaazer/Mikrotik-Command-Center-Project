@@ -179,7 +179,10 @@ class Browser:
     def until(self, js: str, timeout: float = 10.0) -> Any:
         end = time.time() + timeout
         while time.time() < end:
-            v = self.eval(js)
+            try:
+                v = self.eval(js)
+            except RuntimeError:
+                v = None  # the page is still loading (its scripts aren't defined yet): not yet
             if v:
                 return v
             time.sleep(0.2)

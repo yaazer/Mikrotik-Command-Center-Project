@@ -4,6 +4,24 @@
    their link dashed. Hover for details, click to open the host. */
 "use strict";
 
+/* Shared by the flow map and the globe: say why nothing is moving, rather than look frozen. */
+function motionOffNote(ctx, x, y, colors) {
+  ctx.save();
+  ctx.globalAlpha = 1;
+  ctx.font = "600 11.5px " + getComputedStyle(document.body).fontFamily;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const text = "Motion is off: traffic particles paused · Theme Studio › Motion";
+  const tw = ctx.measureText(text).width;
+  ctx.fillStyle = colors.bg || "#000";
+  ctx.globalAlpha = 0.8;
+  ctx.fillRect(x - tw / 2 - 10, y - 11, tw + 20, 22);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = colors.muted || "#999";
+  ctx.fillText(text, x, y);
+  ctx.restore();
+}
+
 const TrafficMap = (() => {
   const SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1, info: 0, "": -1 };
 
@@ -12,7 +30,10 @@ const TrafficMap = (() => {
     const cv = document.createElement("canvas");
     wrap.appendChild(cv);
     const ctx = cv.getContext("2d");
-    const reduced = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+    // Theme Studio: Motion (full / calm / off) and Rendering (Lite draws at 1x resolution)
+    const motion = () => (window.Theme ? Theme.motion()
+      : (window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches ? "off" : "full"));
+    const lite = () => !!(window.Theme && Theme.isLite());
     const nodes = new Map();
     let parts = [];
     let W = 0, H = 0, dpr = 1, colors = {}, hover = null, snap = null, raf = 0, last = 0, alive = true;
@@ -26,7 +47,7 @@ const TrafficMap = (() => {
         bg: g("--bg"), accent: g("--accent"), mono: g("--mono") };
     }
     function resize() {
-      dpr = Math.min(2, window.devicePixelRatio || 1);
+      dpr = Math.min(lite() ? 1 : 2, window.devicePixelRatio || 1);
       W = wrap.clientWidth; H = wrap.clientHeight;
       cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
       layout(true);
@@ -34,7 +55,7 @@ const TrafficMap = (() => {
     const ro = new ResizeObserver(resize);
     ro.observe(wrap);
     readColors();
-    on("theme", readColors);
+    on("theme", () => { if (alive) { readColors(); resize(); } });
 
     const narrow = () => W < 640;  // phones: nodes hug the edges, labels point inward
     const rate = (n) => (n.up || 0) + (n.down || 0);
@@ -61,7 +82,8 @@ const TrafficMap = (() => {
           nodes.set(id, n);
         }
         Object.assign(n, { label: x.name || x.ip, name: x.name, up: x.up, down: x.down, conns: x.conns, threat: x.threat || "",
-          blocked: !!x.blocked, peers: x.peers, hosts: x.hosts, ports: x.ports, talpha: 1, dead: false });
+          blocked: !!x.blocked, peers: x.peers, hosts: x.hosts, ports: x.ports, talpha: 1, dead: false,
+          cats: x.cats || {}, cat: x.cat || "other" });
         n.tr = radius(rate(n));
       };
       peers.forEach((p) => add("peer", p));
@@ -122,7 +144,8 @@ const TrafficMap = (() => {
     }
 
     function spawn(dt) {
-      const density = reduced ? 0.35 : 1;
+      const m = motion();
+      const density = m === "off" ? 0 : m === "calm" ? 0.45 : 1;
       for (const n of nodes.values()) {
         if (n.dead || n.blocked) continue;
         for (const dir of ["in", "out"]) {
@@ -134,7 +157,8 @@ const TrafficMap = (() => {
             n.acc[dir] -= 1;
             // toward the router for peer downloads and host uploads; away from it otherwise
             const toward = (n.kind === "peer") === (dir === "in");
-            parts.push({ n, dir, toward, t: 0, v: 0.38 + Math.random() * 0.22, s: 1.3 + Math.min(2.2, Math.log10(1 + bps / 1e5)) });
+            parts.push({ n, dir, toward, t: 0, v: 0.38 + Math.random() * 0.22, s: 1.3 + Math.min(2.2, Math.log10(1 + bps / 1e5)),
+              cat: Types.pick(n.cats) });
           }
         }
       }
@@ -142,6 +166,10 @@ const TrafficMap = (() => {
       parts = parts.filter((p) => p.t < 1 && nodes.has(p.n.id) && !p.n.blocked);
       if (parts.length > 2500) parts.splice(0, parts.length - 2500);
     }
+
+    // a type is focused (legend click): everything that doesn't carry it steps back
+    const focusOK = (n) => !Types.focus || Types.by !== "type" || !!(n.cats && n.cats[Types.focus]);
+    const byType = () => Types.by === "type";
 
     function related(n) {
       if (!hover || hover === router) return true;
@@ -170,8 +198,8 @@ const TrafficMap = (() => {
         const rel = related(n);
         const c = curve(n, 0);
         const w = 0.6 + Math.min(4, Math.log10(1 + rate(n) / 1e4));
-        ctx.globalAlpha = n.alpha * (rel ? (hover && hover !== router ? 0.75 : 0.32) : 0.08);
-        ctx.strokeStyle = n.threat ? colors.crit : n.blocked ? colors.faint : colors.line;
+        ctx.globalAlpha = n.alpha * (rel && focusOK(n) ? (hover && hover !== router ? 0.75 : byType() ? 0.42 : 0.32) : 0.08);
+        ctx.strokeStyle = n.threat ? colors.crit : n.blocked ? colors.faint : byType() ? Types.color(n.cat) : colors.line;
         ctx.lineWidth = w;
         ctx.setLineDash(n.blocked ? [4, 5] : []);
         ctx.beginPath(); ctx.moveTo(c[0], c[1]); ctx.quadraticCurveTo(c[2], c[3], c[4], c[5]); ctx.stroke();
@@ -186,19 +214,21 @@ const TrafficMap = (() => {
         const tt = p.toward ? p.t : 1 - p.t;
         const [x, y] = at(c, tt);
         const fade = Math.min(1, p.t * 6, (1 - p.t) * 6);
-        ctx.globalAlpha = n.alpha * fade * (related(n) ? 0.95 : 0.15);
-        ctx.fillStyle = n.threat && p.dir === "out" && n.kind === "host" ? colors.crit : p.dir === "in" ? colors.in : colors.out;
+        const on = related(n) && (!Types.focus || !byType() || p.cat === Types.focus);
+        ctx.globalAlpha = n.alpha * fade * (on ? 0.95 : 0.1);
+        ctx.fillStyle = byType() ? Types.color(p.cat)
+          : n.threat && p.dir === "out" && n.kind === "host" ? colors.crit : p.dir === "in" ? colors.in : colors.out;
         ctx.beginPath(); ctx.arc(x, y, p.s, 0, Math.PI * 2); ctx.fill();
       }
       ctx.globalCompositeOperation = "source-over";
 
       // nodes
       for (const n of nodes.values()) {
-        const rel = related(n);
+        const rel = related(n) && focusOK(n);
         ctx.globalAlpha = n.alpha * (rel ? 1 : 0.3);
         const col = n.threat ? (n.threat === "critical" || n.threat === "high" ? colors.crit : colors.med)
-          : n.blocked ? colors.faint : n.kind === "peer" ? colors.in : colors.accent;
-        if (n.threat && !reduced) {
+          : n.blocked ? colors.faint : byType() ? Types.color(n.cat) : n.kind === "peer" ? colors.in : colors.accent;
+        if (n.threat && motion() !== "off") {
           const ph = (t * 1.2) % 1;
           ctx.strokeStyle = colors.crit;
           ctx.globalAlpha = n.alpha * (1 - ph) * 0.8;
@@ -258,6 +288,7 @@ const TrafficMap = (() => {
       ctx.fillText("↓ " + fmt.bps(router.down || 0), router.x - sep, router.y + rr + 31);
       ctx.fillStyle = colors.out;
       ctx.fillText("↑ " + fmt.bps(router.up || 0), router.x + sep, router.y + rr + 31 + dy);
+      if (motion() === "off") motionOffNote(ctx, W / 2, H - 14, colors);
     }
 
     function hit(x, y) {
@@ -283,6 +314,7 @@ const TrafficMap = (() => {
         ? `talking to ${(n.hosts || []).length} LAN host${(n.hosts || []).length === 1 ? "" : "s"}${n.ports && n.ports.length ? " · ports " + n.ports.join(", ") : ""}`
         : `${n.peers || 0} Internet peer${n.peers === 1 ? "" : "s"} · ${n.conns || 0} conns`;
       tip.show(`<b>${esc(n.label)}</b>${n.name ? `<span class="mono muted">${esc(n.ip)}</span><br>` : ""}<span class="in">↓ ${fmt.bps(n.down)}</span> · <span class="out">↑ ${fmt.bps(n.up)}</span><br><span class="muted">${esc(extra)}</span>` +
+        Types.mixHtml(n.cats) +
         (n.threat ? `<br><span style="color:var(--crit)">⚠ ${esc(n.threat)} threat</span>` : "") + (n.blocked ? '<br><span class="muted">blocked by MCC</span>' : ""), e.clientX, e.clientY);
     });
     cv.addEventListener("mouseleave", () => { hover = null; tip.hide(); });

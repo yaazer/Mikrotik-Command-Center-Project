@@ -156,6 +156,42 @@ Locations come from a **local** MaxMind-format (`.mmdb`) database. Your traffic'
 
 The globe's coastlines and land come from Natural Earth (public domain), bundled in `mcc/web/world.js` (43 KB). To regenerate it, run `tools/build_world.py`.
 
+## Traffic types
+
+Every conversation is classified into one of these types:
+- video & music streaming;
+- BitTorrent/P2P;
+- gaming;
+- voice & video calls;
+- social & messaging;
+- cloud storage & backup;
+- software updates;
+- smart home/IoT;
+- VPN & remote access;
+- email;
+- web;
+- DNS & time;
+- other.
+
+**Where you see them:**
+- **Colour by type:** the globe and the flow map colour links, places and particles by type. The **Type / Direction** switch on each live panel changes that back to download/upload colours.
+- **Focus a type:** click a type in the legend or the **Traffic types** panel. It's highlighted everywhere, and the Conversations table shows only that type.
+- **Per row:** Conversations gets a Type column (hover it to see why a row was classified that way), host and peer rows get a type dot, and the host drawer breaks a host's traffic down by type.
+
+**How a type is decided** (`mcc/classify.py`):
+1. **The name your device looked up**, from the router's DNS cache. For example, `*.nflxvideo.net` and `*.googlevideo.com` are streaming, and `*.steamcontent.com` is gaming. A name must be the listed domain or a subdomain of it, so a lookalike such as `netflix.com.evil.example` doesn't count.
+2. **Well-known ports:**
+   - 6881–6999 and 51413: BitTorrent;
+   - 3074: Xbox Live;
+   - 8801: Zoom;
+   - 993: IMAPS;
+   - 51820: WireGuard;
+   - and so on.
+3. **A pattern:** a LAN host talking to many unnamed peers on random high ports is running P2P. BitTorrent picks random ports, so ports alone miss most of it.
+4. **Fallback:** anything else on 80/443 is web, and the rest is "other".
+
+This is an informed guess from names and ports, not deep packet inspection. A CDN that serves several services shows as whatever its name says, and encrypted traffic to an unrecognised name is "web". Each type keeps the same colour in every theme.
+
 ## Arranging the console
 
 Every panel on every page is resizable:
@@ -165,6 +201,27 @@ Every panel on every page is resizable:
 - **Reset:** double-click a handle to reset that panel. The layout button in the header resets the whole page (also in `Ctrl+K`).
 
 Layouts are saved in your browser, per page. On a phone, panels stack full-width.
+
+### Theme Studio
+
+The palette button in the header (or `Ctrl+K`, then type a theme name) opens the Theme Studio. It's the same one as in the VCF Automation Import tool, and changes apply live.
+
+- **Themes:** NOC (the default cyan and amber), Aurora, Nebula, Solar Flare, Phosphor, Graphite, Glacier (light) and Daylight (light).
+  - Palettes are generated in OKLCH from a few hues, so every theme stays legible.
+  - Severity colours (critical, high, medium, low, ok) keep their meaning in every theme.
+  - Download and upload take each theme's two main hues.
+- **Hue shift** rotates a whole theme. **Glow** sets the aurora behind the panels and the glow around them; 0 turns the aurora off.
+- **Reactive ambience:** the aurora tints with the threat level, hazard red under attack and amber when elevated.
+- **Motion:**
+  - **Full**: everything moves.
+  - **Calm**: thinner traffic particles and a slower globe. This is the default when your OS asks for reduced motion.
+  - **Off**: no particles, spin, pulses or aurora. The data is still drawn.
+- **Rendering:**
+  - **Lite** drops the aurora, frosted glass and glow, and draws the map and globe at normal resolution. It's much faster on a VM or remote desktop without GPU acceleration.
+  - **Auto** detects that from the browser, or from slow frames.
+- **Density:** **Compact** tightens tables, panels, logs and the threat feed.
+
+Choices are saved per browser.
 
 ## The switch (RouterOS or SwOS)
 
@@ -204,7 +261,7 @@ mcc/actions.py       propose / confirm / undo engine with safety rails and audit
 mcc/setup_plan.py    telemetry setup and removal plans
 mcc/hub.py           pollers, collectors, history, live event fan-out
 mcc/server.py        HTTP API, server-sent events, static console
-mcc/web/             the console (no frameworks)
+mcc/web/             the console (no frameworks); theme.js = Theme Studio, layout.js = resizable panels
 mcc/geo.py           .mmdb reader (stdlib), locator, home location, opt-in DB-IP download
 mcc/geodata.py       country label points (Natural Earth) for country-level databases
 mcc/sim.py           simulated router, switch and network (demo + tests)

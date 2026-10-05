@@ -14,6 +14,7 @@ import time
 from collections import defaultdict, deque
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
+from . import classify
 from .collectors import PROTO_NAMES
 from .util import in_networks, ip_obj, is_local_scope, split_hostport, to_int
 
@@ -224,19 +225,30 @@ class TrafficModel:
         hosts: Dict[str, Dict[str, Any]] = {}
         peers: Dict[str, Dict[str, Any]] = {}
         services: Dict[str, Dict[str, Any]] = {}
+        types: Dict[str, Dict[str, Any]] = {}
         tot_in = tot_out = 0.0
         plist = []
+        classify.apply(pairs.values(), self.name_of)  # p["cat"] / p["cat_why"]
         for p in pairs.values():
             h = hosts.setdefault(p["local"], {"ip": p["local"], "name": self.name_of(p["local"]), "up": 0.0,
-                                              "down": 0.0, "conns": 0, "peers": set()})
+                                              "down": 0.0, "conns": 0, "peers": set(), "_cats": []})
             h["conns"] += p["conns"]
             if p["dir"] == "lan":
                 continue
             h["up"] += p["up"]
             h["down"] += p["down"]
             h["peers"].add(p["remote"])
+            h["_cats"].append((p["cat"], p["up"] + p["down"]))
             r = peers.setdefault(p["remote"], {"ip": p["remote"], "name": self.name_of(p["remote"]), "up": 0.0,
-                                               "down": 0.0, "conns": 0, "hosts": set(), "ports": set()})
+                                               "down": 0.0, "conns": 0, "hosts": set(), "ports": set(), "_cats": []})
+            r["_cats"].append((p["cat"], p["up"] + p["down"]))
+            t = types.setdefault(p["cat"], {"id": p["cat"], "label": classify.LABEL.get(p["cat"], p["cat"]), "up": 0.0,
+                                            "down": 0.0, "conns": 0, "hosts": set(), "peers": set()})
+            t["up"] += p["up"]
+            t["down"] += p["down"]
+            t["conns"] += p["conns"]
+            t["hosts"].add(p["local"])
+            t["peers"].add(p["remote"])
             r["up"] += p["up"]
             r["down"] += p["down"]
             r["conns"] += p["conns"]
@@ -255,12 +267,18 @@ class TrafficModel:
             self.host_hist[ip].append((now, h["down"], h["up"]))
             b = self.baseline_up.get(ip)
             self.baseline_up[ip] = h["up"] if b is None else b * 0.995 + h["up"] * 0.005
+        def cats(x: Dict[str, Any]) -> Dict[str, Any]:
+            c, dom = classify.rollup(x.pop("_cats", []))
+            return {"cats": c, "cat": dom}
+
         host_list = sorted(({**h, "peers": len(h["peers"]), "threat": threats.get(ip, ""),
-                             "baseline_up": self.baseline_up.get(ip, 0.0)}
+                             "baseline_up": self.baseline_up.get(ip, 0.0), **cats(h)}
                             for ip, h in hosts.items()), key=lambda h: -(h["up"] + h["down"]))
         peer_list = sorted(({**r, "hosts": sorted(r["hosts"])[:8], "ports": sorted(r["ports"])[:8],
-                             "blocked": ip in blocked, "threat": threats.get(ip, "")}
+                             "blocked": ip in blocked, "threat": threats.get(ip, ""), **cats(r)}
                             for ip, r in peers.items()), key=lambda r: -(r["up"] + r["down"]))
+        type_list = sorted(({**t, "hosts": len(t["hosts"]), "peers": len(t["peers"]), "bps": t["up"] + t["down"]}
+                            for t in types.values()), key=lambda t: -t["bps"])
         return {
             "source": src,
             "conns": self.conn_count if src == "conntrack" else sum(p["conns"] for p in pairs.values()),
@@ -269,14 +287,17 @@ class TrafficModel:
             "peers": peer_list[:80], "peer_count": len(peer_list),
             "pairs": [{"local": p["local"], "remote": p["remote"], "proto": p["proto"], "port": p["port"],
                        "dir": p["dir"], "up": p["up"], "down": p["down"], "conns": p["conns"],
-                       "service": service_label(p["proto"], p["port"])} for p in plist[:limit_pairs]],
+                       "service": service_label(p["proto"], p["port"]), "cat": p["cat"], "cat_why": p["cat_why"]}
+                      for p in plist[:limit_pairs]],
             "services": sorted(services.values(), key=lambda s: -s["bps"])[:20],
+            "types": type_list,
         }
 
     def host_detail(self, ip: str, now: Optional[float] = None) -> Dict[str, Any]:
         now = now or time.time()
         src = self.source(now)
         pairs = self.conn_pairs if src == "conntrack" else self.flow_pairs(now)
+        classify.apply(pairs.values(), self.name_of)
         rows = [p for p in pairs.values() if p["local"] == ip or p["remote"] == ip]
         rows.sort(key=lambda p: -(p["up"] + p["down"]))
         return {

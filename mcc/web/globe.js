@@ -49,14 +49,17 @@ const Globe = (() => {
         <button class="icon-btn" data-g="spin" title="Auto-rotate">⟳</button>
         <button class="icon-btn" data-g="in" title="Zoom in">+</button><button class="icon-btn" data-g="out" title="Zoom out">−</button></div>
       <div class="globe-countries"></div>
-      <div class="map-legend"><span><i style="background:var(--in)"></i>download</span><span><i style="background:var(--out)"></i>upload</span><span><i style="background:var(--crit)"></i>threat</span></div>
+      <div class="map-legend type-legend"></div>
       <div class="globe-attrib"></div>
       <div class="globe-note hidden"></div>`);
     const ctx = cv.getContext("2d");
-    const reduced = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+    // Theme Studio: Motion (full / calm / off) and Rendering (Lite draws at 1x resolution)
+    const motion = () => (window.Theme ? Theme.motion()
+      : (window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches ? "off" : "full"));
+    const lite = () => !!(window.Theme && Theme.isLite());
     let w = 0, h = 0, dpr = 1, colors = {}, raf = 0, last = 0, alive = true, snap = null;
     let clat = 25, clon = -40, target = null, zoom = 1, vlon = 0, vlat = 0, dragging = false, lastTouch = 0;
-    let spin = !reduced;
+    let spin = motion() !== "off";
     try { const s = localStorage.getItem("mcc-globe-spin"); if (s !== null) spin = s === "1"; } catch (e) { /* */ }
     let home = null, homeV = null, nodes = [], parts = [], hover = null, centred = false;
 
@@ -65,12 +68,13 @@ const Globe = (() => {
       const g = (n) => cs.getPropertyValue(n).trim();
       colors = { in: g("--in"), out: g("--out"), crit: g("--crit"), med: g("--med"), text: g("--text"), muted: g("--muted"),
         faint: g("--faint"), line: g("--line"), soft: g("--line-soft"), accent: g("--accent"), bg: g("--bg"),
-        panel: g("--panel-hi"), mono: g("--mono"), light: document.documentElement.dataset.theme === "light" };
+        panel: g("--panel-hi"), mono: g("--mono"), light: document.documentElement.dataset.theme === "light",
+        oceanA: g("--globe-ocean-a"), oceanB: g("--globe-ocean-b"), land: g("--globe-land") };
     }
     readColors();
-    on("theme", readColors);
+    on("theme", () => { if (alive) { readColors(); resize(); } });
     function resize() {
-      dpr = Math.min(2, window.devicePixelRatio || 1);
+      dpr = Math.min(lite() ? 1 : 2, window.devicePixelRatio || 1);
       w = wrap.clientWidth; h = wrap.clientHeight;
       cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
     }
@@ -79,6 +83,8 @@ const Globe = (() => {
     resize();
 
     const R = () => Math.min(w, h) * 0.42 * zoom;
+    const byType = () => Types.by === "type";
+    const focusOK = (n) => !Types.focus || !byType() || !!(n.cats && n.cats[Types.focus]);
     const rate = (n) => n.up + n.down;
 
     /* -------- data -------- */
@@ -104,11 +110,12 @@ const Globe = (() => {
         if (!seen.has(key)) {
           seen.add(key);
           Object.assign(n, { city: p.geo.city, country: p.geo.country, cc: p.geo.cc, precision: p.geo.precision,
-            peers: [], up: 0, down: 0, threat: "", blocked: 0, gone: false, talpha: 1 });
+            peers: [], up: 0, down: 0, threat: "", blocked: 0, gone: false, talpha: 1, cats: {} });
         }
         n.peers.push(p);
         n.up += p.up; n.down += p.down;
         if (p.blocked) n.blocked++;
+        for (const k in p.cats || {}) n.cats[k] = (n.cats[k] || 0) + p.cats[k];
         if (p.threat && (TrafficMap.SEV_RANK[p.threat] || 0) > (TrafficMap.SEV_RANK[n.threat] || -1)) n.threat = p.threat;
       }
       for (const n of places.values()) {
@@ -124,6 +131,7 @@ const Globe = (() => {
           n.homeKey = hk;
         }
         n.peers.sort((a, b) => rate(b) - rate(a));
+        n.cat = Object.entries(n.cats || {}).sort((a, b) => b[1] - a[1]).map((e) => e[0])[0] || "other";
       }
       nodes = [...places.values()].sort((a, b) => (a.gone - b.gone) || rate(b) - rate(a));
       overlays(geo);
@@ -193,7 +201,8 @@ const Globe = (() => {
         } else {
           clon += vlon * dt; clat = Math.max(-80, Math.min(80, clat + vlat * dt));
           vlon *= Math.pow(0.05, dt); vlat *= Math.pow(0.05, dt);
-          if (spin && Math.abs(vlon) < 1 && now - lastTouch > 2500) clon += 4 * dt;
+          const m = motion();
+          if (spin && m !== "off" && Math.abs(vlon) < 1 && now - lastTouch > 2500) clon += (m === "calm" ? 1.5 : 4) * dt;
         }
       }
       let expired = false;
@@ -219,7 +228,8 @@ const Globe = (() => {
 
     function spawn(dt) {
       if (!homeV) { parts = []; return; }
-      const density = reduced ? 0.3 : 1;
+      const m = motion();
+      const density = m === "off" ? 0 : m === "calm" ? 0.4 : 1;
       for (const n of nodes) {
         if (!n.arc || n.blocked === n.peers.length) continue;
         for (const dir of ["in", "out"]) {
@@ -228,7 +238,8 @@ const Globe = (() => {
           n.acc[dir] += Math.min(12, Math.log10(1 + bps / 1e3) * 2) * density * dt;
           while (n.acc[dir] >= 1) {
             n.acc[dir] -= 1;
-            parts.push({ n, dir, t: 0, v: 0.22 + Math.random() * 0.12, s: 1.2 + Math.min(2, Math.log10(1 + bps / 1e5)) });
+            parts.push({ n, dir, t: 0, v: 0.22 + Math.random() * 0.12, s: 1.2 + Math.min(2, Math.log10(1 + bps / 1e5)),
+              cat: Types.pick(n.cats) });
           }
         }
       }
@@ -250,8 +261,8 @@ const Globe = (() => {
       ctx.beginPath(); ctx.arc(cx, cy, r * 1.22, 0, Math.PI * 2); ctx.fill();
       // ocean
       const oc = ctx.createRadialGradient(cx - r * 0.35, cy - r * 0.4, r * 0.1, cx, cy, r);
-      oc.addColorStop(0, colors.light ? "oklch(0.97 0.02 230)" : "oklch(0.30 0.05 245)");
-      oc.addColorStop(1, colors.light ? "oklch(0.88 0.03 235)" : "oklch(0.15 0.03 255)");
+      oc.addColorStop(0, colors.oceanA || (colors.light ? "oklch(0.97 0.02 230)" : "oklch(0.30 0.05 245)"));
+      oc.addColorStop(1, colors.oceanB || (colors.light ? "oklch(0.88 0.03 235)" : "oklch(0.15 0.03 255)"));
       ctx.fillStyle = oc;
       ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
       // graticule
@@ -262,7 +273,7 @@ const Globe = (() => {
       // land
       if (LAND) {
         const ds = Math.max(0.9, Math.min(2.4, r / 230));
-        ctx.fillStyle = colors.light ? "oklch(0.55 0.06 240)" : "oklch(0.80 0.08 215)";
+        ctx.fillStyle = colors.land || (colors.light ? "oklch(0.55 0.06 240)" : "oklch(0.80 0.08 215)");
         for (let i = 0; i < LAND.length; i += 3) {
           const x1 = LAND[i] * cx0 - LAND[i + 2] * sx0;
           const z1 = LAND[i] * sx0 + LAND[i + 2] * cx0;
@@ -283,8 +294,8 @@ const Globe = (() => {
       const live = hover && hover !== "home" ? hover : null;
       for (const n of nodes) {
         if (!n.arc) continue;
-        const rel = !live || live === n;
-        const col = n.threat ? colors.crit : n.blocked === n.peers.length ? colors.faint
+        const rel = (!live || live === n) && focusOK(n);
+        const col = n.threat ? colors.crit : n.blocked === n.peers.length ? colors.faint : byType() ? Types.color(n.cat)
           : (n.gone ? n.wasDown : n.down >= n.up) ? colors.in : colors.out;
         ctx.strokeStyle = col;
         ctx.globalAlpha = n.alpha * (rel ? (live ? 0.95 : 0.55) : 0.12);
@@ -304,8 +315,9 @@ const Globe = (() => {
         const v = proj([o[0] + (q[0] - o[0]) * k, o[1] + (q[1] - o[1]) * k, o[2] + (q[2] - o[2]) * k]);
         if (!visible(v)) continue;
         const [x, y] = S(v);
-        ctx.globalAlpha = p.n.alpha * Math.min(1, p.t * 6, (1 - p.t) * 6) * (!live || live === p.n ? 0.95 : 0.15);
-        ctx.fillStyle = p.n.threat ? colors.crit : p.dir === "in" ? colors.in : colors.out;
+        const pon = (!live || live === p.n) && (!Types.focus || !byType() || p.cat === Types.focus);
+        ctx.globalAlpha = p.n.alpha * Math.min(1, p.t * 6, (1 - p.t) * 6) * (pon ? 0.95 : 0.1);
+        ctx.fillStyle = byType() ? Types.color(p.cat) : p.n.threat ? colors.crit : p.dir === "in" ? colors.in : colors.out;
         ctx.beginPath(); ctx.arc(x, y, p.s, 0, Math.PI * 2); ctx.fill();
       }
       ctx.globalCompositeOperation = "source-over";
@@ -318,9 +330,9 @@ const Globe = (() => {
         const [x, y] = S(v);
         const rad = 2.5 + Math.min(7, Math.log10(1 + rate(n) / 2e3) * 1.8);
         n.screen = [x, y, rad];
-        const col = n.threat ? colors.crit : n.precision === "country" ? colors.med : colors.accent;
-        ctx.globalAlpha = n.alpha * (!live || live === n ? 1 : 0.35) * (0.4 + 0.6 * v[2]);
-        if (n.threat && !reduced && !n.gone) {
+        const col = n.threat ? colors.crit : byType() ? Types.color(n.cat) : n.precision === "country" ? colors.med : colors.accent;
+        ctx.globalAlpha = n.alpha * ((!live || live === n) && focusOK(n) ? 1 : 0.35) * (0.4 + 0.6 * v[2]);
+        if (n.threat && motion() !== "off" && !n.gone) {
           const ph = (t * 1.1 + idx * 0.13) % 1;
           ctx.strokeStyle = colors.crit;
           ctx.lineWidth = 1.5;
@@ -373,7 +385,7 @@ const Globe = (() => {
         const v = proj(homeV);
         if (v[2] >= 0) {
           const [x, y] = S(v);
-          const ph = reduced ? 0.5 : (t * 0.8) % 1;
+          const ph = motion() === "off" ? 0.5 : (t * 0.8) % 1;
           ctx.strokeStyle = colors.accent;
           ctx.globalAlpha = 1 - ph;
           ctx.lineWidth = 2;
@@ -396,6 +408,7 @@ const Globe = (() => {
           homeScreen = [x, y];
         } else homeScreen = null;
       }
+      if (motion() === "off") motionOffNote(ctx, w / 2, h - 14, colors);
     }
     let homeScreen = null;
 
@@ -470,6 +483,7 @@ const Globe = (() => {
           : `<span class="in">↓ ${fmt.bps(n.down)}</span> · <span class="out">↑ ${fmt.bps(n.up)}</span>`}
         ${n.peers.slice(0, 6).map((p) => `<div class="mono" style="font-size:11.5px">${esc(p.name || p.ip)} <span class="muted">${fmt.bps(p.up + p.down)}</span>${p.threat ? ' <span style="color:var(--crit)">⚠</span>' : ""}</div>`).join("")}
         ${n.peers.length > 6 ? `<span class="muted">+${n.peers.length - 6} more</span>` : ""}
+        ${Types.mixHtml(n.cats)}
         ${n.threat ? `<br><span style="color:var(--crit)">⚠ ${esc(n.threat)} threat</span>` : ""}`, e.clientX, e.clientY);
     });
     const release = (e) => {

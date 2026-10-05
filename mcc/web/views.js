@@ -43,7 +43,7 @@ function hostsTable(list, kind, limit) {
   const max = Math.max(...list.map((h) => Math.max(h.down, h.up)), 1);
   return `<table class="t"><thead><tr><th>${kind === "peer" ? "Remote" : "Host"}</th><th class="r">↓</th><th class="r">↑</th><th></th></tr></thead><tbody>
     ${list.slice(0, limit || 12).map((h) => `<tr class="click" data-ip="${esc(h.ip)}">
-      <td>${whoCell(h.name, h.ip + (h.geo ? " · " + (h.geo.city ? h.geo.city + ", " : "") + h.geo.cc : ""))}${h.threat ? ` <span class="sev sv-${esc(h.threat)}"></span>` : ""}${h.blocked ? ' <span class="pill red">blocked</span>' : ""}</td>
+      <td><div class="who-row">${typeDot(h.cat)}${whoCell(h.name, h.ip + (h.geo ? " · " + (h.geo.city ? h.geo.city + ", " : "") + h.geo.cc : ""))}</div>${h.threat ? ` <span class="sev sv-${esc(h.threat)}"></span>` : ""}${h.blocked ? ' <span class="pill red">blocked</span>' : ""}</td>
       <td class="r num in">${fmt.bps(h.down)}</td><td class="r num out">${fmt.bps(h.up)}</td><td style="width:90px">${rateBars(h.down, h.up, max)}</td></tr>`).join("")}
   </tbody></table>`;
 }
@@ -53,6 +53,37 @@ function servicesHtml(list) {
   return list.slice(0, 10).map((s) => `<div class="svc"><span>${esc(s.label)} <span class="faint">· ${s.conns}</span></span><span class="num r" style="text-align:right">${fmt.bps(s.bps)}</span>
     <div class="bar"><i style="width:${Math.max(1, (s.bps / max) * 100).toFixed(1)}%"></i></div></div>`).join("");
 }
+/* ---- traffic types (mcc/classify.py): panel, legend, colour-mode switch ---- */
+function typesHtml(types) {
+  const list = (types || []).filter((t) => t.bps > 0);
+  if (!list.length) return '<div class="empty">No classified traffic yet.</div>';
+  const total = list.reduce((a, t) => a + t.bps, 0) || 1;
+  return `<div class="tbar big">${list.map((t) => `<i style="width:${((t.bps / total) * 100).toFixed(2)}%;background:${Types.color(t.id)}" title="${esc(t.label)}"></i>`).join("")}</div>
+    <div class="types">${list.map((t) => `<div class="trow ${Types.focus === t.id ? "on" : ""} ${Types.focus && Types.focus !== t.id ? "dim" : ""}" data-type="${esc(t.id)}" title="Click to highlight ${esc(t.label)} in the map, globe and conversations">
+      <i class="tdot" style="background:${Types.color(t.id)}"></i><span class="tl-name">${esc(t.label)}</span>
+      <span class="num faint">${Math.round((t.bps / total) * 100)}%</span><span class="num in">${fmt.bps(t.down)}</span><span class="num out">${fmt.bps(t.up)}</span>
+      <span class="faint tl-sub">${t.hosts} host${t.hosts === 1 ? "" : "s"} · ${t.peers} peer${t.peers === 1 ? "" : "s"}</span></div>`).join("")}</div>`;
+}
+function typeDot(cat) {
+  return cat ? `<i class="tdot" style="background:${Types.color(cat)}" title="${esc(Types.label(cat))}"></i>` : "";
+}
+/* every live panel: legend over the map/globe and the Type/Direction switch */
+function refreshTypeUI() {
+  const types = S.snap && S.snap.traffic.types;
+  $$(".type-legend").forEach((el) => { el.innerHTML = Types.legend(types); });
+  $$(".color-by button").forEach((b) => b.classList.toggle("on", b.dataset.by === Types.by));
+}
+document.addEventListener("click", (e) => {
+  const t = e.target.closest(".type-legend [data-type], .types [data-type], [data-type-filter]");
+  if (t) { Types.toggleFocus(t.dataset.type || t.dataset.typeFilter); return; }
+  const b = e.target.closest(".color-by [data-by]");
+  if (b) Types.setBy(b.dataset.by);
+});
+on("types", () => {
+  refreshTypeUI();
+  if (current && current.view.onTypes) current.view.onTypes();
+});
+
 function bindRows(root) {
   $$("tr[data-ip]", root).forEach((tr) => (tr.onclick = () => openHost(tr.dataset.ip)));
 }
@@ -213,6 +244,7 @@ VIEWS.overview = {
       <div class="kpis" id="kpis"></div>
       <div class="grid">
         <section class="panel s8" data-pid="overview:live"><header><h2>Live traffic</h2><span class="grow"></span><span class="hint" id="map-src"></span>
+          <div class="seg color-by" title="Colour the traffic by type or by direction"><button data-by="type">Type</button><button data-by="direction">Direction</button></div>
           <div class="seg" id="live-kind"><button data-k="globe">Globe</button><button data-k="map">Flow map</button></div></header>
           <div id="live" class="globe-wrap"></div></section>
         <section class="panel s4"><header><h2>Threat feed</h2><span class="grow"></span><a class="hint" href="#/threats">all threats →</a></header><div class="feed" id="feed" style="height:470px"></div></section>
@@ -221,7 +253,8 @@ VIEWS.overview = {
         <section class="panel s5"><header><h2>Switch</h2><span class="grow"></span><span class="hint" id="sw-id"></span></header><div class="body" id="ports"></div></section>
         <section class="panel s4"><header><h2>Top LAN talkers</h2><span class="grow"></span><a class="hint" href="#/traffic">traffic →</a></header><div class="body flush scroll" style="max-height:340px" id="talkers"></div></section>
         <section class="panel s4"><header><h2>Top destinations</h2></header><div class="body flush scroll" style="max-height:340px" id="dests"></div></section>
-        <section class="panel s4"><header><h2>Services</h2></header><div class="body flush services scroll" style="max-height:340px;padding:6px 0" id="svcs"></div></section>
+        <section class="panel s4" data-pid="overview:types"><header><h2>Traffic types</h2><span class="grow"></span><a class="hint" href="#/traffic">by conversation →</a></header>
+          <div class="body scroll" style="max-height:340px" id="types"></div></section>
       </div>`;
     this.mountLive(liveKind());
     $("#live-kind", m).onclick = (e) => { const b = e.target.closest("[data-k]"); if (b) this.mountLive(b.dataset.k); };
@@ -263,7 +296,8 @@ VIEWS.overview = {
     $("#sw-id").textContent = [sys.identity, sys.model, sys.version && (sys.os === "routeros" ? sys.version : "SwOS " + sys.version)].filter(Boolean).join(" · ");
     $("#talkers").innerHTML = hostsTable(tr.hosts, "host", 10);
     $("#dests").innerHTML = hostsTable(tr.peers, "peer", 10);
-    $("#svcs").innerHTML = servicesHtml(tr.services);
+    $("#types").innerHTML = typesHtml(tr.types);
+    refreshTypeUI();
     bindRows($("#talkers")); bindRows($("#dests"));
     if (++this.n % 10 === 0) this.feedKey = null;
     this.drawFeed();
@@ -283,6 +317,7 @@ VIEWS.overview = {
     bindThreatCards(feed, (id) => go("threats", { id }));
   },
   onThreat() { this.drawFeed(); },
+  onTypes() { const el = $("#types"); if (el && S.snap) el.innerHTML = typesHtml(S.snap.traffic.types); },
   mountLive(kind) {
     if (this.map) this.map.destroy();
     this.kind = kind;
@@ -290,9 +325,10 @@ VIEWS.overview = {
     $$("#live-kind button").forEach((b) => b.classList.toggle("on", b.dataset.k === kind));
     const host = $("#live");
     host.className = kind === "globe" ? "globe-wrap" : "map-wrap";
-    host.innerHTML = kind === "map" ? '<div class="map-legend"><span><i style="background:var(--in)"></i>download</span><span><i style="background:var(--out)"></i>upload</span><span><i style="background:var(--crit)"></i>threat</span></div>' : "";
+    host.innerHTML = kind === "map" ? '<div class="map-legend type-legend"></div>' : "";
     this.map = kind === "globe" ? Globe.create(host) : TrafficMap.create(host);
     if (S.snap) this.map.update(S.snap);
+    refreshTypeUI();
   },
   leave() { if (this.map) this.map.destroy(); },
 };
@@ -320,16 +356,18 @@ VIEWS.traffic = {
     this.q = "";
     m.innerHTML = `${connectBanner()}${telemetryNudge()}
       <div class="grid">
-        <section class="panel s12"><header><h2>Traffic map</h2><span class="grow"></span><span class="hint" id="t-src"></span></header>
-          <div class="map-wrap tall" id="map"><div class="map-legend"><span><i style="background:var(--in)"></i>download</span><span><i style="background:var(--out)"></i>upload</span><span><i style="background:var(--crit)"></i>threat</span><span>✕ blocked</span></div></div></section>
+        <section class="panel s12"><header><h2>Traffic map</h2><span class="grow"></span><span class="hint" id="t-src"></span><div class="seg color-by" title="Colour the traffic by type or by direction"><button data-by="type">Type</button><button data-by="direction">Direction</button></div></header>
+          <div class="map-wrap tall" id="map"><div class="map-legend type-legend"></div></div></section>
         <section class="panel s8" data-pid="traffic:globe"><header><h2>Where it goes</h2><span class="grow"></span><span class="hint" id="g-src"></span></header>
           <div class="globe-wrap" id="globe"></div></section>
-        <section class="panel s4" data-pid="traffic:countries"><header><h2>Countries</h2></header><div class="body flush scroll" style="max-height:470px" id="countries"></div></section>
+        <section class="panel s4" data-pid="traffic:types"><header><h2>Traffic types</h2><span class="grow"></span><span class="hint">click one to highlight it</span></header>
+          <div class="body scroll" style="max-height:470px" id="types"></div></section>
         <section class="panel s12"><header><h2>Conversations</h2><span class="grow"></span><input type="text" id="t-q" placeholder="Filter by host, IP or service" style="max-width:280px"></header>
           <div class="body flush scroll" style="max-height:440px" id="pairs"></div></section>
-        <section class="panel s4"><header><h2>LAN hosts</h2></header><div class="body flush scroll" style="max-height:420px" id="hosts"></div></section>
-        <section class="panel s4"><header><h2>Internet peers</h2></header><div class="body flush scroll" style="max-height:420px" id="peers"></div></section>
-        <section class="panel s4"><header><h2>Services</h2></header><div class="body flush services scroll" style="max-height:420px;padding:6px 0" id="svcs"></div></section>
+        <section class="panel s3"><header><h2>LAN hosts</h2></header><div class="body flush scroll" style="max-height:420px" id="hosts"></div></section>
+        <section class="panel s3"><header><h2>Internet peers</h2></header><div class="body flush scroll" style="max-height:420px" id="peers"></div></section>
+        <section class="panel s3"><header><h2>Services</h2></header><div class="body flush services scroll" style="max-height:420px;padding:6px 0" id="svcs"></div></section>
+        <section class="panel s3" data-pid="traffic:countries"><header><h2>Countries</h2></header><div class="body flush scroll" style="max-height:420px" id="countries"></div></section>
       </div>`;
     this.map = TrafficMap.create($("#map", m), { peers: 18, hosts: 16 });
     this.globe = Globe.create($("#globe", m));
@@ -347,17 +385,25 @@ VIEWS.traffic = {
     tr.hosts.forEach((h) => (names[h.ip] = h.name));
     tr.peers.forEach((p) => (names[p.ip] = p.name));
     const q = this.q;
-    const rows = tr.pairs.filter((p) => !q || [p.local, p.remote, names[p.local], names[p.remote], p.service].some((v) => (v || "").toLowerCase().includes(q)));
+    const focus = Types.focus;
+    const rows = tr.pairs.filter((p) => (!focus || p.cat === focus) &&
+      (!q || [p.local, p.remote, names[p.local], names[p.remote], p.service, Types.label(p.cat)].some((v) => (v || "").toLowerCase().includes(q))));
     const max = Math.max(...rows.map((p) => Math.max(p.down, p.up)), 1);
-    $("#pairs").innerHTML = rows.length ? `<table class="t"><thead><tr><th>LAN host</th><th></th><th>Remote</th><th>Service</th><th class="r">Conns</th><th class="r">↓</th><th class="r">↑</th><th></th></tr></thead><tbody>
+    $("#types").innerHTML = typesHtml(tr.types);
+    refreshTypeUI();
+    const note = focus ? `<div class="focus-note"><i class="tdot" style="background:${Types.color(focus)}"></i>Showing only <b>${esc(Types.label(focus))}</b>
+      <button class="btn sm ghost" data-type-filter="${esc(focus)}">${ICON.x} Show all types</button></div>` : "";
+    $("#pairs").innerHTML = note + (rows.length ? `<table class="t"><thead><tr><th>LAN host</th><th></th><th>Remote</th><th>Type</th><th>Service</th><th class="r">Conns</th><th class="r">↓</th><th class="r">↑</th><th></th></tr></thead><tbody>
       ${rows.map((p) => `<tr class="click" data-ip="${esc(p.dir === "lan" ? p.local : p.remote)}"><td>${whoCell(names[p.local], p.local)}</td><td class="faint">${p.dir === "in" ? "⇠" : p.dir === "lan" ? "⇄" : "⇢"}</td>
-        <td>${whoCell(names[p.remote], p.remote)}</td><td>${esc(p.service)}</td><td class="r num">${p.conns}</td><td class="r num in">${fmt.bps(p.down)}</td><td class="r num out">${fmt.bps(p.up)}</td><td style="width:100px">${rateBars(p.down, p.up, max)}</td></tr>`).join("")}
-      </tbody></table>` : '<div class="empty">No conversations match.</div>';
+        <td>${whoCell(names[p.remote], p.remote)}</td><td><span class="tchip" title="${esc(p.cat_why || "")}">${typeDot(p.cat)}${esc(Types.label(p.cat))}</span></td>
+        <td>${esc(p.service)}</td><td class="r num">${p.conns}</td><td class="r num in">${fmt.bps(p.down)}</td><td class="r num out">${fmt.bps(p.up)}</td><td style="width:100px">${rateBars(p.down, p.up, max)}</td></tr>`).join("")}
+      </tbody></table>` : '<div class="empty">No conversations match.</div>');
     $("#hosts").innerHTML = hostsTable(tr.hosts, "host", 60);
     $("#peers").innerHTML = hostsTable(tr.peers, "peer", 80);
     $("#svcs").innerHTML = servicesHtml(tr.services);
     bindRows($("#pairs")); bindRows($("#hosts")); bindRows($("#peers"));
   },
+  onTypes() { if (S.snap && $("#pairs")) this.tick(); },
   leave() { if (this.map) this.map.destroy(); if (this.globe) this.globe.destroy(); },
 };
 

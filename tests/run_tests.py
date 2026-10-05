@@ -253,6 +253,52 @@ def t_traffic_orientation():
     eq((r[0]["up"], r[0]["down"]), (4000.0, 20000.0), "delta rates")
 
 
+@test
+def t_traffic_types():
+    from mcc import classify
+    cases = [
+        (("TCP", 443, "rr3---sn-ab5l6n7s.googlevideo.com"), "streaming"),
+        (("TCP", 443, "ipv4-c001-dfw001.1.oca.nflxvideo.net"), "streaming"),
+        (("UDP", 51413, ""), "p2p"), (("TCP", 6881, ""), "p2p"),
+        (("UDP", 8801, ""), "calls"), (("TCP", 443, "zoom.us"), "calls"),
+        (("TCP", 443, "steamcontent.com"), "gaming"), (("UDP", 3074, ""), "gaming"),
+        (("TCP", 443, "scontent.cdninstagram.com"), "social"), (("TCP", 6667, "irc.libera.chat"), "social"),
+        (("TCP", 443, "bucket.s3.us-east-1.amazonaws.com"), "cloud"), (("TCP", 443, "p01-content.icloud-content.com"), "cloud"),
+        (("TCP", 443, "tlu.dl.delivery.mp.microsoft.com"), "updates"), (("TCP", 443, "a1.tuyaus.com"), "iot"),
+        (("UDP", 51820, ""), "remote"), (("ESP", 0, ""), "remote"), (("TCP", 993, ""), "mail"),
+        (("UDP", 53, ""), "infra"), (("ICMP", 0, ""), "infra"),
+        (("TCP", 443, ""), "web"), (("UDP", 443, ""), "web"), (("TCP", 12345, ""), "other"),
+        # lookalikes don't count: a name must BE the domain or a subdomain of it
+        (("TCP", 443, "netflix.com.evil.example"), "web"), (("TCP", 443, "spring.com"), "web"),
+        (("TCP", 443, "notnetflix.com"), "web"),
+    ]
+    for args, want in cases:
+        eq(classify.classify(*args)[0], want, "{} ->".format(args))
+    ids = [c["id"] for c in classify.CATEGORIES]
+    eq(len(ids), len(set(ids)), "category ids unique")
+    # the P2P pattern: one host, many unnamed peers on random high ports
+    pairs = [{"local": "192.168.1.5", "remote": "77.1.1.{}".format(i), "proto": "UDP", "port": 20000 + i, "dir": "out"}
+             for i in range(8)]
+    pairs.append({"local": "192.168.1.6", "remote": "88.1.1.1", "proto": "TCP", "port": 40000, "dir": "out"})
+    classify.apply(pairs, lambda ip: "")
+    ok(all(p["cat"] == "p2p" for p in pairs[:8]), "a swarm of unnamed high-port peers is P2P")
+    eq(pairs[8]["cat"], "other", "a single unknown high-port connection is not")
+    ok("P2P pattern" in pairs[0]["cat_why"], "and says why")
+    m = _model()
+    m.ingest_conns([
+        {".id": "*1", "src-address": "192.168.88.30:5000", "dst-address": "45.57.40.1:443",
+         "reply-src-address": "45.57.40.1:443", "protocol": "tcp", "orig-rate": "200000", "repl-rate": "16000000"},
+        {".id": "*2", "src-address": "192.168.88.30:5001", "dst-address": "8.8.8.8:53",
+         "reply-src-address": "8.8.8.8:53", "protocol": "udp", "orig-rate": "800", "repl-rate": "900"},
+    ])
+    m.name_of = lambda ip: {"45.57.40.1": "ipv4-c001.oca.nflxvideo.net"}.get(ip, "")
+    snap = m.snapshot()
+    eq(snap["types"][0]["id"], "streaming", "biggest type first")
+    eq(snap["hosts"][0]["cat"], "streaming", "a host's dominant type")
+    ok(set(snap["hosts"][0]["cats"]) == {"streaming", "infra"}, "a host's mix")
+    eq({p["cat"] for p in snap["pairs"]}, {"streaming", "infra"}, "pairs labelled")
+
+
 def _detector(tmp, **detect):
     cfg = Config(tmp)
     cfg.update({"detect": detect} if detect else {})
@@ -1003,6 +1049,19 @@ def t_server_security():
             eq(st, 200, "removed")
             st, _, _ = _req(port, "POST", "/api/ignore/I9999/remove", {}, {"X-MCC": "1"})
             eq(st, 404, "unknown rule")
+            st, bi, _ = _req(port, "GET", "/api/build")
+            eq((st, bi["build"] == bi["build_disk"], len(bi["build"])), (200, True, 16), "build ids match on a fresh start")
+            import mcc.server as srv_mod
+            web_file = srv_mod.WEB / "index.html"
+            orig = web_file.read_bytes()
+            try:
+                web_file.write_bytes(orig + b"\n<!-- changed -->")
+                st, bi2, _ = _req(port, "GET", "/api/build")
+                ok(bi2["build_disk"] != bi2["build"], "files changed on disk without a restart are noticed")
+            finally:
+                web_file.write_bytes(orig)
+            st, bi3, _ = _req(port, "GET", "/api/build")
+            eq(bi3["build_disk"], bi3["build"], "and match again once restored")
             st, _, _ = _req(port, "GET", "/../../mcc/config.py")
             eq(st, 404, "path traversal")
             st, html, r = _req(port, "GET", "/")
@@ -1046,6 +1105,74 @@ def t_server_token_when_exposed():
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+
+@test
+def t_replace_running_instance():
+    """`mcc.py --replace` restarts: a current copy is asked to shut down (per-run secret); an older
+    copy without a run file is found by its port and stopped; a non-MCC listener is never touched."""
+    import subprocess
+    from mcc import runctl
+    tmp = Path(tempfile.mkdtemp(prefix="mcc-replace-"))
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    procs = []
+
+    def launch(name, *extra):
+        p = subprocess.Popen([sys.executable, str(ROOT / "mcc.py"), "--demo", "--no-browser", "--port", str(port),
+                              "--data", str(tmp / name)] + list(extra),
+                             cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        procs.append(p)
+        return p
+
+    def serving(p):
+        try:
+            info = json.loads(runctl.run_file(port).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return info.get("pid") == p.pid and runctl.port_in_use(port)
+
+    try:
+        a = launch("a")
+        ok(wait_for(lambda: serving(a), 30), "first copy serving")
+        st, _, _ = _req(port, "POST", "/api/admin/shutdown", {}, {"X-MCC": "1"})
+        eq(st, 403, "shutdown without the secret is refused")
+        st, _, _ = _req(port, "POST", "/api/admin/shutdown", {}, {"X-MCC": "1", "X-MCC-Secret": "guess"})
+        eq(st, 403, "wrong secret refused")
+        b = launch("b", "--replace")
+        ok(wait_for(lambda: a.poll() is not None, 20), "first copy exited")
+        eq(a.returncode, 0, "it shut down cleanly (not killed)")
+        ok(wait_for(lambda: serving(b), 30), "second copy took over the port")
+        # an older copy has no run file: found by the port, confirmed to be MCC, stopped
+        runctl.run_file(port).unlink()
+        c = launch("c", "--replace")
+        ok(wait_for(lambda: b.poll() is not None, 25), "old-style copy stopped by its port")
+        ok(wait_for(lambda: serving(c), 30), "third copy serving")
+        # something that isn't MCC on the port is left alone
+        with socket.socket() as other:
+            other.bind(("127.0.0.1", 0))
+            other.listen(16)
+            oport = other.getsockname()[1]
+            msgs = []
+            ok(not runctl.stop_existing(oport, log=msgs.append), "refuses to stop a non-MCC listener")
+            ok(any("isn't MCC" in m for m in msgs), "and says why")
+            ok(runctl.port_in_use(oport), "the other listener is untouched")
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(10)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+            if p.stdout:
+                p.stdout.close()
+        try:
+            runctl.run_file(port).unlink()
+        except OSError:
+            pass
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ============================================================================================

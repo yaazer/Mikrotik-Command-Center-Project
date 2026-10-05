@@ -333,6 +333,79 @@ def sc_globe_fade(d: Demo, c: Check) -> None:
         c(not b.errors, "no console errors: {}".format(b.errors[:3]))
 
 
+def sc_update(d: Demo, c: Check) -> None:
+    """A tab left open across a restart onto new code must reload itself (it kept old JS before)."""
+    with Browser(1400, 900) as b:
+        b.nav(d.url + "#/traffic")
+        b.until("!!S.build && !!document.querySelector('#pairs')", 10)
+        build = b.eval("S.build")
+        c(build and len(build) == 16, "the console knows which build it runs ({})".format(build))
+        b.eval("window.__marker = 1")
+        c(b.eval("onBuild(S.build)") is False, "same build on reconnect: no reload")
+        b.wait(1.0)
+        c(b.eval("window.__marker") == 1, "page kept")
+        b.eval("onBuild('0000000000000000')")  # what a reconnect to an updated MCC delivers
+        c(b.until("window.__marker === undefined && !!document.querySelector('#pairs')", 10),
+          "different build: the tab reloads itself onto the new code, same page")
+        c(b.eval("location.hash") == "#/traffic", "and stays on the page you were on")
+        # an MCC whose files were updated but which wasn't restarted says so, instead of looking broken
+        c(not b.eval("!!document.querySelector('#update-bar')"), "no update bar when the server runs the current files")
+        b.eval("checkSkew({ build: S.build, build_disk: 'ffffffffffffffff' })")
+        c(b.eval("!!document.querySelector('#update-bar') && /restart-mcc\\.cmd/.test(document.querySelector('#update-bar').innerText)"),
+          "files changed since start: the bar asks for a restart")
+        b.eval("checkSkew(null)")
+        c(b.eval("/traffic types/.test(document.querySelector('#update-bar').innerText)"),
+          "a server too old to report its build: same bar, and it says what stays empty")
+        b.eval("checkSkew({ build: S.build, build_disk: S.build })")
+        c(not b.eval("!!document.querySelector('#update-bar')"), "the bar goes once they match")
+        b.eval("Theme.set({ motion: 'off' })")
+        b.nav(d.url + "#/overview")
+        b.until("!!document.querySelector('#live canvas')", 8)
+        b.wait(1.0)
+        shot(b, "motion-off-note")
+        b.eval("Theme.set({ motion: 'full' })")
+        c(not b.errors, "no console errors: {}".format(b.errors[:3]))
+
+
+def sc_types(d: Demo, c: Check) -> None:
+    with Browser(1600, 1000) as b:
+        b.nav(d.url + "#/overview")
+        c(b.until("document.querySelectorAll('#types .trow').length >= 5", 20), "Overview lists traffic types")
+        c(b.eval("!!document.querySelector('#types .tbar.big')"), "with a breakdown bar")
+        c(b.until("document.querySelectorAll('#live .type-legend .tl').length >= 5", 5), "the live view's legend shows the types")
+        click(b, '#live-kind [data-k="map"]')
+        c(b.until("document.querySelectorAll('#live .type-legend .tl').length >= 5", 5), "the flow map has the same legend")
+        click(b, '.color-by [data-by="direction"]')
+        c(b.eval("Types.by") == "direction" and "download" in b.eval("document.querySelector('#live .type-legend').innerText"),
+          "Direction mode switches back to download/upload colours")
+        click(b, '.color-by [data-by="type"]')
+        click(b, '#live-kind [data-k="globe"]')
+        b.until("!!document.querySelector('#live.globe-wrap canvas')", 5)
+        first = b.eval("document.querySelector('#live .type-legend .tl').dataset.type")
+        click(b, "#live .type-legend .tl")
+        c(b.eval("Types.focus") == first, "clicking a legend entry focuses that type ({})".format(first))
+        c(b.until("!!document.querySelector('#types .trow.on[data-type=\"%s\"]')" % first, 3), "the types panel marks it")
+        c(b.until("VIEWS.overview.map.stats().parts > 0", 8), "globe keeps drawing while focused")
+        b.nav(d.url + "#/traffic")
+        c(b.until("document.querySelectorAll('#pairs tbody tr').length > 0", 10), "Traffic page conversations")
+        cats = b.eval("[...new Set([...document.querySelectorAll('#pairs .tchip')].map(x => x.innerText.trim()))]")
+        c(cats == [b.eval("Types.label(Types.focus)")], "conversations filtered to the focused type ({})".format(cats))
+        click(b, "#pairs [data-type-filter]")
+        c(b.until("Types.focus === null && new Set([...document.querySelectorAll('#pairs .tchip')].map(x => x.innerText.trim())).size > 2", 5),
+          "'Show all types' clears the filter")
+        c(b.eval("document.querySelectorAll('#hosts .tdot').length") > 3, "host rows carry a type dot")
+        b.until("!!document.querySelector('#hosts tr[data-ip]')", 5)
+        click(b, "#hosts tr[data-ip]")
+        c(b.until("[...document.querySelectorAll('#drawer h4')].some(h => /traffic types/i.test(h.innerText)) && !!document.querySelector('#drawer .tbar')", 8),
+          "the host drawer breaks its traffic down by type")
+        b.eval("closeDrawer()")
+        b.eval("location.reload()")
+        b.wait(1.0)
+        b.until("typeof Types !== 'undefined'", 8)
+        c(b.eval("Types.by") == "type", "colour mode persists")
+        c(not b.errors, "no console errors: {}".format(b.errors[:3]))
+
+
 def sc_drawer(d: Demo, c: Check) -> None:
     with Browser(1600, 1000) as b:
         b.nav(d.url + "#/overview")
@@ -369,15 +442,79 @@ def sc_light(d: Demo, c: Check) -> None:
         b.nav(d.url + "#/overview")
         b.until("document.querySelectorAll('.kpi').length === 7", 10)
         click(b, "#theme-btn")
-        c(b.eval("document.documentElement.dataset.theme") == "light", "theme toggles to light")
+        b.until("!!document.querySelector('#studio [data-th=\"glacier\"]')", 5)
+        click(b, '#studio [data-th="glacier"]')
+        click(b, "#studio [data-close]")
+        c(b.eval("document.documentElement.dataset.theme") == "light", "a light theme switches the console to light")
         bg = b.eval("getComputedStyle(document.body).backgroundColor")
-        c(bg and "oklch(0.96" in bg or "rgb(2" in (bg or ""), "light background applied ({})".format(bg))
+        c(bg and ("oklch(0.96" in bg or "rgb(2" in bg), "light background applied ({})".format(bg))
         b.wait(2)
         shot(b, "light")
+        b.eval("Theme.set({ theme: 'noc' })")
         c(not b.errors, "no console errors: {}".format(b.errors[:3]))
 
 
-SCENARIOS = {"pages": sc_pages, "setup": sc_setup, "respond": sc_respond, "ignore": sc_ignore, "layout": sc_layout, "globe-fade": sc_globe_fade, "drawer": sc_drawer, "phone": sc_phone,
+def css(b: Browser, name: str) -> str:
+    return b.eval("getComputedStyle(document.documentElement).getPropertyValue(%r).trim()" % name) or ""
+
+
+def sc_theme(d: Demo, c: Check) -> None:
+    with Browser(1600, 1000) as b:
+        b.nav(d.url + "#/overview")
+        b.until("document.querySelectorAll('.kpi').length === 7 && document.querySelector('#live canvas')", 10)
+        c(b.eval("!!document.querySelector('#fx-aurora')"), "aurora layer behind the console")
+        click(b, "#theme-btn")
+        c(b.until("document.querySelectorAll('#studio .swatch').length === 8", 5), "Theme Studio opens with 8 themes")
+        shot(b, "theme-studio")
+        accents = {}
+        for tid in ("noc", "aurora", "nebula", "solar", "phosphor", "graphite", "glacier", "daylight"):
+            click(b, '#studio [data-th="%s"]' % tid)
+            accents[tid] = (css(b, "--accent"), b.eval("document.documentElement.dataset.theme"))
+        c(len({a for a, _ in accents.values()}) == 8, "every theme has its own accent")
+        c(accents["glacier"][1] == "light" and accents["nebula"][1] == "dark", "light and dark themes set the mode")
+        c(b.eval("document.querySelector('#studio .swatch.on').dataset.th") == "daylight", "picked theme is marked")
+        click(b, '#studio [data-th="aurora"]')
+        before = css(b, "--accent")
+        b.eval("(() => { const r = document.querySelector('#studio [data-in=shift]'); r.value = 90; r.dispatchEvent(new Event('input')); })()")
+        c(css(b, "--accent") != before and "+90" in b.eval("document.querySelector('#v-shift').innerText"), "hue shift recolours live")
+        b.eval("(() => { const r = document.querySelector('#studio [data-in=glow]'); r.value = 0; r.dispatchEvent(new Event('input')); })()")
+        c(b.eval("getComputedStyle(document.querySelector('#fx-aurora')).opacity") == "0", "glow 0 hides the aurora")
+        click(b, '#studio [data-seg="motion"] [data-k="off"]')
+        c(b.eval("document.body.dataset.motion") == "off", "motion off")
+        c(b.until("VIEWS.overview.map.stats && VIEWS.overview.map.stats().parts === 0", 12), "motion off stops the globe's particles")
+        click(b, '#studio [data-seg="motion"] [data-k="full"]')
+        c(b.until("VIEWS.overview.map.stats().parts > 0", 8), "and full brings them back")
+        click(b, '#studio [data-seg="quality"] [data-k="lite"]')
+        c(b.eval("document.body.dataset.fx") == "lite" and b.eval("getComputedStyle(document.querySelector('#fx-aurora')).display") == "none",
+          "Lite rendering drops the aurora")
+        click(b, '#studio [data-seg="density"] [data-k="compact"]')
+        c(b.eval("document.body.dataset.density") == "compact", "compact density")
+        pad = b.eval("parseFloat(getComputedStyle(document.querySelector('.panel > header')).paddingTop)")
+        c(pad is not None and pad <= 8, "compact tightens panels ({}px)".format(pad))
+        b.eval("location.reload()")
+        b.wait(1.0)
+        b.until("!!document.querySelector('.kpi') && typeof Theme !== 'undefined'", 10)
+        c(b.eval("Theme.prefs.theme") == "aurora" and b.eval("Theme.prefs.shift") == 90 and b.eval("document.body.dataset.density") == "compact",
+          "choices persist across reloads")
+        c(not b.eval("!!document.querySelector('#studio')"), "studio starts closed after a reload")
+        click(b, "#theme-btn")
+        b.until("!!document.querySelector('#studio [data-reset]')", 5)
+        click(b, "#studio [data-reset]")
+        c(b.eval("Theme.prefs.theme") == "noc" and b.eval("Theme.prefs.shift") == 0 and b.eval("document.body.dataset.density") == "comfortable",
+          "reset restores the defaults")
+        b.eval("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
+        c(b.until("!document.querySelector('#studio')", 3), "Esc closes the studio")
+        b.eval("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'k', ctrlKey: true}))")
+        b.eval("(() => { const i = document.querySelector('#cmdk input'); i.value = 'nebula'; i.dispatchEvent(new Event('input')); })()")
+        c(b.until("document.querySelector('#cmdk li.on') && document.querySelector('#cmdk li.on').innerText.includes('Nebula')", 3),
+          "Ctrl+K finds themes")
+        b.eval("document.querySelector('#cmdk li.on').click()")
+        c(b.eval("Theme.prefs.theme") == "nebula", "and switches to them")
+        b.eval("Theme.set({ theme: 'noc' })")
+        c(not b.errors, "no console errors: {}".format(b.errors[:3]))
+
+
+SCENARIOS = {"pages": sc_pages, "setup": sc_setup, "respond": sc_respond, "ignore": sc_ignore, "layout": sc_layout, "globe-fade": sc_globe_fade, "theme": sc_theme, "update": sc_update, "types": sc_types, "drawer": sc_drawer, "phone": sc_phone,
              "light": sc_light}
 
 

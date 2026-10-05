@@ -9,6 +9,7 @@ Browser-side protection, because this server can change your router:
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import mimetypes
@@ -31,6 +32,31 @@ from .swos import SwOSError
 from .util import parse_networks
 
 WEB = Path(__file__).resolve().parent / "web"
+
+
+_DISK = {"sig": None, "build": ""}
+
+
+def disk_build_id() -> str:
+    """build_id() of the files on disk *now* -- re-hashed only when a file's size or mtime changed.
+    Differs from the running build when MCC was updated but not restarted."""
+    files = sorted(p for p in list(WEB.rglob("*")) + list(WEB.parent.glob("*.py")) if p.is_file())
+    sig = tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size) for p in files)
+    if sig != _DISK["sig"]:
+        _DISK.update(sig=sig, build=build_id())
+    return _DISK["build"]
+
+
+def build_id() -> str:
+    """A fingerprint of the code this server runs (console files + Python modules). An open console
+    tab compares it on every (re)connect and reloads itself when MCC was restarted on new code --
+    otherwise a tab opened before the restart keeps running the old JavaScript."""
+    h = hashlib.sha256()
+    for p in sorted(list(WEB.rglob("*")) + list(WEB.parent.glob("*.py"))):
+        if p.is_file():
+            h.update(p.name.encode())
+            h.update(p.read_bytes())
+    return h.hexdigest()[:16]
 MAX_BODY = 64 * 1024
 
 
@@ -64,6 +90,7 @@ class Server(ThreadingHTTPServer):
 
 def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840) -> Tuple[Server, str]:
     token = "" if _is_loopback(bind) else secrets.token_urlsafe(18)
+    build = build_id()
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "MCC/0.1"
@@ -166,6 +193,17 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840) -> Tuple[Se
                 return self._json(403, {"error": "cross-site request refused"})
             if self.headers.get("X-MCC") != "1":
                 return self._json(403, {"error": "missing X-MCC header"})
+            if url.path == "/api/admin/shutdown":
+                # only `mcc.py --replace` on this machine knows the per-run secret (temp run file)
+                secret = getattr(hub, "admin_secret", "")
+                given = self.headers.get("X-MCC-Secret") or ""
+                if not secret or not secrets.compare_digest(given, secret) or not _is_loopback(self.client_address[0]):
+                    return self._json(403, {"error": "shutdown refused"})
+                self._json(200, {"ok": True})
+                hook = getattr(hub, "shutdown_hook", None)
+                if hook:
+                    hook()
+                return None
             if not self._token_ok(q):
                 return self._json(401, {"error": "access token required"})
             try:
@@ -199,7 +237,7 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840) -> Tuple[Se
             self.close_connection = True
             q = hub.bus.subscribe()
             try:
-                self._event("state", hub.full_state())
+                self._event("state", dict(hub.full_state(), build=build, build_disk=disk_build_id()))
                 last = time.time()
                 while True:
                     try:
@@ -225,7 +263,7 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840) -> Tuple[Se
     # -- API ---------------------------------------------------------------------------------
     def api_get(path: str, q: Dict[str, str]) -> Any:
         if path == "/api/state":
-            return hub.full_state()
+            return dict(hub.full_state(), build=build, build_disk=disk_build_id())
         if path == "/api/devices":
             return {"devices": hub.devices_view()}
         if path == "/api/host":
@@ -246,6 +284,8 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840) -> Tuple[Se
             return {"rules": hub.detector.suppressions_list()}
         if path == "/api/geo":
             return dict(hub.geo.info(), home=hub.geo.home(hub.public_addrs()))
+        if path == "/api/build":
+            return {"build": build, "build_disk": disk_build_id()}
         if path == "/api/status":
             return hub.status()
         raise ApiError(404, "no such endpoint")

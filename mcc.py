@@ -2,6 +2,7 @@
 
     python mcc.py              start the console; connect to your router from the Setup page
     python mcc.py --demo       a simulated router + switch + network with scripted incidents
+    python mcc.py --replace    stop an MCC already running on the port, then start (i.e. restart)
 
 Python 3.8+ standard library only. Passwords are kept in memory and never written to disk.
 """
@@ -19,6 +20,7 @@ from pathlib import Path
 from mcc import __version__
 from mcc.config import DATA_DIR, Config
 from mcc.hub import Hub
+from mcc.runctl import remove_run_file, stop_existing, write_run_file
 from mcc.server import make_server
 
 DEMO_BLOCKLIST = """# Demo blocklist -- one IP or CIDR per line.
@@ -36,9 +38,16 @@ def main(argv=None) -> int:
     ap.add_argument("--speed", type=float, default=1.0, help="demo: incident script speed multiplier")
     ap.add_argument("--no-browser", action="store_true", help="don't open a browser")
     ap.add_argument("--data", default=None, help="data directory (default ./data, or ./data/demo with --demo)")
+    ap.add_argument("--replace", action="store_true",
+                    help="stop an MCC already running on this port first (restart)")
     args = ap.parse_args(argv)
 
     data_dir = Path(args.data) if args.data else (DATA_DIR / "demo" if args.demo else DATA_DIR)
+    if args.replace:
+        # before anything else: the running copy holds the UI port and the UDP collectors
+        ui_port = args.port if args.port is not None else int(Config(data_dir).get("ui.port") or 8840)
+        if not stop_existing(ui_port):
+            return 2
     world = None
     if args.demo:
         from mcc import sim
@@ -69,11 +78,14 @@ def main(argv=None) -> int:
     try:
         httpd, token = make_server(hub, bind, port)
     except OSError as e:
-        print("Cannot listen on {}:{} -- {}. Is MCC already running? Try --port.".format(bind, port, e),
-              file=sys.stderr)
+        print("Cannot listen on {}:{} -- {}. MCC is probably already running: restart it with\n"
+              "  python mcc.py --replace   (or pick another --port)".format(bind, port, e), file=sys.stderr)
         hub.stop()
         return 2
     url = "http://{}:{}/".format("127.0.0.1" if bind in ("0.0.0.0", "::") else bind, httpd.server_address[1])
+    # lets a later `mcc.py --replace` ask this copy to shut down cleanly
+    hub.admin_secret = write_run_file(httpd.server_address[1])
+    hub.shutdown_hook = lambda: threading.Thread(target=httpd.shutdown, daemon=True).start()
     if token:
         url += "?token=" + token
 
@@ -87,7 +99,7 @@ def main(argv=None) -> int:
     print("  data      {}".format(data_dir))
     if token:
         print("  ! the console is reachable from the network; the token in the URL is required")
-    print("  Ctrl+C to stop")
+    print("  Ctrl+C to stop · restart with: python mcc.py --replace{}".format(" --demo" if args.demo else ""))
     if not args.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
@@ -95,6 +107,7 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        remove_run_file(httpd.server_address[1])
         httpd.server_close()
         hub.stop()
         if world:

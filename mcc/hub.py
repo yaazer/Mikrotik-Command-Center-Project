@@ -15,6 +15,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 from .actions import BLOCK_LIST, QUARANTINE_LIST, ActionEngine
 from .collectors import FlowParser, UdpCollector, classify, level_of, split_syslog
 from .config import Config
+from .classify import CATEGORIES
 from .detect import RULES, Detector
 from .geo import Geo
 from .routeros import CertificateChanged, RouterOS, RouterOSError, local_ip_toward
@@ -763,7 +764,7 @@ class Hub:
         return {"snapshot": snap, "history": {"ifaces": hist, "health": health, "switch": sw},
                 "threats": self.detector.list(), "actions": self.actions.list(), "logs": logs,
                 "entries": self.entries, "config": self.cfg.public(), "rules": RULES,
-                "ignore": self.detector.suppressions_list()}
+                "ignore": self.detector.suppressions_list(), "categories": CATEGORIES}
 
     def devices_view(self) -> List[Dict[str, Any]]:
         known = self.detector.known_devices()

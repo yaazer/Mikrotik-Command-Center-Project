@@ -39,19 +39,20 @@ HOSTS = [
      [("s3.amazonaws.com", 443, "tcp", 0.2, 1.5, 2), ("plex.tv", 32400, "tcp", 0.1, 4.0, 1)]),
     ("192.168.88.20", "DC:2C:6E:10:00:20", "workstation", "sfp-sfpplus1", 3,
      [("github.com", 443, "tcp", 1.5, 0.2, 3), ("zoom.us", 8801, "udp", 3.0, 2.2, 1),
-      ("cloudflare.com", 443, "tcp", 0.6, 0.05, 4)]),
+      ("cloudflare.com", 443, "tcp", 0.6, 0.05, 4), ("tlu.dl.delivery.mp.microsoft.com", 443, "tcp", 4.0, 0.05, 1)]),
     ("192.168.88.70", "DC:2C:6E:10:00:70", "homelab", "sfp-sfpplus1", 4,
      [("deb.debian.org", 443, "tcp", 2.0, 0.1, 1)]),
     ("192.168.88.21", "3C:22:FB:00:00:21", "laptop", "ether2", 0,
      [("youtube.com", 443, "tcp", 6.0, 0.2, 2), ("icloud.com", 443, "tcp", 0.3, 0.1, 2)]),
     ("192.168.88.22", "3C:22:FB:00:00:22", "phone", "ether2", 0,
-     [("icloud.com", 443, "tcp", 0.2, 0.05, 2), ("google.com", 443, "tcp", 0.5, 0.05, 2)]),
+     [("icloud.com", 443, "tcp", 0.2, 0.05, 2), ("google.com", 443, "tcp", 0.5, 0.05, 2),
+      ("scontent.cdninstagram.com", 443, "tcp", 1.5, 0.1, 1)]),
     ("192.168.88.30", "A4:77:33:00:00:30", "living-room-tv", "ether3", 0,
      [("netflix.com", 443, "tcp", 16.0, 0.3, 2)]),
     ("192.168.88.40", "18:C0:4D:00:00:40", "gaming-pc", "ether4", 0,
      [("steampowered.com", 27015, "udp", 1.2, 0.6, 1), ("steampowered.com", 443, "tcp", 9.0, 0.1, 1)]),
     ("192.168.88.50", "9C:8E:CD:00:00:50", "ip-camera", "ether5", 0,
-     [("camcloud.example.net", 443, "tcp", 0.05, 1.2, 1)]),
+     [("api.wyzecam.com", 443, "tcp", 0.05, 1.2, 1)]),
     ("192.168.88.60", "00:1B:A9:00:00:60", "printer", "ether5", 0,
      [("time.cloudflare.com", 123, "udp", 0.001, 0.001, 1)]),
 ]
@@ -60,7 +61,8 @@ SERVICES = {
     "s3.amazonaws.com": "52.216.8.1", "plex.tv": "52.5.140.2", "github.com": "140.82.112.4",
     "zoom.us": "170.114.10.77", "cloudflare.com": "104.16.132.229", "deb.debian.org": "151.101.2.132",
     "youtube.com": "142.250.72.14", "icloud.com": "17.253.144.10", "google.com": "142.250.72.46",
-    "netflix.com": "45.57.40.1", "steampowered.com": "155.133.248.36", "camcloud.example.net": "47.88.10.20",
+    "netflix.com": "45.57.40.1", "steampowered.com": "155.133.248.36", "api.wyzecam.com": "47.88.10.20",
+    "tlu.dl.delivery.mp.microsoft.com": "13.107.4.50", "scontent.cdninstagram.com": "157.240.11.174",
     "time.cloudflare.com": "162.159.200.1", "irc.libera.chat": "203.0.113.200", "update-check.biz": "192.0.2.66",
 }
 
@@ -89,7 +91,8 @@ _SERVICE_CITY = {
     "s3.amazonaws.com": "Ashburn", "plex.tv": "Ashburn", "github.com": "Ashburn", "zoom.us": "San Jose",
     "cloudflare.com": "San Francisco", "deb.debian.org": "Amsterdam", "youtube.com": "Atlanta",
     "icloud.com": "Cupertino", "google.com": "Atlanta", "netflix.com": "Chicago", "steampowered.com": "Frankfurt",
-    "camcloud.example.net": "Singapore", "time.cloudflare.com": "San Francisco", "irc.libera.chat": "Stockholm",
+    "api.wyzecam.com": "Seattle", "tlu.dl.delivery.mp.microsoft.com": "Chicago",
+    "scontent.cdninstagram.com": "Atlanta", "time.cloudflare.com": "San Francisco", "irc.libera.chat": "Stockholm",
     "update-check.biz": "Bucharest",
 }
 _WORLD = sorted(c for c in _CITY if c != "Dallas")
@@ -231,6 +234,8 @@ class World:
                                       "comment": "defconf: masquerade"})
         self.add("/ip/firewall/nat", {"chain": "dstnat", "action": "dst-nat", "protocol": "tcp", "dst-port": "22",
                                       "in-interface-list": "WAN", "to-addresses": "192.168.88.70", "comment": "homelab ssh"})
+        self.add("/ip/firewall/nat", {"chain": "dstnat", "action": "dst-nat", "dst-port": "51413",
+                                      "in-interface-list": "WAN", "to-addresses": "192.168.88.70", "comment": "torrents"})
         for t in ("/ip/firewall/raw", "/ip/firewall/address-list", "/ipv6/firewall/raw", "/ipv6/firewall/filter",
                   "/ipv6/firewall/address-list", "/ip/traffic-flow/target", "/ipv6/address"):
             self.tables[t] = []
@@ -347,6 +352,22 @@ class World:
                     per_host[key] += 1
                     self.new_conn(ip, self.rng.randint(40000, 65000), rip, port, proto,
                                   up * 1e6 / n, down * 1e6 / n, self.rng.uniform(25, 140), "app", ip)
+        # the homelab seeds Linux ISOs: a BitTorrent swarm of unnamed peers on random high ports,
+        # some it dials (from its listen port 51413) and some that dial in through a port forward
+        if self.iface_up("sfp-sfpplus1") and not self.quarantined("192.168.88.70"):
+            swarm = sum(1 for c in self.conns.values() if c["_kind"] == "torrent")
+            while swarm < 14:
+                swarm += 1
+                peer = "{}.{}.{}.{}".format(self.rng.choice([31, 46, 77, 88, 91, 109, 176, 185, 188, 213]),
+                                            self.rng.randint(1, 254), self.rng.randint(1, 254), self.rng.randint(1, 254))
+                down, up = self.rng.uniform(0.2e6, 1.6e6), self.rng.uniform(0.1e6, 0.9e6)
+                if self.rng.random() < 0.4:
+                    self.new_conn(peer, self.rng.randint(20000, 65000), WAN_IP, 51413, self.rng.choice(["tcp", "udp"]),
+                                  up, down, self.rng.uniform(20, 90), "torrent", "192.168.88.70", nat_to="192.168.88.70")
+                else:
+                    self.new_conn("192.168.88.70", 51413, peer, self.rng.randint(10000, 65000),
+                                  self.rng.choice(["tcp", "udp"]), up, down, self.rng.uniform(20, 90), "torrent",
+                                  "192.168.88.70")
         # inbound HTTPS-ish visitors to the homelab ssh forward are attacks; legit visitors use 443 tunnels
         if self.rng.random() < 0.05 and self.iface_up("sfp-sfpplus1"):
             client = "{}.{}.{}.{}".format(self.rng.choice([24, 73, 98, 174]), self.rng.randint(1, 254),

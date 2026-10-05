@@ -120,6 +120,9 @@ function connectStream() {
     S.config = st.config || {};
     S.rules = st.rules || {};
     S.ignore = st.ignore || [];
+    S.categories = st.categories || [];
+    if (onBuild(st.build)) return;
+    checkSkew(st);
     S.connected = true;
     setReconnect(false);
     emit("state");
@@ -167,6 +170,91 @@ function connectStream() {
   es.addEventListener("resync", () => { es.close(); setTimeout(connectStream, 300); });
   es.onerror = () => { setReconnect(true); };
 }
+/* ---------------- traffic types: colours, colour mode, focus ---------------- */
+// Category definitions come from the server (mcc/classify.py) with a fixed hue each, so a type is the
+// same colour in every theme. by = "type" | "direction"; focus = one type highlighted everywhere.
+const Types = {
+  by: (() => { try { return localStorage.getItem("mcc-color-by") || "type"; } catch (e) { return "type"; } })(),
+  focus: null,
+  def(id) { return (S.categories || []).find((c) => c.id === id) || { id, label: id, hue: 0, c: 0 }; },
+  label(id) { return this.def(id).label; },
+  color(id, alpha) {
+    const d = this.def(id), light = document.documentElement.dataset.theme === "light";
+    const l = d.c === 0 ? (light ? 0.55 : 0.62) : d.c < 0.05 ? (light ? 0.5 : 0.7) : (light ? 0.58 : 0.76);
+    return `oklch(${l} ${d.c} ${d.hue}${alpha === undefined ? "" : " / " + alpha})`;
+  },
+  setBy(by) {
+    this.by = by;
+    try { localStorage.setItem("mcc-color-by", by); } catch (e) { /* private mode */ }
+    emit("types");
+  },
+  toggleFocus(id) { this.focus = this.focus === id ? null : id; emit("types"); },
+  /* weighted pick from {cat: bps}: a particle carries one type, in proportion to the mix */
+  pick(cats) {
+    let total = 0;
+    for (const k in cats) total += cats[k];
+    if (!total) return "other";
+    let r = Math.random() * total;
+    for (const k in cats) { r -= cats[k]; if (r <= 0) return k; }
+    return Object.keys(cats)[0];
+  },
+  /* "■ Video & music streaming 12 Mb/s" lines for tooltips and the drawer, biggest first */
+  mixHtml(cats, max) {
+    const rows = Object.entries(cats || {}).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]).slice(0, max || 4);
+    return rows.map(([k, v]) => `<div class="tmix"><i style="background:${this.color(k)}"></i>${esc(this.label(k))}<span>${fmt.bps(v)}</span></div>`).join("");
+  },
+  /* a thin stacked bar of a {cat: bps} mix */
+  barHtml(cats) {
+    const rows = Object.entries(cats || {}).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+    const total = rows.reduce((a, [, v]) => a + v, 0) || 1;
+    return `<div class="tbar">${rows.map(([k, v]) => `<i style="width:${((v / total) * 100).toFixed(2)}%;background:${this.color(k)}" title="${esc(this.label(k))}: ${fmt.bps(v)} (${Math.round((v / total) * 100)}%)"></i>`).join("")}</div>`;
+  },
+  /* the legend shown over the map / globe: types present, clickable to focus */
+  legend(types) {
+    if (this.by !== "type") {
+      return '<span><i style="background:var(--in)"></i>download</span><span><i style="background:var(--out)"></i>upload</span><span><i style="background:var(--crit)"></i>threat</span>';
+    }
+    return (types || []).filter((t) => t.bps > 0).slice(0, 9).map((t) => `<button class="tl ${this.focus === t.id ? "on" : ""} ${this.focus && this.focus !== t.id ? "dim" : ""}" data-type="${esc(t.id)}" title="${esc(t.label)}: ${fmt.bps(t.bps)} · click to highlight">
+        <i style="background:${this.color(t.id)}"></i>${esc(t.label)}</button>`).join("") + '<span><i style="background:var(--crit)"></i>threat</span>';
+  },
+};
+on("state", () => emit("types"));
+
+/* MCC restarted on different code? This tab is running the old JavaScript: reload it (the URL,
+   and with it the page you're on, is kept). True when a reload is under way. */
+function onBuild(build) {
+  if (!build) return false;
+  if (S.build && S.build !== build) {
+    setReconnect(false);
+    toast("MCC was updated", "Reloading the console…", { ms: 4000 });
+    setTimeout(() => location.reload(), 600);
+    return true;
+  }
+  S.build = build;
+  return false;
+}
+/* The page files are read from disk on every load, but the server process runs the code it started
+   with. After an update without a restart the two disagree: the page has features the server doesn't
+   feed (everything then looks empty or "other"). Say so plainly. */
+function checkSkew(info) {
+  const older = !info || !info.build;                       // a server from before build ids existed
+  const changed = !older && info.build_disk && info.build_disk !== info.build;
+  let bar = $("#update-bar");
+  if (!older && !changed) { if (bar) bar.remove(); return; }
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "update-bar";
+    bar.className = "update-bar";
+    $("#tabs").after(bar);
+  }
+  bar.innerHTML = `${ICON.alert}<span><b>MCC was updated but is still running the old version.</b> Restart it to apply:
+    run <span class="mono">restart-mcc.cmd</span> (or <span class="mono">python mcc.py --replace</span>).
+    ${older ? "Until then some features, such as traffic types, stay empty." : ""}</span>`;
+}
+setInterval(() => {
+  if (!S.connected) return;
+  api.get("/api/build").then(checkSkew).catch((e) => { if (/no such endpoint/i.test(e.message)) checkSkew(null); });
+}, 60000);
 let reconnectEl = null;
 function setReconnect(on) {
   if (on && !reconnectEl) {
@@ -204,6 +292,7 @@ function renderHeader() {
   ];
   $("#chips").innerHTML = chips.join("");
   const lvl = s.level || "calm";
+  Theme.onLevel(lvl);  // reactive ambience
   const lb = $("#level");
   lb.className = "level " + lvl;
   lb.textContent = lvl.toUpperCase();
@@ -455,13 +544,15 @@ async function loadHost() {
         <div class="panel kpi"><div class="k">Conversations</div><div class="v">${h.pairs.length}</div></div>
       </div>
       ${!peer ? `<div class="panel"><div class="body" style="padding:8px"><div class="chart short"><canvas id="hchart"></canvas></div></div></div>` : ""}
+      ${h.pairs.length ? (() => { const cats = {}; h.pairs.forEach((p) => { cats[p.cat || "other"] = (cats[p.cat || "other"] || 0) + p.up + p.down; });
+        return `<div><h4>Traffic types</h4>${Types.barHtml(cats)}<div style="margin-top:8px">${Types.mixHtml(cats, 8)}</div></div>`; })() : ""}
       ${h.geo ? `<div><h4>Location</h4><dl class="kv"><dt>Where</dt><dd>${esc([h.geo.city, h.geo.region, h.geo.country].filter(Boolean).join(", "))}</dd>
         <dt>Coordinates</dt><dd>${h.geo.lat}, ${h.geo.lon}${h.geo.precision === "country" ? " (country centre)" : ""}</dd></dl></div>` : ""}
       ${h.device ? `<div><h4>Device</h4><dl class="kv"><dt>MAC</dt><dd>${esc(dev.mac)}</dd><dt>Hostname</dt><dd>${esc(dev.hostname || "—")}</dd>
         <dt>Port</dt><dd>${esc(dev.port || dev.iface || "—")}</dd><dt>DHCP</dt><dd>${dev.dhcp ? esc(dev.status || "yes") : "no (ARP only)"}</dd></dl></div>` : ""}
       <div><h4>Conversations now</h4>${h.pairs.length ? `<table class="t"><thead><tr><th>${peer ? "LAN host" : "Remote"}</th><th>Service</th><th class="r">↓</th><th class="r">↑</th></tr></thead><tbody>
         ${h.pairs.slice(0, 40).map((p) => { const other = p.local === ip ? p.remote : p.local; const nm = p.local === ip ? p.remote_name : p.local_name;
-          return `<tr class="click" data-ip="${esc(other)}"><td><div class="who"><b>${esc(nm || other)}</b>${nm ? `<span>${esc(other)}</span>` : ""}</div></td><td>${esc(p.service)}</td><td class="r num in">${fmt.bps(p.down)}</td><td class="r num out">${fmt.bps(p.up)}</td></tr>`; }).join("")}
+          return `<tr class="click" data-ip="${esc(other)}"><td><div class="who"><b>${esc(nm || other)}</b>${nm ? `<span>${esc(other)}</span>` : ""}</div></td><td><span class="tchip" title="${esc(Types.label(p.cat || "other"))}${p.cat_why ? " · " + esc(p.cat_why) : ""}"><i class="tdot" style="background:${Types.color(p.cat || "other")}"></i>${esc(p.service)}</span></td><td class="r num in">${fmt.bps(p.down)}</td><td class="r num out">${fmt.bps(p.up)}</td></tr>`; }).join("")}
         </tbody></table>` : '<div class="note">No traffic right now.</div>'}</div>
       ${h.threats.length ? `<div><h4>Threats</h4>${h.threats.map((t) => `<div class="tcard ${t.status !== "open" ? "dim" : ""}" style="--sv:var(--${sevVar(t.severity)});border:1px solid var(--line-soft);border-radius:8px;margin-bottom:6px" data-tid="${esc(t.id)}">
         <div class="row1"><span class="sev sv-${esc(t.severity)}">${esc(t.severity)}</span><span class="grow"></span><span class="pill">${esc(t.status)}</span></div><h3>${esc(t.title)}</h3><p>${esc(t.summary)}</p></div>`).join("")}</div>` : ""}
@@ -513,6 +604,7 @@ function route() {
   main.innerHTML = "";
   current = { name: page, view: VIEWS[page], params };
   if (S.snap) current.view.render(main, params); else main.innerHTML = '<div class="empty"><b>Connecting to MCC…</b></div>';
+  Theme.frameWatch();  // Auto rendering: notice a machine that draws slowly
 }
 on("state", () => { if (current) { const m = $("#main"); m.innerHTML = ""; current.view.render(m, current.params); } });
 on("tick", () => {
@@ -552,6 +644,9 @@ const cmdk = {
     const pages = ["overview", "traffic", "threats", "actions", "devices", "interfaces", "logs", "setup"];
     pages.forEach((p) => out.push({ kind: "page", label: p[0].toUpperCase() + p.slice(1), run: () => go(p) }));
     out.push({ kind: "layout", label: "Reset this page's layout", run: () => Layout.resetPage() });
+    out.push({ kind: "look & feel", label: "Open Theme Studio", key: "theme", run: () => Theme.open() });
+    Theme.THEMES.forEach((t) => out.push({ kind: "theme", label: "Theme: " + t.label, key: "theme " + t.label.toLowerCase(),
+      run: () => Theme.set({ theme: t.id }) }));
     const snap = S.snap || { traffic: { hosts: [], peers: [] } };
     snap.traffic.hosts.forEach((h) => out.push({ kind: "LAN host", label: `${h.name || h.ip}  ${h.name ? h.ip : ""}`, key: h.ip, run: () => openHost(h.ip) }));
     snap.traffic.peers.forEach((p) => out.push({ kind: "Internet", label: `${p.name || p.ip}  ${p.name ? p.ip : ""}`, key: p.ip, run: () => openHost(p.ip) }));
@@ -580,14 +675,10 @@ function fuzzy(q, s) {
   return i === q.length && (s.includes(q.slice(0, 2)));
 }
 
-/* ---------------- theme ---------------- */
-function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; } return null; }
-function applyTheme(t) { document.documentElement.dataset.theme = t; store("mcc-theme", t); emit("theme"); }
-
 /* ---------------- boot ---------------- */
 document.addEventListener("DOMContentLoaded", () => {
-  applyTheme(store("mcc-theme") || "dark");
-  $("#theme-btn").onclick = () => applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
+  Theme.init();  // theme.js: Theme Studio, palettes, ambience, motion / rendering / density
+  $("#theme-btn").onclick = () => (Theme.isOpen() ? Theme.close() : Theme.open());
   $("#cmdk-btn").onclick = () => cmdk.open();
   $("#layout-btn").onclick = () => { Layout.resetPage(); toast("Layout reset", "Drag a panel's right or bottom edge to resize it; double-click an edge to reset one panel.", { good: true }); };
   $("#level").onclick = () => go("threats");
