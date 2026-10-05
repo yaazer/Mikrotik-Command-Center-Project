@@ -124,5 +124,11 @@ class Config:
             return strip_secrets(copy.deepcopy(self.data))
 
     def resolve(self, rel: str) -> Path:
+        """'data/x' means x in the data directory, wherever that is (--data /var/lib/mcc on a server);
+        other relative paths are relative to the program folder."""
         p = Path(rel)
-        return p if p.is_absolute() else (self.data_dir.parent / p)
+        if p.is_absolute():
+            return p
+        if p.parts and p.parts[0] == "data":
+            return self.data_dir.joinpath(*p.parts[1:])
+        return ROOT / p

@@ -259,7 +259,8 @@ class Geo:
             desc = m.get("description") or {}
             out.update({"path": str(self.db.path), "file": self.db.path.name, "type": m.get("database_type", ""),
                         "description": desc.get("en", "") if isinstance(desc, dict) else str(desc),
-                        "built": datetime.datetime.utcfromtimestamp(build).strftime("%Y-%m-%d") if build else "",
+                        "built": datetime.datetime.fromtimestamp(build, datetime.timezone.utc).strftime("%Y-%m-%d")
+                        if build else "",
                         "ip_version": self.db.ip_version,
                         "dbip": "dbip" in self.db.path.name.lower() or "db-ip" in str(m.get("database_type", "")).lower()})
         return out

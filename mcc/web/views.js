@@ -804,10 +804,10 @@ VIEWS.setup = {
     let plan;
     try { plan = await api.get(url + (lists ? "?lists=1" : "")); } catch (err) { el.innerHTML = `<div class="callout bad">${esc(err.message)}</div>`; return; }
     const removal = plan.kind === "remove";
-    const sl = { installed: "green", partial: "amber", missing: "red", unavailable: "", present: "amber", clean: "green" };
+    const sl = { installed: "green", partial: "amber", missing: "red", unavailable: "", present: "amber", clean: "green", optional: "blue" };
     el.innerHTML = `${removal ? `<label class="check" style="margin-bottom:10px"><input type="checkbox" id="rm-lists" ${lists ? "checked" : ""}> Also empty MCC's block and quarantine lists</label>` :
       `<div class="note" style="margin-bottom:10px">MCC listens on UDP <b>${plan.flow_port}</b> (flows) and <b>${plan.syslog_port}</b> (syslog) at <b>${esc(plan.mcc_ip)}</b>. Each item below shows the exact commands; tick the ones you want.</div>`}
-      ${plan.items.map((it) => `<div class="plan-item"><div class="head">${it.changes.length ? `<input type="checkbox" data-item="${esc(it.id)}" ${it.status !== "installed" ? "checked" : ""} aria-label="include">` : ""}
+      ${plan.items.map((it) => `<div class="plan-item"><div class="head">${it.changes.length ? `<input type="checkbox" data-item="${esc(it.id)}" ${it.status !== "installed" && it.status !== "optional" ? "checked" : ""} aria-label="include">` : ""}
         <h3>${esc(it.title)}</h3><span class="pill ${sl[it.status] || ""}">${esc(it.status)}</span></div><p>${esc(it.why)}</p>
         ${it.detail ? `<div class="note" style="margin-bottom:8px">${esc(it.detail)}</div>` : ""}${it.changes.length ? changesHtml(it.changes) : '<div class="note">Nothing to change.</div>'}</div>`).join("")}
       <div class="btnrow"><button class="btn ${removal ? "danger" : "primary"}" id="plan-apply">${removal ? "Approve removal" : "Approve & apply selected"}</button><button class="btn ghost" id="plan-cancel">Cancel</button>

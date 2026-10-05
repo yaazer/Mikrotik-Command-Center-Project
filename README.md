@@ -18,6 +18,40 @@ The console opens at <http://127.0.0.1:8840/>. It needs Python 3.8+ and a curren
 
 ---
 
+## Running it on a Debian VM (a service)
+
+On Debian 12/13 or Ubuntu, as a user with sudo:
+
+```
+git clone -b main https://github.com/yaazer/Mikrotik-Command-Center-Project.git
+cd Mikrotik-Command-Center-Project
+sudo ./deploy/install-debian.sh
+```
+
+It prints the console URL, `http://<vm-ip>:8840/?token=…`. Open it from your desktop; the token sets a cookie, so bookmark the URL once.
+
+| What | Where |
+|---|---|
+| Program | `/opt/mcc`: root-owned, read-only to the service |
+| Data | `/var/lib/mcc`: config, threats, actions, ignore rules, geolocation DB |
+| Settings | `/etc/mcc/mcc.env` (root-only): bind address, port, access token, optional passwords |
+| Service | `systemctl status mcc` · `journalctl -u mcc -f` · runs as the unprivileged user `mcc`, sandboxed by systemd |
+| Update | `git pull && sudo ./deploy/install-debian.sh`: code replaced, data and settings kept |
+
+**Ports to allow** if the VM has a firewall: 8840/tcp (console) from your desktop, and 2055/udp (flows) and 5514/udp (syslog) from the router. The installer opens these automatically when `ufw` is active.
+
+**Reconnecting after a reboot.** MCC keeps passwords in memory only, so after a restart you'd enter them again in Setup. To have the service reconnect on its own:
+1. Connect once from Setup; that saves the address and user.
+2. Put the password in `/etc/mcc/mcc.env` (`MCC_ROUTER_PASSWORD=…`, `MCC_SWITCH_PASSWORD=…`). The file is root-only.
+3. Run `systemctl restart mcc`.
+
+MCC itself still never writes a password. Use a dedicated, limited RouterOS user for this. A wrong password is tried once, not retried, so the account doesn't get locked.
+
+**Moving from a PC to the VM.**
+- **Data:** copy the PC's `data` folder next to `mcc.py` before running the installer, and the first install imports it (threat history, ignore rules, known devices, geolocation database).
+- **Telemetry:** in the VM's console open **Setup › Telemetry** and approve the plan again. That points flow export and syslog at the VM, and offers (unticked) to remove the router's old flow export to the PC.
+- **The PC:** stop the copy running there.
+
 ## The demo
 
 `--demo` starts a simulated RB5009 and CRS309 with a small LAN:

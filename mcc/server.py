@@ -88,8 +88,13 @@ class Server(ThreadingHTTPServer):
         super().server_bind()
 
 
-def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840) -> Tuple[Server, str]:
-    token = "" if _is_loopback(bind) else secrets.token_urlsafe(18)
+def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840, token: Optional[str] = None) -> Tuple[Server, str]:
+    # Exposed beyond loopback the console needs a token: the one given (a service sets MCC_TOKEN so
+    # its URL survives restarts) or a fresh random one per run.
+    if _is_loopback(bind):
+        token = ""
+    elif not token or len(token) < 16:
+        token = secrets.token_urlsafe(18)
     build = build_id()
 
     class Handler(BaseHTTPRequestHandler):

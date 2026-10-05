@@ -99,6 +99,21 @@ class SetupPlanner:
             "changes": ch, "current": {k: tf.get(k) for k in ("enabled", "interfaces", "active-flow-timeout",
                                                                "inactive-flow-timeout")}})
 
+        # MCC moved (e.g. from a PC to a VM): the router still exports to the old address. Offer --
+        # unticked -- to remove IPFIX targets on MCC's port that point elsewhere.
+        stale = [t for t in others if str(t.get("port")) == str(flow_port) and str(t.get("version", "")).lower() == "ipfix"]
+        if stale:
+            items.append({
+                "id": "stale", "title": "Remove flow export to another collector on UDP {}".format(flow_port),
+                "why": "Probably an earlier MCC (for example the PC you ran it on before this machine). Remove it so "
+                       "the router stops sending flows there. If something else collects flows at that address "
+                       "(ntopng, ElastiFlow...), leave this unticked.",
+                "status": "optional", "detail": "",
+                "changes": [_ch("DELETE", "/ip/traffic-flow/target/{}".format(t[".id"]),
+                                target="[find dst-address={} port={}]".format(t.get("dst-address"), t.get("port")),
+                                note="flow export to {}:{}".format(t.get("dst-address"), t.get("port")))
+                            for t in stale]})
+
         # 2. syslog -> MCC
         actions = ros.get_list("/system/logging/action")
         act = next((a for a in actions if a.get("name") == "mcc"), None)

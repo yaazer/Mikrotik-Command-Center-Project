@@ -1,0 +1,45 @@
+[Unit]
+Description=Mikrotik Command Center
+Documentation=file:///opt/mcc/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mcc
+Group=mcc
+# MCC_BIND, MCC_PORT, MCC_TOKEN and the optional passwords live here (root-only, 0600)
+EnvironmentFile=/etc/mcc/mcc.env
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+WorkingDirectory=/opt/mcc
+ExecStart=/usr/bin/python3 /opt/mcc/mcc.py --data /var/lib/mcc --no-browser
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+# Hardening: MCC needs the network and its data directory, nothing else
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/mcc
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import http.client
 import ipaddress
+import os
 import json
 import shutil
 import socket
@@ -662,7 +663,6 @@ def t_blocklist():
         eq(b.count, 3, "bad lines skipped")
         time.sleep(0.05)
         p.write_text("9.9.9.9\n", encoding="utf-8")
-        import os
         os.utime(p, (time.time() + 5, time.time() + 5))
         ok(b.contains("9.9.9.9") and not b.contains("1.2.3.4"), "reloads when the file changes")
     finally:
@@ -1173,6 +1173,86 @@ def t_replace_running_instance():
         except OSError:
             pass
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_service_mode():
+    """How the Debian service runs MCC: settings from the environment, a fixed token so the URL survives
+    restarts, data in --data, and an unattended reconnect with the password from the env file."""
+    import subprocess
+    from mcc import runctl
+    w = sim.World(script=False).start()
+    router = sim.serve(sim.make_router(w))
+    tmp = Path(tempfile.mkdtemp(prefix="mcc-svc-"))
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    # as left behind by connecting once from Setup: address and user, never a password
+    (tmp / "config.json").write_text(json.dumps({
+        "router": {"host": "127.0.0.1", "user": "admin", "scheme": "http", "port": router.server_address[1]},
+        "collectors": {"bind": "127.0.0.1", "flow_port": 0, "syslog_port": 0}}), encoding="utf-8")
+    token = "fixed-token-for-the-service-1234"
+    procs = []
+
+    def start(password):
+        env = dict(os.environ, MCC_BIND="0.0.0.0", MCC_PORT=str(port), MCC_DATA=str(tmp), MCC_TOKEN=token,
+                   MCC_ROUTER_PASSWORD=password, PYTHONUNBUFFERED="1")
+        p = subprocess.Popen([sys.executable, str(ROOT / "mcc.py"), "--no-browser"], cwd=str(ROOT), env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        procs.append(p)
+        return p
+
+    def status(tok=token):
+        st, body, _ = _req(port, "GET", "/api/status?token=" + tok)
+        return st, body
+
+    try:
+        p = start("demo")
+        ok(wait_for(lambda: runctl.port_in_use(port), 30), "service is listening")
+        eq(status("wrong-token")[0], 401, "the token is required on 0.0.0.0")
+        ok(wait_for(lambda: status()[1]["router"]["state"] == "ok", 30), "reconnected to the router unattended")
+        ok("demo" not in (tmp / "config.json").read_text(encoding="utf-8"), "the password never reaches the data dir")
+        ok(runctl.stop_existing(port, log=lambda m: None), "stops cleanly")
+        ok(wait_for(lambda: p.poll() is not None, 15), "process exited")
+        p2 = start("not-the-password")
+        ok(wait_for(lambda: runctl.port_in_use(port), 30), "restarted with the same URL")
+        eq(status()[0], 200, "the same token still works after a restart")
+        time.sleep(3)
+        ok(status()[1]["router"]["state"] != "ok", "a wrong password doesn't connect")
+        runctl.stop_existing(port, log=lambda m: None)
+        wait_for(lambda: p2.poll() is not None, 15)
+        out = p2.stdout.read()
+        eq(out.count("retrying"), 1, "and it isn't retried (no account lockout): {}".format(out[-300:]))
+        # data/... paths follow --data
+        cfg = Config(tmp)
+        eq(cfg.resolve("data/blocklist.txt"), tmp / "blocklist.txt", "data/ paths resolve inside --data")
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+            if p.stdout:
+                p.stdout.close()
+        router.shutdown()
+        w.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_setup_offers_to_remove_old_flow_target():
+    """Moving MCC (PC -> VM): the router still exports to the old address. The plan offers, unticked,
+    to remove IPFIX targets on MCC's port pointing elsewhere."""
+    with Env() as e:
+        e.world.add("/ip/traffic-flow/target", {"dst-address": "192.168.88.250", "port": str(e.hub.collector_port("flow")),
+                                                "version": "ipfix"})
+        e.world.add("/ip/traffic-flow/target", {"dst-address": "192.168.88.251", "port": "9995", "version": "9"})
+        plan = e.hub.setup.plan()
+        stale = next((i for i in plan["items"] if i["id"] == "stale"), None)
+        ok(stale, "stale target item offered")
+        eq((stale["status"], len(stale["changes"])), ("optional", 1), "optional, only the same-port IPFIX target")
+        ok("192.168.88.250" in stale["changes"][0]["cli"], "names the old address")
+        e.hub.setup.apply(plan["id"], ["flows", "stale"])
+        addrs = sorted(t["dst-address"] for t in e.world.tables["/ip/traffic-flow/target"])
+        eq(addrs, ["127.0.0.1", "192.168.88.251"], "old MCC target removed, unrelated collector kept")
 
 
 # ============================================================================================
