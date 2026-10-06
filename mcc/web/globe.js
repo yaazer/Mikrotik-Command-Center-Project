@@ -59,7 +59,7 @@ const Globe = (() => {
       : (window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches ? "off" : "full"));
     const lite = () => !!(window.Theme && Theme.isLite());
     let w = 0, h = 0, dpr = 1, colors = {}, raf = 0, last = 0, alive = true, snap = null;
-    let clat = 25, clon = -40, target = null, zoom = 1, vlon = 0, vlat = 0, dragging = false, lastTouch = 0;
+    let clat = 25, clon = -40, target = null, zoom = 1, zoomTo = null, vlon = 0, vlat = 0, dragging = false, lastTouch = 0;
     let spin = motion() !== "off";
     try { const s = localStorage.getItem("mcc-globe-spin"); if (s !== null) spin = s === "1"; } catch (e) { /* */ }
     let home = null, homeV = null, nodes = [], parts = [], hover = null, centred = false;
@@ -94,8 +94,68 @@ const Globe = (() => {
     const rate = (n) => n.up + n.down;
     // a device is singled out: places it doesn't talk to step right back
     const selDim = (n) => (Select.ip && n.gone ? 0.12 : 1);
-    let selShown = null;
+    // singled out: the globe snaps to a view of all its connection points and stops orbiting.
+    // fitKey = what the current fit framed; preSel = the zoom to go back to afterwards;
+    // selAt = when it was singled out (dragging or zooming after that keeps your view)
+    let fitKey = null, preSel = null, selAt = 0, selIp = null, fitC = null, fitFar = 0;
     on("select", () => { if (alive && snap) update(snap); });
+
+    /* where to look so that all these points (unit vectors) are in view, and how wide that view is */
+    const ang = (a, b) => Math.acos(Math.max(-1, Math.min(1, a[0] * b[0] + a[1] * b[1] + a[2] * b[2])));
+    const unit = (v) => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+    function viewFor(pts) {
+      // the centre that keeps the farthest point closest (iteratively step toward the farthest point)
+      let c = unit(pts.reduce((a, v) => [a[0] + v[0], a[1] + v[1], a[2] + v[2]], [0, 0, 0]));
+      if (!isFinite(c[0]) || Math.hypot(c[0], c[1], c[2]) < 0.5) c = pts[0];
+      for (let i = 1; i <= 200; i++) {
+        let q = pts[0], qa = -1;
+        for (const v of pts) { const d = ang(c, v); if (d > qa) { qa = d; q = v; } }
+        const k = 1 / (i + 1);
+        c = unit([c[0] + (q[0] - c[0]) * k, c[1] + (q[1] - c[1]) * k, c[2] + (q[2] - c[2]) * k]);
+      }
+      let far = Math.max(...pts.map((v) => ang(c, v)));
+      const LIMIT = 80 * D2R;  // beyond this a point sits on the globe's rim: hard to see, harder to click
+      if (far > LIMIT) {
+        // they span more than one side of the globe: face the side with the most of them
+        let best = c, bestN = -1, bestSum = Infinity;
+        for (const cand of [c, ...pts]) {
+          const ds = pts.map((v) => ang(cand, v));
+          const n = ds.filter((d) => d <= LIMIT).length, sum = ds.reduce((a, d) => a + Math.min(d, LIMIT), 0);
+          if (n > bestN || (n === bestN && sum < bestSum)) { best = cand; bestN = n; bestSum = sum; }
+        }
+        c = best;
+        far = Math.max(...pts.map((v) => ang(c, v)).filter((d) => d <= LIMIT));
+      }
+      return { c, far };
+    }
+    function fitView(pts) {
+      const { c, far } = viewFor(pts);
+      fitC = c; fitFar = far;
+      // orthographic: a point at angle far from the centre lands sin(far) * R from it; keep it ~80 % of
+      // the way to the panel's edge, leaving room for its label and the raised arc
+      zoomTo = Math.max(0.85, Math.min(2.6, 0.4 / (0.42 * Math.max(Math.sin(Math.min(far, Math.PI / 2)), 0.16))));
+      target = { lat: Math.max(-80, Math.min(80, Math.asin(c[1]) / D2R)), lon: Math.atan2(c[0], c[2]) / D2R };
+      vlon = vlat = 0;
+    }
+    function frameSelection(list) {
+      if (!Select.ip) {
+        if (preSel) { zoomTo = preSel.zoom; preSel = null; }  // back to how it was; orbiting resumes
+        fitKey = null; selIp = null; fitC = null;
+        return;
+      }
+      if (!preSel) preSel = { zoom: zoomTo != null ? zoomTo : zoom };
+      if (Select.ip !== selIp) { selIp = Select.ip; selAt = performance.now(); fitC = null; }  // a new device: frame it afresh
+      const located = list.filter((p) => p.geo);
+      const key = Select.ip + "|" + located.map((p) => p.geo.lat.toFixed(1) + "," + p.geo.lon.toFixed(1)).sort().join(";");
+      if (key === fitKey || lastTouch > selAt) return;  // nothing new to frame, or you've taken over
+      const pts = located.map((p) => W(p.geo.lat, p.geo.lon));
+      if (!pts.length) return;
+      if (homeV) pts.push(homeV);  // arcs start at home: keep it in the picture
+      fitKey = key;
+      // hold still while its connections come and go: re-frame only when one lands outside the view
+      if (fitC && pts.every((v) => ang(fitC, v) <= fitFar + 2 * D2R)) return;
+      fitView(pts);
+    }
 
     /* the peers to put on the globe: everything, or only the singled-out device's paths */
     function peerList(s) {
@@ -132,13 +192,7 @@ const Globe = (() => {
       const wrapB = $(".sel-banner", wrap);
       wrapB.innerHTML = Select.banner();
       wrapB.classList.toggle("hidden", !Select.ip);
-      if (Select.ip !== selShown) {
-        selShown = Select.ip;
-        // singling out an Internet host: turn the globe to it
-        const g = Select.ip && list.length === 1 && list[0].ip === Select.ip ? list[0].geo : null;
-        if (g) { target = { lat: Math.max(-60, Math.min(60, g.lat)), lon: g.lon }; vlon = vlat = 0; }
-        else if (Select.ip) selShown = Select.data && Select.data.ip === Select.ip ? Select.ip : null;  // retry once loaded
-      }
+      frameSelection(list);
       for (const p of list) {
         if (!p.geo) continue;
         const key = p.geo.lat.toFixed(1) + "," + p.geo.lon.toFixed(1);
@@ -235,6 +289,10 @@ const Globe = (() => {
       if (last && now - last < 15) return;  // ~60 fps cap (high-refresh screens would draw 2x for nothing)
       const dt = Math.min(0.1, last ? (now - last) / 1000 : 0.016);
       last = now;
+      if (zoomTo != null) {  // eased zoom (fitting a selection, or going back afterwards)
+        zoom += (zoomTo - zoom) * (1 - Math.pow(0.02, dt));
+        if (Math.abs(zoomTo - zoom) < 0.002) { zoom = zoomTo; zoomTo = null; }
+      }
       if (!dragging) {
         if (target) {
           const k = 1 - Math.pow(0.02, dt);
@@ -245,7 +303,8 @@ const Globe = (() => {
           clon += vlon * dt; clat = Math.max(-80, Math.min(80, clat + vlat * dt));
           vlon *= Math.pow(0.05, dt); vlat *= Math.pow(0.05, dt);
           const m = motion();
-          if (spin && m !== "off" && Math.abs(vlon) < 1 && now - lastTouch > 2500) clon += (m === "calm" ? 1.5 : 4) * dt;
+          // (no orbiting while a device is singled out: its view holds still)
+          if (spin && !Select.ip && m !== "off" && Math.abs(vlon) < 1 && now - lastTouch > 2500) clon += (m === "calm" ? 1.5 : 4) * dt;
         }
       }
       let expired = false;
@@ -557,6 +616,7 @@ const Globe = (() => {
     cv.addEventListener("mouseleave", () => { hover = null; tip.hide(); });
     cv.addEventListener("wheel", (e) => {
       e.preventDefault();
+      zoomTo = null; lastTouch = performance.now();
       zoom = Math.max(0.6, Math.min(4, zoom * Math.exp(-e.deltaY * 0.0015)));
     }, { passive: false });
     cv.addEventListener("dblclick", () => goHome());
@@ -566,11 +626,12 @@ const Globe = (() => {
       const k = b.dataset.g;
       if (k === "home") goHome();
       if (k === "spin") { spin = !spin; b.classList.toggle("on", spin); try { localStorage.setItem("mcc-globe-spin", spin ? "1" : "0"); } catch (err) { /* */ } }
+      if (k === "in" || k === "out") { zoomTo = null; lastTouch = performance.now(); }
       if (k === "in") zoom = Math.min(4, zoom * 1.25);
       if (k === "out") zoom = Math.max(0.6, zoom / 1.25);
     });
     $('.globe-ui [data-g="spin"]', wrap).classList.toggle("on", spin);
-    function goHome() { if (home) { target = { lat: Math.max(-60, Math.min(60, home.lat * 0.6)), lon: home.lon + 25 }; zoom = 1; } }
+    function goHome() { if (home) { target = { lat: Math.max(-60, Math.min(60, home.lat * 0.6)), lon: home.lon + 25 }; zoomTo = 1; } }
 
     function openPlace(n) {
       if (n.peers.length === 1) return openHost(n.peers[0].ip);
@@ -597,8 +658,8 @@ const Globe = (() => {
     }
     raf = requestAnimationFrame(frame);
     // for the UI checks: how far the oldest particle has travelled (0..1) and how many there are
-    const stats = () => ({ parts: parts.length, oldest: parts.reduce((m, p) => Math.max(m, p.t), 0), places: places.size,
-      list: [...places.values()].map((n) => ({ key: n.key, gone: !!n.gone, alpha: n.alpha })) });
+    const stats = () => ({ view: { lat: clat, lon: clon, zoom, settling: !!(target || zoomTo != null) }, parts: parts.length, oldest: parts.reduce((m, p) => Math.max(m, p.t), 0), places: places.size,
+      list: [...places.values()].map((n) => ({ key: n.key, gone: !!n.gone, alpha: n.alpha, screen: n.screen })) });
     return { update, destroy, stats };
   }
   return { create };

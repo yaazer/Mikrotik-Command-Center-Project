@@ -594,9 +594,60 @@ def sc_single_out(d: Demo, c: Check) -> None:
         c(not b.errors, "no console errors: {}".format(b.errors[:3]))
 
 
+def sc_globe_fit(d: Demo, c: Check) -> None:
+    """Singling out a device snaps the globe to show all its connection points, and holds it still."""
+    with Browser(1600, 1000) as b:
+        b.nav(d.url + "#/overview")
+        b.until("!!document.querySelector('#live canvas') && VIEWS.overview.map && VIEWS.overview.map.stats && VIEWS.overview.map.stats().places > 3", 15)
+        b.eval("VIEWS.overview.mountLive('globe')")
+        b.wait(2.0)
+        z0 = b.eval("VIEWS.overview.map.stats().view.zoom")
+        lon0 = b.eval("VIEWS.overview.map.stats().view.lon")
+        b.wait(1.0)
+        c(b.eval("VIEWS.overview.map.stats().view.lon") != lon0, "(the globe orbits before anything is singled out)")
+        # a host whose destinations fit on one side of the globe (the torrent box's swarm spans the world)
+        host = b.eval("S.snap.traffic.hosts.find(h => h.peers >= 2 && h.cat !== 'p2p').ip")
+        b.eval("openHost(%r)" % host)
+        c(b.until("Select.data && Select.data.ip === %r && !VIEWS.overview.map.stats().view.settling" % host, 8),
+          "singling out a host snaps the globe to a new view ({})".format(host))
+        b.wait(0.5)
+        inview = b.eval("""(() => { const cv = document.querySelector('#live canvas'), w = cv.clientWidth, h = cv.clientHeight;
+          const live = VIEWS.overview.map.stats().list.filter(p => !p.gone);
+          return {n: live.length, ok: live.filter(p => p.screen && p.screen[0] >= 0 && p.screen[0] <= w && p.screen[1] >= 0 && p.screen[1] <= h).length}; })()""")
+        c(inview["n"] > 0 and inview["ok"] == inview["n"], "every one of its connection points is in view ({ok}/{n})".format(**inview))
+        swarm = b.eval("(S.snap.traffic.hosts.find(h => h.cat === 'p2p') || {}).ip")
+        if swarm:
+            b.eval("openHost(%r)" % swarm)
+            b.until("Select.data && Select.data.ip === %r && !VIEWS.overview.map.stats().view.settling" % swarm, 8)
+            b.wait(0.5)
+            iv = b.eval("""(() => { const cv = document.querySelector('#live canvas'), w = cv.clientWidth, h = cv.clientHeight;
+              const live = VIEWS.overview.map.stats().list.filter(p => !p.gone);
+              return {n: live.length, ok: live.filter(p => p.screen && p.screen[0] >= 0 && p.screen[0] <= w && p.screen[1] >= 0 && p.screen[1] <= h).length}; })()""")
+            c(iv["ok"] >= 0.6 * iv["n"], "a worldwide swarm: the side with most of it is shown ({ok}/{n})".format(**iv))
+            b.eval("openHost(%r)" % host)
+            b.until("Select.data && Select.data.ip === %r && !VIEWS.overview.map.stats().view.settling" % host, 8)
+        v1 = b.eval("VIEWS.overview.map.stats().view")
+        b.wait(4.5)  # two drawer refreshes: its paths change, the view holds
+        v2 = b.eval("VIEWS.overview.map.stats().view")
+        c(abs(v1["lon"] - v2["lon"]) < 0.01 and abs(v1["lat"] - v2["lat"]) < 0.01, "and stops orbiting")
+        peer = b.eval("S.snap.traffic.peers.find(p => p.geo).ip")
+        b.eval("openHost(%r)" % peer)
+        c(b.until("Select.data && Select.data.ip === %r && !VIEWS.overview.map.stats().view.settling" % peer, 8), "picking an Internet host re-frames it")
+        g = b.eval("S.snap.traffic.peers.find(p => p.ip === %r).geo" % peer)
+        v = b.eval("VIEWS.overview.map.stats().view")
+        c(v["zoom"] > 1.0, "a single destination is zoomed in on (zoom {:.2f})".format(v["zoom"]))
+        shot(b, "globe-fit")
+        b.eval("closeDrawer()")
+        c(b.until("Math.abs(VIEWS.overview.map.stats().view.zoom - %r) < 0.01" % z0, 6), "Show all goes back to the earlier zoom")
+        lon1 = b.eval("VIEWS.overview.map.stats().view.lon")
+        b.wait(1.0)
+        c(b.eval("VIEWS.overview.map.stats().view.lon") != lon1, "and orbiting resumes")
+        c(not b.errors, "no console errors: {}".format(b.errors[:3]))
+
+
 SCENARIOS = {"pages": sc_pages, "setup": sc_setup, "respond": sc_respond, "ignore": sc_ignore, "layout": sc_layout, "globe-fade": sc_globe_fade, "theme": sc_theme, "update": sc_update, "types": sc_types, "drawer": sc_drawer, "phone": sc_phone,
              "light": sc_light, "offscreen": sc_offscreen,
-             "single-out": sc_single_out}
+             "single-out": sc_single_out, "globe-fit": sc_globe_fit}
 
 
 def main(argv) -> int:

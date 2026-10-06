@@ -230,7 +230,10 @@ This is an informed guess from names and ports, not deep packet inspection. A CD
 
 **Single out a device:** click it on the flow map (or a place on the globe, or a row in any list).
 - The flow map shows only that device and every device it talks to, with its traffic paths running through the router.
-- The globe shows only where its traffic goes. It turns toward an Internet host you pick.
+- The globe shows only where its traffic goes. It stops orbiting and snaps to a view of all its connection points and your home location.
+  - **Worldwide traffic:** if they span more than one side of the globe (a torrent swarm, say), it faces the side with the most of them.
+  - **Holds still:** it re-frames only when a new connection lands outside the view.
+  - **Your view wins:** drag or zoom and it leaves the view to you. Show all returns to your earlier zoom, and orbiting resumes.
 - The drawer shows everything MCC knows about it: rates, traffic types, location, the device record, threats, actions, and its **traffic paths**. Each path lists who it talks to, where they are, the type and services, connections and rates.
 - Click a path to single out that device instead. Press Esc, click **Show all**, or click empty space or the router to see everything again.
 
