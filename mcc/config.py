@@ -50,6 +50,8 @@ DEFAULTS: Dict[str, Any] = {
         "watch_ports": [23, 1337, 2323, 4444, 5555, 6667, 6697, 9001, 31337],
         # firewall rules you log with one of these prefixes are VPN kill switches: a hit is a VPN leak
         "leak_prefixes": ["VPN-LEAK"],
+        # a WireGuard tunnel with no handshake for this long is reported as possibly down
+        "vpn_handshake_s": 300,
         "exfil_mbps": 50,
         "exfil_s": 120,
         "exfil_factor": 4,
@@ -59,6 +61,9 @@ DEFAULTS: Dict[str, Any] = {
         "quiet_s": 600,
     },
     "actions": {"default_block": "1h"},
+    # VPN tunnels: interfaces (blank = every WireGuard / OpenVPN / L2TP / SSTP / PPTP / GRE / IPIP / EoIP
+    # interface) and the devices that must only ever use one (a direct connection from them is a leak)
+    "vpn": {"interfaces": [], "required": []},
     "blocklist_file": "data/blocklist.txt",
     # IP geolocation: a local .mmdb (blank = newest in data/geo). Home blank = locate the router's public IP.
     "geo": {"db": "", "home": {"lat": "", "lon": "", "label": ""}},

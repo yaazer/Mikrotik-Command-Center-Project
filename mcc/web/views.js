@@ -65,6 +65,26 @@ function typesHtml(types) {
       <span class="num faint">${Math.round((t.bps / total) * 100)}%</span><span class="num in">${fmt.bps(t.down)}</span><span class="num out">${fmt.bps(t.up)}</span>
       <span class="faint tl-sub">${t.hosts} host${t.hosts === 1 ? "" : "s"} · ${t.peers} peer${t.peers === 1 ? "" : "s"}</span></div>`).join("")}</div>`;
 }
+/* VPN: the tunnel interfaces MCC knows, and a chip for a path that went through one */
+function vpnNames() { return new Set(((S.snap && S.snap.vpn) || {}).tunnels ? S.snap.vpn.tunnels.map((t) => t.name) : []); }
+function vpnChip(via) {
+  const vias = Array.isArray(via) ? via : via ? [via] : [];
+  const names = vpnNames(), hit = vias.filter((v) => names.has(v));
+  return hit.length ? ` <span class="pill vpn" title="through the VPN tunnel ${esc(hit.join(", "))}">VPN</span>` : "";
+}
+function sumSeries(names) {
+  const rows = names.map((n) => S.hist.ifaces[n] || []).filter((r) => r.length);
+  if (!rows.length) return [[], []];
+  const base = rows.reduce((a, r) => (r.length > a.length ? r : a));
+  const rx = [], tx = [];
+  base.forEach((r, i) => {
+    let a = 0, b = 0;
+    rows.forEach((o) => { const q = o[o.length - base.length + i]; if (q) { a += q[1]; b += q[2]; } });
+    rx.push([r[0], a]); tx.push([r[0], b]);
+  });
+  return [rx, tx];
+}
+
 /* a pinned device in a conversation row */
 function pinMark(ip) { return Pins.has(ip) ? `<span class="pin-mark" title="pinned">${ICON.pin}</span>` : ""; }
 function typeDot(cat) {
@@ -441,7 +461,7 @@ VIEWS.traffic = {
     Live.set($("#pairs"), note + (rows.length ? `<table class="t"><thead><tr><th>LAN host</th><th></th><th>Remote</th><th>Type</th><th>Service</th><th class="r">Conns</th><th class="r">↓</th><th class="r">↑</th><th></th></tr></thead><tbody>
       ${rows.map((p) => `<tr class="click ${Pins.has(p.local) || Pins.has(p.remote) ? "pinned" : ""}" data-ip="${esc(p.dir === "lan" ? p.local : p.remote)}"><td><div class="who-row">${whoCell(names[p.local], p.local)}${pinMark(p.local)}</div></td><td class="faint">${p.dir === "in" ? "⇠" : p.dir === "lan" ? "⇄" : "⇢"}</td>
         <td><div class="who-row">${whoCell(names[p.remote], p.remote)}${pinMark(p.remote)}</div></td><td><span class="tchip" title="${esc(p.cat_why || "")}">${typeDot(p.cat)}${esc(Types.label(p.cat))}</span></td>
-        <td>${esc(p.service)}</td><td class="r num">${p.conns}</td><td class="r num in">${fmt.bps(p.down)}</td><td class="r num out">${fmt.bps(p.up)}</td><td style="width:100px">${rateBars(p.down, p.up, max)}</td></tr>`).join("")}
+        <td>${esc(p.service)}${vpnChip(p.via)}</td><td class="r num">${p.conns}</td><td class="r num in">${fmt.bps(p.down)}</td><td class="r num out">${fmt.bps(p.up)}</td><td style="width:100px">${rateBars(p.down, p.up, max)}</td></tr>`).join("")}
       </tbody></table>` : '<div class="empty">No conversations match.</div>'), bindRows);
     Live.set($("#hosts"), hostsTable(tr.hosts, "host", 60), bindRows);
     Live.set($("#peers"), hostsTable(tr.peers, "peer", 80), bindRows);
@@ -450,6 +470,177 @@ VIEWS.traffic = {
   onTypes() { if (S.snap && $("#pairs")) this.tick(); },
   leave() { if (this.map) this.map.destroy(); if (this.globe) this.globe.destroy(); },
 };
+
+/* ================= VPN ================= */
+const VPN_STATUS = { up: ["green", "up"], stale: ["amber", "no handshake"], down: ["red", "down"], disabled: ["", "disabled"], missing: ["", "not found"] };
+VIEWS.vpn = {
+  render(m) {
+    this.q = "";
+    m.innerHTML = `${connectBanner()}<div id="vpn-none"></div>
+      <div class="kpis" id="vpn-kpis"></div>
+      <div class="grid">
+        <section class="panel s8" data-pid="vpn:map"><header><h2>Through the tunnel</h2><span class="grow"></span><span class="hint" id="vpn-src"></span>
+          <div class="seg color-by" title="Colour the traffic by type or by direction"><button data-by="type">Type</button><button data-by="direction">Direction</button></div></header>
+          <div class="map-wrap" id="vpn-map"><div class="map-legend type-legend"></div></div></section>
+        <section class="panel s4" data-pid="vpn:tunnels"><header><h2>Tunnels</h2></header><div class="body scroll" style="max-height:470px" id="vpn-tunnels"></div></section>
+        <section class="panel s8" data-pid="vpn:chart"><header><h2>VPN throughput</h2><span class="grow"></span><span class="legend"><span><i style="background:var(--in)"></i>into the LAN</span><span><i style="background:var(--out)"></i>out through the tunnel</span></span></header>
+          <div class="body"><div class="chart"><canvas id="vpn-chart"></canvas></div></div></section>
+        <section class="panel s4" data-pid="vpn:alerts"><header><h2>VPN alerts</h2><span class="grow"></span><a class="hint" href="#/threats">all threats →</a></header><div class="feed" id="vpn-alerts" style="height:300px"></div></section>
+        <section class="panel s12" data-pid="vpn:hosts"><header><h2>Devices on the VPN</h2><span class="grow"></span><span class="hint">tick <b>Must use VPN</b> to be alerted the moment one goes out directly</span></header>
+          <div class="body flush scroll" style="max-height:420px" id="vpn-hosts"></div></section>
+        <section class="panel s6" data-pid="vpn:pairs"><header><h2>Conversations through the VPN</h2><span class="grow"></span><input type="text" id="vpn-q" placeholder="Filter by host, IP or service" style="max-width:240px"></header>
+          <div class="body flush scroll" style="max-height:440px" id="vpn-pairs"></div></section>
+        <section class="panel s6" data-pid="vpn:outside"><header><h2>Outside the tunnel</h2><span class="grow"></span><span class="hint">direct traffic from VPN devices</span></header>
+          <div class="body flush scroll" style="max-height:440px" id="vpn-outside"></div></section>
+        <section class="panel s12" data-pid="vpn:settings"><header><h2>VPN settings</h2></header><div class="body" id="vpn-settings"></div></section>
+      </div>`;
+    this.map = TrafficMap.create($("#vpn-map", m), { peers: 16, hosts: 12 });
+    $("#vpn-q", m).oninput = (e) => { this.q = e.target.value.toLowerCase(); this.tick(); };
+    this.drawSettings();
+    this.tick();
+  },
+  tick() {
+    const s = S.snap, v = s.vpn || { tunnels: [], required: [] }, tv = s.traffic.vpn || { hosts: [], peers: [], pairs: [], outside: [] };
+    const tunnels = v.tunnels || [];
+    const required = new Set(v.required || []);
+    $("#vpn-none").innerHTML = tunnels.length ? "" : `<div class="callout" style="margin-bottom:14px"><b>No VPN tunnel found on the router.</b>
+      MCC looks for WireGuard, OpenVPN, L2TP, SSTP, PPTP, GRE, IPIP, EoIP, VXLAN and ZeroTier interfaces. If yours is something else, name it in <b>VPN settings</b> below.</div>`;
+    const worst = tunnels.find((t) => t.status === "down") || tunnels.find((t) => t.status === "stale") || tunnels[0];
+    const users = tv.hosts.filter((h) => h.conns > 0);
+    const wanIn = s.wan.rx_bps || 0, wanOut = s.wan.tx_bps || 0;
+    const share = wanIn + wanOut ? Math.min(100, Math.round(((tv.in_bps + tv.out_bps) / (wanIn + wanOut)) * 100)) : 0;
+    const alerts = sortedThreats((t) => t.rule === "vpn_leak" || t.rule === "vpn_down");
+    const live = alerts.filter((t) => t.status === "open" || t.status === "acknowledged");
+    const [dv, du] = fmt.bpsParts(tv.in_bps), [uv, uu] = fmt.bpsParts(tv.out_bps);
+    const st = worst ? VPN_STATUS[worst.status] || ["", worst.status] : ["", "none"];
+    $("#vpn-kpis").innerHTML = `
+      <div class="panel kpi"><div class="k">Tunnel</div><div class="v" style="font-size:22px">${worst ? esc(worst.name) : "—"}</div>
+        <div class="sub"><span class="pill ${st[0]}">${esc(st[1])}</span>${tunnels.length > 1 ? ` · ${tunnels.length} tunnels` : ""}</div></div>
+      <div class="panel kpi"><div class="k in">↓ Through VPN</div><div class="v">${dv}<small>${du}</small></div><div class="sub">into the LAN</div></div>
+      <div class="panel kpi"><div class="k out">↑ Through VPN</div><div class="v">${uv}<small>${uu}</small></div><div class="sub">out through the tunnel</div></div>
+      <div class="panel kpi"><div class="k">Share of Internet</div><div class="v">${share}<small>%</small></div><div class="sub">of all WAN traffic</div></div>
+      <div class="panel kpi"><div class="k">Devices</div><div class="v">${users.length}</div><div class="sub">${required.size} must use the VPN</div></div>
+      <div class="panel kpi clickable" data-go="threats"><div class="k">VPN alerts</div><div class="v" style="color:${live.length ? "var(--crit)" : "var(--ok)"}">${live.length}</div>
+        <div class="sub">leaks and tunnel drops</div></div>`;
+    $$("[data-go]", $("#vpn-kpis")).forEach((k) => (k.onclick = () => go(k.dataset.go)));
+    // the flow map, fed only what went through the tunnel: devices -> tunnel -> destinations
+    this.map.update({ router: { identity: tunnels.map((t) => t.name).join(" + ") || "VPN" },
+      traffic: { hosts: users, peers: tv.peers, in_bps: tv.in_bps, out_bps: tv.out_bps, conns: tv.pairs.reduce((a, p) => a + p.conns, 0),
+        source: s.traffic.source } });
+    $("#vpn-src").textContent = tv.known ? `${tv.conns} connections through the tunnel` : s.traffic.source === "conntrack"
+      ? "path not known yet: waiting for the router's addresses" : "the tunnel path needs the live connection table";
+    refreshTypeUI();
+    Live.set($("#vpn-tunnels"), this.tunnelsHtml(tunnels));
+    const [rx, tx] = sumSeries(tunnels.map((t) => t.name));
+    Charts.line($("#vpn-chart"), [{ data: rx, color: cssVar("--in"), fill: true, label: "↓" }, { data: tx, color: cssVar("--out"), fill: true, label: "↑" }],
+      { window: 1800, yfmt: fmt.bps, mirror: true });
+    Live.set($("#vpn-alerts"), alerts.length ? alerts.slice(0, 20).map((t) => threatCard(t, false)).join("") :
+      `<div class="empty" style="margin:auto"><b style="color:var(--ok)">No VPN alerts</b>Tunnel drops and leaks show up here.</div>`,
+      (el) => bindThreatCards(el, (id) => go("threats", { id })));
+    Live.set($("#vpn-hosts"), this.hostsHtml(tv.hosts, required), (el) => {
+      bindRows(el);
+      $$("[data-req]", el).forEach((b) => (b.onclick = (e) => { e.stopPropagation(); this.toggleRequired(b.dataset.req); }));
+    });
+    const q = this.q;
+    const rows = tv.pairs.filter((p) => !q || [p.local, p.remote, p.service, nameOf(p.local), nameOf(p.remote), Types.label(p.cat)]
+      .some((x) => (x || "").toLowerCase().includes(q)));
+    Live.set($("#vpn-pairs"), this.pairsHtml(rows, false, required, "No conversations through the tunnel right now."), bindRows);
+    Live.set($("#vpn-outside"), this.pairsHtml(tv.outside, true, required,
+      "Nothing from these devices is going around the tunnel."), bindRows);
+  },
+  tunnelsHtml(tunnels) {
+    if (!tunnels.length) return '<div class="empty">No tunnel interfaces.</div>';
+    return tunnels.map((t) => {
+      const [cls, label] = VPN_STATUS[t.status] || ["", t.status];
+      const g = t.endpoint_geo;
+      const where = g ? [g.city, g.country].filter(Boolean).join(", ") : "";
+      const hs = t.handshake_s;
+      return `<div class="tunnel ${esc(t.status)}"><div class="row1"><b>${esc(t.name)}</b><span class="faint">${esc(t.kind)}</span><span class="grow"></span><span class="pill ${cls}">${esc(label)}</span></div>
+        ${t.comment ? `<div class="muted" style="font-size:12.5px">${esc(t.comment)}</div>` : ""}
+        <dl class="kv">
+          ${t.endpoint ? `<dt>Server</dt><dd class="mono">${esc(t.endpoint)}${where ? `<div class="faint" style="font-family:var(--sans)">${esc(where)}</div>` : ""}</dd>` : ""}
+          ${t.addresses.length ? `<dt>Tunnel address</dt><dd class="mono">${esc(t.addresses.join(", "))}</dd>` : ""}
+          ${hs != null ? `<dt>Last handshake</dt><dd style="${t.status === "stale" ? "color:var(--high)" : ""}">${fmt.dur(hs)} ago</dd>` : ""}
+          <dt>Now</dt><dd><span class="in">↓ ${fmt.bps(t.rx_bps)}</span> · <span class="out">↑ ${fmt.bps(t.tx_bps)}</span></dd>
+        </dl></div>`;
+    }).join("");
+  },
+  hostsHtml(hosts, required) {
+    if (!hosts.length) return '<div class="empty"><b>No device is using the VPN right now</b>Devices appear here once their traffic goes through a tunnel.</div>';
+    const max = Math.max(1, ...hosts.map((h) => Math.max(h.down, h.up, h.direct_down, h.direct_up)));
+    return `<table class="t"><thead><tr><th>Device</th><th class="r">VPN ↓</th><th class="r">VPN ↑</th><th class="r">Direct ↓</th><th class="r">Direct ↑</th><th>Through the VPN</th><th>Status</th><th class="r">Must use VPN</th></tr></thead><tbody>
+      ${hosts.map((h) => {
+        const tot = h.up + h.down + h.direct_up + h.direct_down;
+        const pct = tot ? Math.round(((h.up + h.down) / tot) * 100) : h.conns ? 100 : 0;
+        const leak = h.required && h.direct_conns > 0;
+        const status = leak ? '<span class="pill red">leaking</span>' : h.conns === 0 && h.direct_conns === 0 ? '<span class="pill">quiet</span>'
+          : h.direct_conns > 0 ? '<span class="pill amber" title="some of its traffic goes around the tunnel">split tunnel</span>'
+          : `<span class="pill green">${h.required ? "VPN only" : "all through VPN"}</span>`;
+        return `<tr class="click ${h.pinned ? "pinned" : ""}" data-ip="${esc(h.ip)}"><td><div class="who-row">${typeDot(h.cat)}${whoCell(h.name, h.ip)}${Pins.button(h.ip)}</div></td>
+          <td class="r num in">${fmt.bps(h.down)}</td><td class="r num out">${fmt.bps(h.up)}</td>
+          <td class="r num ${leak ? "bad" : "in"}">${h.direct_conns ? fmt.bps(h.direct_down) : ""}</td><td class="r num ${leak ? "bad" : "out"}">${h.direct_conns ? fmt.bps(h.direct_up) : ""}</td>
+          <td style="width:160px"><div class="share"><i style="width:${pct}%"></i></div><span class="faint num" style="font-size:11.5px">${pct}%</span></td>
+          <td>${status}</td>
+          <td class="r"><button class="btn sm ${h.required ? "on" : ""}" data-req="${esc(h.ip)}" aria-pressed="${!!h.required}" title="${h.required ? "Stop requiring the VPN" : "Alert whenever this device goes out without the VPN"}">${h.required ? ICON.check + " Required" : "Require"}</button></td></tr>`;
+      }).join("")}</tbody></table>`;
+  },
+  pairsHtml(rows, outside, required, empty) {
+    if (!rows.length) return `<div class="empty">${empty}</div>`;
+    const max = Math.max(...rows.map((p) => Math.max(p.down, p.up)), 1);
+    return `<table class="t"><thead><tr><th>LAN host</th><th>Remote</th><th>Type</th><th>Service</th>${outside ? "<th>Out</th>" : ""}<th class="r">↓</th><th class="r">↑</th><th></th></tr></thead><tbody>
+      ${rows.map((p) => `<tr class="click ${outside && required.has(p.local) ? "leakrow" : ""}" data-ip="${esc(p.remote)}"><td>${whoCell(nameOf(p.local), p.local)}</td><td>${whoCell(nameOf(p.remote), p.remote)}</td>
+        <td><span class="tchip" title="${esc(p.cat_why || "")}">${typeDot(p.cat)}${esc(Types.label(p.cat))}</span></td><td style="white-space:nowrap">${esc(p.service)}</td>
+        ${outside ? `<td class="mono">${esc(p.via)}${required.has(p.local) ? ' <span class="pill red">leak</span>' : ""}</td>` : ""}
+        <td class="r num in">${fmt.bps(p.down)}</td><td class="r num out">${fmt.bps(p.up)}</td><td style="width:90px">${rateBars(p.down, p.up, max)}</td></tr>`).join("")}
+      </tbody></table>`;
+  },
+  async saveVpn(patch) {
+    try {
+      S.config = await api.post("/api/settings", patch);
+      this.drawSettings();
+      return true;
+    } catch (err) { toast("Not saved", err.message, { bad: true, ms: 10000 }); return false; }
+  },
+  async toggleRequired(ip) {
+    const cur = new Set((S.config.vpn || {}).required || []);
+    const on = !cur.has(ip);
+    if (on) cur.add(ip); else cur.delete(ip);
+    if (await this.saveVpn({ vpn: { required: [...cur] } })) {
+      if (S.snap.vpn) S.snap.vpn.required = [...cur];
+      toast(on ? `${ip} must use the VPN` : `${ip} may use either path`, on ? "MCC alerts the moment it goes out without the VPN." : "", { good: true });
+      this.tick();
+    }
+  },
+  drawSettings() {
+    const el = $("#vpn-settings");
+    if (!el) return;
+    const c = S.config.vpn || {}, d = S.config.detect || {};
+    const found = ((S.snap && S.snap.vpn) || {}).tunnels || [];
+    el.innerHTML = `<form class="form" id="f-vpn">
+      <label for="v-if">Tunnel interfaces</label><input type="text" id="v-if" value="${esc((c.interfaces || []).join(", "))}" placeholder="auto${found.length && !(c.interfaces || []).length ? ": " + esc(found.map((t) => t.name).join(", ")) : ""}">
+      <label for="v-req">Must use the VPN</label><textarea id="v-req" rows="3" placeholder="one IP per line: MCC raises a critical VPN leak alert when one of these goes out without the VPN">${esc((c.required || []).join("\n"))}</textarea>
+      <label for="v-hs">No handshake for (s)</label><input type="number" id="v-hs" value="${esc(d.vpn_handshake_s || 300)}" style="max-width:140px">
+      <span></span><div class="note">How MCC tells: a connection that leaves the router through a tunnel is translated to the tunnel's own address, and the router's connection table says so. Blank interfaces = every WireGuard, OpenVPN, L2TP, SSTP, PPTP, GRE, IPIP, EoIP, VXLAN or ZeroTier interface. Your kill-switch rule's <span class="mono">VPN-LEAK</span> log hits are alerts too (Setup › Settings › VPN leak log prefixes).</div>
+      <span></span><div class="btnrow"><button class="btn primary" type="submit">Save VPN settings</button></div></form>`;
+    $("#f-vpn", el).onsubmit = async (e) => {
+      e.preventDefault();
+      const lines = (id) => $(id).value.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
+      const patch = { vpn: { interfaces: lines("#v-if"), required: lines("#v-req") } };
+      const hs = +$("#v-hs").value;
+      if (hs > 0) patch.detect = { vpn_handshake_s: hs };
+      if (await this.saveVpn(patch)) toast("VPN settings saved", "", { good: true });
+    };
+  },
+  onThreat() { if (S.snap) this.tick(); },
+  onTypes() { if (S.snap && $("#vpn-map")) this.tick(); },
+  leave() { if (this.map) this.map.destroy(); },
+};
+function nameOf(ip) {
+  const tr = S.snap.traffic;
+  const h = tr.hosts.find((x) => x.ip === ip) || tr.peers.find((x) => x.ip === ip) ||
+    (tr.vpn || { hosts: [], peers: [] }).hosts.find((x) => x.ip === ip) || (tr.vpn || { peers: [] }).peers.find((x) => x.ip === ip);
+  return h ? h.name : "";
+}
 
 /* ================= Threats ================= */
 VIEWS.threats = {

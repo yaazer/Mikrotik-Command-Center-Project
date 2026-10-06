@@ -56,6 +56,9 @@ RULES: Dict[str, Dict[str, str]] = {
                  "leak prefix, VPN-LEAK by default) caught a device sending traffic outside its VPN. The VPN on "
                  "that device is probably down or misrouted; anything that got past the rule showed your real "
                  "address."},
+    "vpn_down": {"name": "VPN tunnel down", "why": "A VPN tunnel interface stopped running, or its WireGuard peer "
+                 "has not completed a handshake for minutes. Devices that rely on it are cut off -- or, without a "
+                 "kill switch, going out unprotected."},
     "exfil": {"name": "Unusual upload", "why": "A LAN host has been uploading far above its own normal rate for a "
               "while. Could be a backup -- or data leaving."},
     "new_device": {"name": "New device", "why": "A MAC address never seen before joined the network."},
@@ -603,6 +606,56 @@ class Detector:
                               e.get("prefix", "").strip(), e.get("chain", ""), out_if, src),
                           ts, subject=src, role="host", target=dst, evidence=self.recent[src],
                           proposals=[self._kill(src), self._quarantine(src)], count=n)
+
+    def on_vpn(self, tunnels: List[Dict[str, Any]], ts: Optional[float] = None) -> None:
+        """Tunnel status from the hub every few seconds: alert while one is down, close the alert when it's back."""
+        ts = ts or time.time()
+        with self.lock:
+            for t in tunnels:
+                name, status = t["name"], t["status"]
+                if status in ("down", "stale"):
+                    ep = t.get("endpoint") or ""
+                    if status == "down":
+                        title = "VPN tunnel {} is down".format(name)
+                        summary = "The {} interface is not running{}.".format(
+                            name, " (server {})".format(ep) if ep else "")
+                    else:
+                        age = t.get("handshake_s")
+                        title = "VPN tunnel {} may be down".format(name)
+                        summary = "No WireGuard handshake with {} for {}.".format(
+                            ep or "its peer", "{} min".format(int(age // 60)) if age is not None else "as long as MCC has watched")
+                    self.raise_threat("vpn_down", name, "high" if status == "down" else "medium", title, summary, ts,
+                                      target=ep, evidence=[(ts, "{} {}".format(name, status))])
+                elif status == "up":
+                    tid = self.by_key.get(("vpn_down", name))
+                    th = self.threats.get(tid) if tid else None
+                    if th is not None and th["status"] in ("open", "acknowledged"):
+                        self.set_status(tid, "resolved", "{} is back up".format(name))
+
+    def on_vpn_bypass(self, conns: List[Dict[str, Any]], ts: Optional[float] = None) -> None:
+        """Connections from devices that must only use the VPN, seen leaving by another interface (the
+        connection table's NAT address says which). Unlike a kill-switch log hit, this traffic got out."""
+        ts = ts or time.time()
+        with self.lock:
+            by_host: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+            for c in conns:
+                by_host[c["local"]].append(c)
+            for local, cs in by_host.items():
+                c = max(cs, key=lambda x: x.get("up", 0) + x.get("down", 0))
+                text = "{} {}:{} -> {}:{} out {} (not the VPN)".format(c.get("proto", ""), c.get("src", local),
+                                                                       c.get("sport", ""), c.get("dst", ""),
+                                                                       c.get("dport", ""), c["via"])
+                self._note(local, ts, text)
+                vias = sorted({x["via"] for x in cs})
+                self.raise_threat("vpn_leak", local + ":direct", "critical",
+                                  "VPN leak: {} is going out {} directly".format(local, ", ".join(vias)),
+                                  "{} connection{} from a device that must only use the VPN left by {} and got "
+                                  "through, e.g. to {} port {}. Check its VPN, and add a kill-switch rule.".format(
+                                      len(cs), "" if len(cs) == 1 else "s", ", ".join(vias), c.get("remote", ""),
+                                      c.get("port", "")),
+                                  ts, subject=local, role="host", target=c.get("remote", ""),
+                                  evidence=self.recent[local], proposals=[self._kill(local), self._quarantine(local)],
+                                  count=len(cs))
 
     def on_login(self, src: str, user: str, via: str, ok: bool, ts: Optional[float] = None) -> None:
         ts = ts or time.time()

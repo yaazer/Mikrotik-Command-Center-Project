@@ -144,6 +144,8 @@ Blocks and quarantines also drop the address's open connections. Without that, c
 | Suspicious outbound port | a LAN host connects out on 23, 4444, 6667, 9001, … | block peer / quarantine |
 | Unusual upload | ≥ 50 Mb/s and ≥ 4× the host's normal rate, for 2 min | drop connections / quarantine |
 | VPN leak | a firewall rule logged with the `VPN-LEAK` prefix (your VPN kill switch) catches a device; prefixes in Settings | drop connections / quarantine |
+| VPN leak (got through) | a device on the VPN page's *Must use the VPN* list leaves by another interface | drop connections / quarantine |
+| VPN tunnel down | a tunnel interface stops running, or WireGuard has no handshake for 5 min | — |
 | New device | a MAC never seen before (the first run is the baseline) | quarantine, or mark known |
 | Link down | a router or switch port that was up loses link | — |
 | Router CPU / temperature | ≥ 90 % for 30 s / ≥ 75 °C | — |
@@ -234,6 +236,28 @@ Every conversation is classified into one of these types:
 4. **Fallback:** anything else on 80/443 is web, and the rest is "other".
 
 This is an informed guess from names and ports, not deep packet inspection. A CDN that serves several services shows as whatever its name says, and encrypted traffic to an unrecognised name is "web". Each type keeps the same colour in every theme.
+
+## VPN tunnels
+
+The **VPN** page shows everything going through your VPN tunnel(s), and nothing else.
+- **Tunnels:** each one's status (up, down, or *no handshake* for a silent WireGuard peer), server address and location, tunnel address, last handshake and live rates. The VPN tab shows **!** whenever a tunnel is down, whatever page you're on.
+- **Through the tunnel:** a flow map of only the VPN traffic, devices → tunnel → destinations, coloured by type. Below it are the tunnel's throughput over time, and its share of all Internet traffic.
+- **Devices on the VPN:** each device's traffic through the tunnel and outside it, the share that goes through it, and a status: *all through VPN*, *split tunnel* or *leaking*.
+- **Conversations through the VPN**, and **Outside the tunnel**: what those same devices send around it.
+- **VPN alerts:** tunnel drops and leaks.
+
+**How MCC tells which way a connection went:** a connection leaving through a tunnel is translated to the tunnel's own address, and the router's connection table records that address. So MCC needs no knowledge of your routing rules or mangle marks.
+- **Which interfaces count:** by default, every WireGuard, OpenVPN, L2TP, SSTP, PPTP, GRE, IPIP, EoIP, VXLAN or ZeroTier interface. Name others in **VPN settings**.
+- **Not a WAN:** a VPN's own default route, in its own routing table, no longer makes the tunnel count as a WAN. Its traffic is already counted, encrypted, on the real uplink.
+
+**Alerts:**
+- **VPN tunnel down:** high when the interface stops running, medium when WireGuard has had no handshake for 5 minutes (adjustable). It resolves itself when the tunnel is back.
+- **VPN leak, got through (critical):** a device on the **Must use the VPN** list was seen leaving by another interface. Tick **Require** on its row, or list it in VPN settings. This complements your kill-switch rule's `VPN-LEAK` log hits, which are attempts the rule blocked.
+
+**Limits:**
+- **Live connection table only:** the path comes from the live connection table, not from flow records.
+- **Policy-based IPsec:** this has no tunnel interface, so it isn't shown.
+- **No NAT on the tunnel:** a site-to-site tunnel without NAT is recognised only for addresses inside the tunnel's own subnet.
 
 ## Singling out a device, and pinning
 

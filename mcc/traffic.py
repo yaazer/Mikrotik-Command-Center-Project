@@ -58,7 +58,7 @@ class TrafficModel:
         self.lan_nets = lan_nets
         self.router_addrs = router_addrs
         self.name_of = name_of
-        self.conn_pairs: Dict[Tuple[str, str, str, int], Dict[str, Any]] = {}
+        self.conn_pairs: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self.conn_count = 0
         self.conn_at = 0.0
         self._prev_bytes: Dict[str, Tuple[float, int, int]] = {}
@@ -66,6 +66,9 @@ class TrafficModel:
         self.flow_total = 0
         self.host_hist: Dict[str, Deque[Tuple[float, float, float]]] = defaultdict(lambda: deque(maxlen=300))
         self.baseline_up: Dict[str, float] = {}
+        # which router interface a connection left (or arrived) by: path_of(direction, src, dst, reply_dst)
+        # -> interface name, or "" when the connection table doesn't say (set by the hub)
+        self.path_of: Callable[[str, str, str, str], str] = lambda d, src, dst, rdst: ""
 
     # -- classification ----------------------------------------------------------------------
     def side(self, ip: str) -> str:
@@ -102,17 +105,19 @@ class TrafficModel:
     def ingest_conns(self, conns: Iterable[Dict[str, Any]], now: Optional[float] = None) -> List[Dict[str, Any]]:
         """Takes /ip/firewall/connection rows, returns them normalised (for the detector)."""
         now = now or time.time()
-        pairs: Dict[Tuple[str, str, str, int], Dict[str, Any]] = {}
+        pairs: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         seen_ids = set()
         normalised = []
         for c in conns:
             src, sport = split_hostport(c.get("src-address", ""))
             dst, dport = split_hostport(c.get("dst-address", ""))
             rsrc, rport = split_hostport(c.get("reply-src-address", ""))
+            rdst, _ = split_hostport(c.get("reply-dst-address", ""))
             o = self.orient(src, dst, rsrc)
             if o is None:
                 continue
             local, remote, direction = o
+            via = "" if direction == "lan" else self.path_of(direction, src, dst, rdst)
             proto = str(c.get("protocol", "")).upper() or "?"
             if proto.isdigit():
                 proto = PROTO_NAMES.get(int(proto), proto)
@@ -135,18 +140,18 @@ class TrafficModel:
                 up, down = orig, repl
             else:
                 up, down = repl, orig
-            key = (local, remote, proto, port)
+            key = (local, remote, proto, port, via)
             p = pairs.get(key)
             if p is None:
                 p = pairs[key] = {"local": local, "remote": remote, "proto": proto, "port": port,
-                                  "dir": direction, "up": 0.0, "down": 0.0, "conns": 0, "bytes": 0}
+                                  "dir": direction, "via": via, "up": 0.0, "down": 0.0, "conns": 0, "bytes": 0}
             p["up"] += up
             p["down"] += down
             p["conns"] += 1
             p["bytes"] += ob + rb
             normalised.append({"id": cid, "local": local, "remote": remote, "dir": direction, "proto": proto,
                                "port": port, "src": src, "dst": dst, "sport": sport or 0, "dport": dport or 0,
-                               "tcp_state": c.get("tcp-state", ""), "up": up, "down": down})
+                               "tcp_state": c.get("tcp-state", ""), "up": up, "down": down, "via": via})
         for cid in list(self._prev_bytes):
             if cid not in seen_ids:
                 del self._prev_bytes[cid]
@@ -179,9 +184,9 @@ class TrafficModel:
         while self.flows and self.flows[0][0] < cutoff:
             self.flows.popleft()
 
-    def flow_pairs(self, now: float) -> Dict[Tuple[str, str, str, int], Dict[str, Any]]:
+    def flow_pairs(self, now: float) -> Dict[Tuple[Any, ...], Dict[str, Any]]:
         self._prune(now)
-        pairs: Dict[Tuple[str, str, str, int], Dict[str, Any]] = {}
+        pairs: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         span = self.FLOW_WINDOW
         for _ts, f in self.flows:
             local, remote = f["local"], f["remote"]
@@ -197,7 +202,7 @@ class TrafficModel:
             p = pairs.get(key)
             if p is None:
                 p = pairs[key] = {"local": local, "remote": remote, "proto": proto, "port": port, "dir": f["dir"],
-                                  "up": 0.0, "down": 0.0, "conns": 0, "bytes": 0}
+                                  "via": "", "up": 0.0, "down": 0.0, "conns": 0, "bytes": 0}
             bps = f["bytes"] * 8 / span
             if up:
                 p["up"] += bps
@@ -217,7 +222,8 @@ class TrafficModel:
 
     def snapshot(self, now: Optional[float] = None, blocked: Optional[Set[str]] = None,
                  threats: Optional[Dict[str, str]] = None, limit_pairs: int = 120,
-                 pinned: Optional[Dict[str, bool]] = None) -> Dict[str, Any]:
+                 pinned: Optional[Dict[str, bool]] = None, vpn: Optional[Set[str]] = None,
+                 vpn_required: Iterable[str] = ()) -> Dict[str, Any]:
         """pinned: address -> is it a LAN host. Pinned devices lead every list (and are listed even
         when idle); conversations involving one come first."""
         now = now or time.time()
@@ -291,6 +297,7 @@ class TrafficModel:
                             for ip, r in peers.items()), key=order)
         type_list = sorted(({**t, "hosts": len(t["hosts"]), "peers": len(t["peers"]), "bps": t["up"] + t["down"]}
                             for t in types.values()), key=lambda t: -t["bps"])
+        vpn_view = self._vpn_view(pairs.values(), vpn or set(), set(vpn_required), blocked, threats, pinned)
         return {
             "source": src,
             "conns": self.conn_count if src == "conntrack" else sum(p["conns"] for p in pairs.values()),
@@ -298,12 +305,91 @@ class TrafficModel:
             "hosts": host_list[:60], "host_count": len(host_list),
             "peers": peer_list[:80], "peer_count": len(peer_list),
             "pairs": [{"local": p["local"], "remote": p["remote"], "proto": p["proto"], "port": p["port"],
-                       "dir": p["dir"], "up": p["up"], "down": p["down"], "conns": p["conns"],
+                       "dir": p["dir"], "via": p.get("via", ""), "up": p["up"], "down": p["down"], "conns": p["conns"],
                        "service": service_label(p["proto"], p["port"]), "cat": p["cat"], "cat_why": p["cat_why"]}
                       for p in plist[:limit_pairs]],
             "services": sorted(services.values(), key=lambda s: -s["bps"])[:20],
             "types": type_list,
+            "vpn": vpn_view,
         }
+
+    def _vpn_view(self, pairs: Iterable[Dict[str, Any]], vpn: Set[str], required: Set[str], blocked: Set[str],
+                  threats: Dict[str, str], pinned: Dict[str, bool]) -> Dict[str, Any]:
+        """Traffic through the VPN tunnel(s), the devices using them, and what those devices send outside.
+        A connection's path is the interface it was NAT'd to (its reply-dst address); "" = not known."""
+        hosts: Dict[str, Dict[str, Any]] = {}
+        peers: Dict[str, Dict[str, Any]] = {}
+        through, outside = [], []
+        tot = {"in": 0.0, "out": 0.0, "conns": 0, "direct_in": 0.0, "direct_out": 0.0}
+        known = False
+        for p in pairs:
+            if p["dir"] == "lan":
+                continue
+            via = p.get("via", "")
+            known = known or bool(via)
+            if not via:
+                continue  # path unknown (flow records, or no NAT): neither VPN nor direct
+            h = hosts.setdefault(p["local"], {"ip": p["local"], "name": self.name_of(p["local"]), "up": 0.0,
+                                              "down": 0.0, "conns": 0, "direct_up": 0.0, "direct_down": 0.0,
+                                              "direct_conns": 0, "peers": set(), "_cats": [], "via": set()})
+            if via in vpn:
+                h["up"] += p["up"]
+                h["down"] += p["down"]
+                h["conns"] += p["conns"]
+                h["peers"].add(p["remote"])
+                h["via"].add(via)
+                h["_cats"].append((p.get("cat", "other"), p["up"] + p["down"]))
+                r = peers.setdefault(p["remote"], {"ip": p["remote"], "name": self.name_of(p["remote"]), "up": 0.0,
+                                                   "down": 0.0, "conns": 0, "hosts": set(), "ports": set(), "_cats": []})
+                r["up"] += p["up"]
+                r["down"] += p["down"]
+                r["conns"] += p["conns"]
+                r["hosts"].add(p["local"])
+                r["ports"].add(p["port"])
+                r["_cats"].append((p.get("cat", "other"), p["up"] + p["down"]))
+                tot["in"] += p["down"]
+                tot["out"] += p["up"]
+                tot["conns"] += p["conns"]
+                through.append(p)
+            else:
+                h["direct_up"] += p["up"]
+                h["direct_down"] += p["down"]
+                h["direct_conns"] += p["conns"]
+                outside.append(p)
+        for ip in required:  # devices that must use the VPN are listed even when quiet
+            hosts.setdefault(ip, {"ip": ip, "name": self.name_of(ip), "up": 0.0, "down": 0.0, "conns": 0,
+                                  "direct_up": 0.0, "direct_down": 0.0, "direct_conns": 0, "peers": set(),
+                                  "_cats": [], "via": set()})
+        users = {ip for ip, h in hosts.items() if h["conns"] or ip in required}
+        for ip, h in hosts.items():
+            if ip in users:
+                tot["direct_in"] += h["direct_down"]
+                tot["direct_out"] += h["direct_up"]
+
+        def cats(x: Dict[str, Any]) -> Dict[str, Any]:
+            c, dom = classify.rollup(x.pop("_cats", []))
+            return {"cats": c, "cat": dom}
+
+        def pair_out(p: Dict[str, Any]) -> Dict[str, Any]:
+            return {"local": p["local"], "remote": p["remote"], "proto": p["proto"], "port": p["port"], "dir": p["dir"],
+                    "via": p.get("via", ""), "up": p["up"], "down": p["down"], "conns": p["conns"],
+                    "service": service_label(p["proto"], p["port"]), "cat": p.get("cat", "other"),
+                    "cat_why": p.get("cat_why", "")}
+
+        rate = lambda x: x["up"] + x["down"]  # noqa: E731
+        host_list = sorted(({**h, "peers": len(h["peers"]), "via": sorted(h["via"]), "required": ip in required,
+                             "pinned": ip in pinned, "threat": threats.get(ip, ""), **cats(h)}
+                            for ip, h in hosts.items() if ip in users),
+                           key=lambda h: (not h["required"], not h["pinned"], -rate(h)))
+        peer_list = sorted(({**r, "hosts": sorted(r["hosts"])[:8], "ports": sorted(r["ports"])[:8],
+                             "blocked": ip in blocked, "threat": threats.get(ip, ""), "pinned": ip in pinned, **cats(r)}
+                            for ip, r in peers.items()), key=lambda r: -rate(r))
+        through.sort(key=lambda p: -rate(p))
+        outside = sorted((p for p in outside if p["local"] in users), key=lambda p: (p["local"] not in required, -rate(p)))
+        return {"interfaces": sorted(vpn), "known": known, "in_bps": tot["in"], "out_bps": tot["out"],
+                "conns": tot["conns"], "direct_in_bps": tot["direct_in"], "direct_out_bps": tot["direct_out"],
+                "hosts": host_list[:60], "peers": peer_list[:60], "pairs": [pair_out(p) for p in through[:120]],
+                "outside": [pair_out(p) for p in outside[:60]]}
 
     def host_detail(self, ip: str, now: Optional[float] = None) -> Dict[str, Any]:
         now = now or time.time()

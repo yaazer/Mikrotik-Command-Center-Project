@@ -75,7 +75,9 @@ def main(argv=None) -> int:
         cfg = Config(data_dir)
         cfg.update({"collectors": {"bind": "127.0.0.1", "flow_port": 0, "syslog_port": 0},
                     "blocklist_file": str(data_dir / "blocklist.txt"),
-                    "lan_networks": ["192.168.88.0/24"], "wan": {"down_mbps": 500, "up_mbps": 100}})
+                    "lan_networks": ["192.168.88.0/24"], "wan": {"down_mbps": 500, "up_mbps": 100},
+                    # the simulated laptop and phone are policy-routed through a WireGuard tunnel
+                    "vpn": {"required": list(sim.VPN_HOSTS)}})
     else:
         cfg = Config(data_dir)
 
