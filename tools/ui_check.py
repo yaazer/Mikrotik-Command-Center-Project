@@ -81,7 +81,12 @@ def click(b: Browser, sel: str) -> bool:
 
 def see(b: Browser, sel: str) -> None:
     """Scroll to a panel, as a person would: live tables off screen wait until they're scrolled to."""
-    b.until("(() => { const e = document.querySelector(%r); if (e) e.scrollIntoView({block: 'nearest'}); return !!e; })()" % sel, 10)
+    # (again until it stays in view: tables above it can fill in as they come into view and push it down)
+    b.until("(() => { const e = document.querySelector(%r); if (!e) return false; e.scrollIntoView({block: 'nearest'});"
+            " const r = e.getBoundingClientRect(); return r.top < innerHeight && r.bottom > 0; })()" % sel, 10)
+    b.wait(0.2)
+    b.until("(() => { const e = document.querySelector(%r); e.scrollIntoView({block: 'nearest'});"
+            " const r = e.getBoundingClientRect(); return r.top < innerHeight && r.bottom > 0; })()" % sel, 10)
 
 
 # ------------------------------------------------------------------------------------------
@@ -554,8 +559,44 @@ def sc_offscreen(d: Demo, c: Check) -> None:
         c(not b.errors, "no console errors: {}".format(b.errors[:3]))
 
 
+def sc_single_out(d: Demo, c: Check) -> None:
+    """Click a device on the flow map: only it and its paths remain, details in the drawer. Pin it."""
+    with Browser(1600, 1000) as b:
+        b.nav(d.url + "#/traffic")
+        b.until("!!document.querySelector('#map canvas') && VIEWS.traffic.map.stats().nodes.filter(n => n.kind === 'host').length > 3", 15)
+        b.wait(2.0)  # let the nodes settle into place
+        n = b.eval("(() => { const n = VIEWS.traffic.map.stats().nodes.filter(n => n.kind === 'host')[0]; const r = document.querySelector('#map canvas').getBoundingClientRect(); return {ip: n.ip, x: r.left + n.x, y: r.top + n.y}; })()")
+        for t in ("mouseMoved", "mousePressed", "mouseReleased"):
+            b.call("Input.dispatchMouseEvent", type=t, x=n["x"], y=n["y"], button="left", clickCount=1)
+        c(b.until("Select.ip === %r && !!Select.data" % n["ip"], 5), "clicking a device on the map singles it out ({})".format(n["ip"]))
+        c(b.until("document.querySelector('#drawer.open') && document.querySelectorAll('#drawer table.paths tbody tr').length > 0", 5),
+          "its drawer lists its traffic paths")
+        npaths = b.eval("Select.paths().length")
+        c(b.until("(() => { const ns = VIEWS.traffic.map.stats().nodes; return ns.filter(x => x.sel).length === 1 && ns.length === 1 + Math.min(%d, 30) || ns.length <= 1 + %d; })()" % (npaths, npaths), 5),
+          "the map shows just it and the devices it talks to")
+        others = b.eval("VIEWS.traffic.map.stats().nodes.filter(x => !x.sel).map(x => x.ip)")
+        paths = b.eval("Select.paths().map(x => x.ip)")
+        c(all(ip in paths for ip in others), "every other device on the map is one of its paths")
+        c(not b.eval("document.querySelector('#map .sel-banner').classList.contains('hidden')"), "a strip over the map says what is singled out")
+        c(b.until("VIEWS.traffic.globe.stats().list.some(p => !p.gone)", 5), "the globe keeps only its destinations")
+        shot(b, "single-out")
+        click(b, "#drawer [data-pin]")
+        c(b.until("Pins.has(%r) && S.snap.traffic.hosts[0].ip === %r" % (n["ip"], n["ip"]), 5), "pinning puts it first in the lists")
+        b.eval("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
+        c(b.until("Select.ip === null && document.querySelector('#map .sel-banner').classList.contains('hidden')", 3), "Esc shows everything again")
+        c(b.until("VIEWS.traffic.map.stats().nodes.some(x => x.ip === %r && x.pinned)" % n["ip"], 5), "the map marks it as pinned")
+        see(b, "#hosts")
+        c(b.until("document.querySelector('#hosts tr[data-ip]').dataset.ip === %r && document.querySelector('#hosts tr.pinned .pin-btn.on') !== null" % n["ip"], 5),
+          "LAN hosts table: pinned row first, with its pin lit")
+        click(b, "#hosts tr.pinned .pin-btn")
+        c(b.until("!Pins.has(%r)" % n["ip"], 5), "the row's pin button unpins")
+        c(not b.eval("!!document.querySelector('#drawer.open')"), "(the pin button doesn't open the row)")
+        c(not b.errors, "no console errors: {}".format(b.errors[:3]))
+
+
 SCENARIOS = {"pages": sc_pages, "setup": sc_setup, "respond": sc_respond, "ignore": sc_ignore, "layout": sc_layout, "globe-fade": sc_globe_fade, "theme": sc_theme, "update": sc_update, "types": sc_types, "drawer": sc_drawer, "phone": sc_phone,
-             "light": sc_light, "offscreen": sc_offscreen}
+             "light": sc_light, "offscreen": sc_offscreen,
+             "single-out": sc_single_out}
 
 
 def main(argv) -> int:

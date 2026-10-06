@@ -2,7 +2,7 @@
    Home (the router's location) is joined to every located Internet peer by a great-circle arc
    raised above the surface; particles flow along it at the live rate -- in the "in" colour toward
    home (download), the "out" colour away from it (upload). Peers at the same place are merged.
-   Drag to spin, wheel to zoom, hover for details, click to open the host. */
+   Drag to spin, wheel to zoom, hover for details, click a place to single out its host. */
 "use strict";
 
 const Globe = (() => {
@@ -51,7 +51,8 @@ const Globe = (() => {
       <div class="globe-countries"></div>
       <div class="map-legend type-legend"></div>
       <div class="globe-attrib"></div>
-      <div class="globe-note hidden"></div>`);
+      <div class="globe-note hidden"></div>
+      <div class="sel-banner hidden"></div>`);
     const ctx = cv.getContext("2d");
     // Theme Studio: Motion (full / calm / off) and Rendering (Lite draws at 1x resolution)
     const motion = () => (window.Theme ? Theme.motion()
@@ -91,6 +92,30 @@ const Globe = (() => {
     const byType = () => Types.by === "type";
     const focusOK = (n) => !Types.focus || !byType() || !!(n.cats && n.cats[Types.focus]);
     const rate = (n) => n.up + n.down;
+    // a device is singled out: places it doesn't talk to step right back
+    const selDim = (n) => (Select.ip && n.gone ? 0.12 : 1);
+    let selShown = null;
+    on("select", () => { if (alive && snap) update(snap); });
+
+    /* the peers to put on the globe: everything, or only the singled-out device's paths */
+    function peerList(s) {
+      const ip = Select.ip;
+      if (!ip) return s.traffic.peers;
+      const h = Select.data && Select.data.ip === ip ? Select.data : null;
+      const live = new Map(s.traffic.peers.map((p) => [p.ip, p]));
+      if (!h) return s.traffic.peers.filter((p) => p.ip === ip || (p.hosts || []).includes(ip));  // still loading
+      const paths = Select.paths();
+      if (!h.lan) {  // an Internet host: just its own place
+        const sum = (k) => paths.reduce((a, x) => a + x[k], 0);
+        const cats = {};
+        paths.forEach((x) => { for (const k in x.cats) cats[k] = (cats[k] || 0) + x.cats[k]; });
+        return h.geo ? [Object.assign({ ip, name: h.name, up: sum("up"), down: sum("down"), cats }, live.get(ip) || {}, { geo: h.geo })] : [];
+      }
+      return paths.filter((x) => x.geo && !x.lan).map((x) => {
+        const l = live.get(x.ip) || {};
+        return Object.assign({}, x, { threat: l.threat || "", blocked: !!l.blocked });
+      });
+    }
 
     /* -------- data -------- */
     function update(s) {
@@ -103,7 +128,18 @@ const Globe = (() => {
       // so replacing the objects on every refresh would cut every particle off mid-flight.
       const hk = homeKey();
       const seen = new Set();
-      for (const p of s.traffic.peers) {
+      const list = peerList(s);
+      const wrapB = $(".sel-banner", wrap);
+      wrapB.innerHTML = Select.banner();
+      wrapB.classList.toggle("hidden", !Select.ip);
+      if (Select.ip !== selShown) {
+        selShown = Select.ip;
+        // singling out an Internet host: turn the globe to it
+        const g = Select.ip && list.length === 1 && list[0].ip === Select.ip ? list[0].geo : null;
+        if (g) { target = { lat: Math.max(-60, Math.min(60, g.lat)), lon: g.lon }; vlon = vlat = 0; }
+        else if (Select.ip) selShown = Select.data && Select.data.ip === Select.ip ? Select.ip : null;  // retry once loaded
+      }
+      for (const p of list) {
         if (!p.geo) continue;
         const key = p.geo.lat.toFixed(1) + "," + p.geo.lon.toFixed(1);
         let n = places.get(key);
@@ -316,7 +352,7 @@ const Globe = (() => {
         const col = n.threat ? colors.crit : n.blocked === n.peers.length ? colors.faint : byType() ? Types.color(n.cat)
           : (n.gone ? n.wasDown : n.down >= n.up) ? colors.in : colors.out;
         ctx.strokeStyle = col;
-        ctx.globalAlpha = n.alpha * (rel ? (live ? 0.95 : 0.55) : 0.12);
+        ctx.globalAlpha = n.alpha * selDim(n) * (rel ? (live ? 0.95 : Select.ip ? 0.85 : 0.55) : 0.12);
         ctx.lineWidth = 0.8 + Math.min(3, Math.log10(1 + rate(n) / 2e4));
         ctx.setLineDash(n.blocked === n.peers.length ? [3, 4] : []);
         polyline(n.arc, S, true);
@@ -334,7 +370,7 @@ const Globe = (() => {
         if (!visible(v)) continue;
         const [x, y] = S(v);
         const pon = (!live || live === p.n) && (!Types.focus || !byType() || p.cat === Types.focus);
-        ctx.globalAlpha = p.n.alpha * Math.min(1, p.t * 6, (1 - p.t) * 6) * (pon ? 0.95 : 0.1);
+        ctx.globalAlpha = p.n.alpha * selDim(p.n) * Math.min(1, p.t * 6, (1 - p.t) * 6) * (pon ? 0.95 : 0.1);
         ctx.fillStyle = byType() ? Types.color(p.cat) : p.n.threat ? colors.crit : p.dir === "in" ? colors.in : colors.out;
         ctx.beginPath(); ctx.arc(x, y, p.s, 0, Math.PI * 2); ctx.fill();
       }
@@ -349,7 +385,7 @@ const Globe = (() => {
         const rad = 2.5 + Math.min(7, Math.log10(1 + rate(n) / 2e3) * 1.8);
         n.screen = [x, y, rad];
         const col = n.threat ? colors.crit : byType() ? Types.color(n.cat) : n.precision === "country" ? colors.med : colors.accent;
-        ctx.globalAlpha = n.alpha * ((!live || live === n) && focusOK(n) ? 1 : 0.35) * (0.4 + 0.6 * v[2]);
+        ctx.globalAlpha = n.alpha * selDim(n) * ((!live || live === n) && focusOK(n) ? 1 : 0.35) * (0.4 + 0.6 * v[2]);
         if (n.threat && motion() !== "off" && !n.gone) {
           const ph = (t * 1.1 + idx * 0.13) % 1;
           ctx.strokeStyle = colors.crit;
@@ -389,7 +425,7 @@ const Globe = (() => {
         let at = free(right) ? right : free(left) ? left : n === live ? right : null;
         if (!at) continue;
         placed.push(at);
-        ctx.globalAlpha = n.alpha * Math.min(1, z * 3);
+        ctx.globalAlpha = n.alpha * selDim(n) * Math.min(1, z * 3);
         ctx.textAlign = "left";
         ctx.lineWidth = 3;
         ctx.strokeStyle = alphaC(colors.bg, 0.8);
@@ -513,6 +549,7 @@ const Globe = (() => {
         const rect = cv.getBoundingClientRect();
         const n = hit(e.clientX - rect.left, e.clientY - rect.top);
         if (n && n !== "home") { tip.hide(); openPlace(n); }
+        else if (!n && Select.ip) closeDrawer();  // empty space: back to everything
       }
     };
     cv.addEventListener("pointerup", release);

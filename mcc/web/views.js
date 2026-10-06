@@ -19,7 +19,8 @@ function connectBanner() {
   if (r.state === "ok") return "";
   return `<div class="callout ${r.state === "error" ? "bad" : ""}" style="margin-bottom:14px">
     <b>${r.state === "error" ? "Lost the router" : "No router connected"}.</b> ${r.error ? esc(r.error) + ". " : ""}
-    <a href="#/setup">Connect it in Setup</a> — passwords stay in memory only.</div>`;
+    <a href="#/setup">Connect it in Setup</a> — passwords stay in memory only, so this is needed after every restart.
+    ${S.snap.traffic.conns ? "Until then, traffic still arrives from flow export, but devices show by address or by names MCC remembers: device names come from the router's DHCP leases and DNS cache." : ""}</div>`;
 }
 function telemetryNudge() {
   if (!connected()) return "";
@@ -42,9 +43,9 @@ function hostsTable(list, kind, limit) {
   if (!list.length) return `<div class="empty"><b>No traffic yet</b>${connected() ? "Waiting for the first connection-table read…" : "Connect a router to see traffic."}</div>`;
   const max = Math.max(...list.map((h) => Math.max(h.down, h.up)), 1);
   return `<table class="t"><thead><tr><th>${kind === "peer" ? "Remote" : "Host"}</th><th class="r">↓</th><th class="r">↑</th><th></th></tr></thead><tbody>
-    ${list.slice(0, limit || 12).map((h) => `<tr class="click" data-ip="${esc(h.ip)}">
-      <td><div class="who-row">${typeDot(h.cat)}${whoCell(h.name, h.ip + (h.geo ? " · " + (h.geo.city ? h.geo.city + ", " : "") + h.geo.cc : ""))}</div>${h.threat ? ` <span class="sev sv-${esc(h.threat)}"></span>` : ""}${h.blocked ? ' <span class="pill red">blocked</span>' : ""}</td>
-      <td class="r num in">${fmt.bps(h.down)}</td><td class="r num out">${fmt.bps(h.up)}</td><td style="width:90px">${rateBars(h.down, h.up, max)}</td></tr>`).join("")}
+    ${list.slice(0, limit || 12).map((h) => `<tr class="click ${h.pinned ? "pinned" : ""} ${h.ip === Select.ip ? "selected" : ""}" data-ip="${esc(h.ip)}">
+      <td><div class="who-row">${typeDot(h.cat)}${whoCell(h.name, h.ip + (h.geo ? " · " + (h.geo.city ? h.geo.city + ", " : "") + h.geo.cc : ""))}${Pins.button(h.ip)}</div>${h.threat ? ` <span class="sev sv-${esc(h.threat)}"></span>` : ""}${h.blocked ? ' <span class="pill red">blocked</span>' : ""}</td>
+      <td class="r num in">${h.idle ? '<span class="faint">idle</span>' : fmt.bps(h.down)}</td><td class="r num out">${h.idle ? "" : fmt.bps(h.up)}</td><td style="width:90px">${rateBars(h.down, h.up, max)}</td></tr>`).join("")}
   </tbody></table>`;
 }
 function servicesHtml(list) {
@@ -64,6 +65,8 @@ function typesHtml(types) {
       <span class="num faint">${Math.round((t.bps / total) * 100)}%</span><span class="num in">${fmt.bps(t.down)}</span><span class="num out">${fmt.bps(t.up)}</span>
       <span class="faint tl-sub">${t.hosts} host${t.hosts === 1 ? "" : "s"} · ${t.peers} peer${t.peers === 1 ? "" : "s"}</span></div>`).join("")}</div>`;
 }
+/* a pinned device in a conversation row */
+function pinMark(ip) { return Pins.has(ip) ? `<span class="pin-mark" title="pinned">${ICON.pin}</span>` : ""; }
 function typeDot(cat) {
   return cat ? `<i class="tdot" style="background:${Types.color(cat)}" title="${esc(Types.label(cat))}"></i>` : "";
 }
@@ -82,6 +85,11 @@ document.addEventListener("click", (e) => {
 on("types", () => {
   refreshTypeUI();
   if (current && current.view.onTypes) current.view.onTypes();
+});
+on("pins", () => {
+  if (!current) return;
+  if (current.view.onPins) current.view.onPins();
+  else if (current.view.tick && S.snap && (current.name === "overview" || current.name === "traffic")) current.view.tick();
 });
 
 function bindRows(root) {
@@ -431,8 +439,8 @@ VIEWS.traffic = {
     const note = focus ? `<div class="focus-note"><i class="tdot" style="background:${Types.color(focus)}"></i>Showing only <b>${esc(Types.label(focus))}</b>
       <button class="btn sm ghost" data-type-filter="${esc(focus)}">${ICON.x} Show all types</button></div>` : "";
     Live.set($("#pairs"), note + (rows.length ? `<table class="t"><thead><tr><th>LAN host</th><th></th><th>Remote</th><th>Type</th><th>Service</th><th class="r">Conns</th><th class="r">↓</th><th class="r">↑</th><th></th></tr></thead><tbody>
-      ${rows.map((p) => `<tr class="click" data-ip="${esc(p.dir === "lan" ? p.local : p.remote)}"><td>${whoCell(names[p.local], p.local)}</td><td class="faint">${p.dir === "in" ? "⇠" : p.dir === "lan" ? "⇄" : "⇢"}</td>
-        <td>${whoCell(names[p.remote], p.remote)}</td><td><span class="tchip" title="${esc(p.cat_why || "")}">${typeDot(p.cat)}${esc(Types.label(p.cat))}</span></td>
+      ${rows.map((p) => `<tr class="click ${Pins.has(p.local) || Pins.has(p.remote) ? "pinned" : ""}" data-ip="${esc(p.dir === "lan" ? p.local : p.remote)}"><td><div class="who-row">${whoCell(names[p.local], p.local)}${pinMark(p.local)}</div></td><td class="faint">${p.dir === "in" ? "⇠" : p.dir === "lan" ? "⇄" : "⇢"}</td>
+        <td><div class="who-row">${whoCell(names[p.remote], p.remote)}${pinMark(p.remote)}</div></td><td><span class="tchip" title="${esc(p.cat_why || "")}">${typeDot(p.cat)}${esc(Types.label(p.cat))}</span></td>
         <td>${esc(p.service)}</td><td class="r num">${p.conns}</td><td class="r num in">${fmt.bps(p.down)}</td><td class="r num out">${fmt.bps(p.up)}</td><td style="width:100px">${rateBars(p.down, p.up, max)}</td></tr>`).join("")}
       </tbody></table>` : '<div class="empty">No conversations match.</div>'), bindRows);
     Live.set($("#hosts"), hostsTable(tr.hosts, "host", 60), bindRows);
@@ -607,8 +615,8 @@ VIEWS.devices = {
     const q = this.q;
     const list = this.devs.filter((d) => !q || [d.name, d.hostname, d.ip, d.mac, d.port, d.iface].some((v) => (v || "").toLowerCase().includes(q)));
     el.innerHTML = list.length ? `<table class="t"><thead><tr><th></th><th>Device</th><th>MAC</th><th>Port</th><th>Lease</th><th class="r">↓</th><th class="r">↑</th><th></th></tr></thead><tbody>
-      ${list.map((d) => `<tr class="click" data-ip="${esc(d.ip)}"><td style="width:28px">${!d.known ? '<span class="pill yellow">new</span>' : d.threat ? `<span class="sev sv-${esc(d.threat)}"></span>` : ""}</td>
-        <td>${whoCell(d.name || d.hostname, d.ip)}</td><td class="mono muted">${esc(d.mac)}</td><td>${esc(d.port || d.iface || "—")}</td>
+      ${list.map((d) => `<tr class="click ${d.pinned ? "pinned" : ""}" data-ip="${esc(d.ip)}"><td style="width:28px">${!d.known ? '<span class="pill yellow">new</span>' : d.threat ? `<span class="sev sv-${esc(d.threat)}"></span>` : ""}</td>
+        <td><div class="who-row">${whoCell(d.name || d.hostname, d.ip)}${d.ip ? Pins.button(d.ip) : ""}</div></td><td class="mono muted">${esc(d.mac)}</td><td>${esc(d.port || d.iface || "—")}</td>
         <td class="muted">${d.dhcp ? esc(d.status || "") + (d.static ? " · static" : "") : "ARP only"}</td>
         <td class="r num in">${d.down ? fmt.bps(d.down) : ""}</td><td class="r num out">${d.up ? fmt.bps(d.up) : ""}</td>
         <td class="r" style="white-space:nowrap">${!d.known ? `<button class="btn sm" data-known="${esc(d.mac)}">Mark known</button> ` : ""}${d.quarantined
@@ -619,6 +627,7 @@ VIEWS.devices = {
     $$("[data-q]", el).forEach((b) => (b.onclick = (e) => { e.stopPropagation(); respond("quarantine_host", { ip: b.dataset.q }, "from Devices"); }));
     $$("[data-rel]", el).forEach((b) => (b.onclick = (e) => { e.stopPropagation(); respond("remove_entry", { ip: b.dataset.rel, list: "mcc-quarantine" }, "from Devices"); }));
   },
+  onPins() { this.load(); },
   leave() { clearInterval(this.timer); },
 };
 

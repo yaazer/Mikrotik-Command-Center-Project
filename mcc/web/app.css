@@ -547,3 +547,29 @@ body[data-density="compact"] .top { padding-top: 7px; padding-bottom: 7px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ---------- pinned devices + one device singled out ---------- */
+.pin-btn { flex: none; display: inline-grid; place-items: center; width: 22px; height: 22px; margin-left: 6px; padding: 0;
+           border: 0; border-radius: 6px; background: transparent; color: var(--faint); cursor: pointer; opacity: 0; }
+.pin-btn svg { width: 14px; height: 14px; }
+tr:hover .pin-btn, .pin-btn:focus-visible, .sel-banner .pin-btn { opacity: 1; }
+.pin-btn:hover { color: var(--accent); background: oklch(from var(--accent) l c h / 0.12); }
+.pin-btn.on { opacity: 1; color: var(--accent); }
+.pin-btn.on svg { fill: oklch(from var(--accent) l c h / 0.35); }
+@media (hover: none) { .pin-btn { opacity: .55; } }
+.pin-mark { display: inline-grid; color: var(--accent); margin-left: 6px; }
+.pin-mark svg { width: 13px; height: 13px; fill: oklch(from var(--accent) l c h / 0.35); }
+table.t tr.pinned td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+table.t tr.selected td { background: oklch(from var(--accent) l c h / 0.1); }
+.btn.on { border-color: var(--accent); color: var(--accent); }
+.btn.on svg { fill: oklch(from var(--accent) l c h / 0.35); }
+.sel-banner { position: absolute; left: 50%; top: 10px; transform: translateX(-50%); z-index: 2; max-width: calc(100% - 120px);
+              display: flex; align-items: center; gap: 8px; padding: 5px 6px 5px 12px; font-size: 13px; white-space: nowrap;
+              background: oklch(from var(--bg) l c h / 0.85); border: 1px solid oklch(from var(--accent) l c h / 0.6); border-radius: 999px;
+              box-shadow: 0 4px 18px oklch(0 0 0 / 0.25); }
+.sel-banner .sb-t { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.sel-banner .sb-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none;
+                      box-shadow: 0 0 0 3px oklch(from var(--accent) l c h / 0.25); }
+.sel-banner .pin-btn { margin-left: 0; }
+.drawer .note svg { width: 14px; height: 14px; vertical-align: -2px; color: var(--accent); }
+@media (max-width: 720px) { .sel-banner { max-width: calc(100% - 24px); top: auto; bottom: 34px; } }

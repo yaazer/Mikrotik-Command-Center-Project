@@ -226,6 +226,19 @@ Every conversation is classified into one of these types:
 
 This is an informed guess from names and ports, not deep packet inspection. A CDN that serves several services shows as whatever its name says, and encrypted traffic to an unrecognised name is "web". Each type keeps the same colour in every theme.
 
+## Singling out a device, and pinning
+
+**Single out a device:** click it on the flow map (or a place on the globe, or a row in any list).
+- The flow map shows only that device and every device it talks to, with its traffic paths running through the router.
+- The globe shows only where its traffic goes. It turns toward an Internet host you pick.
+- The drawer shows everything MCC knows about it: rates, traffic types, location, the device record, threats, actions, and its **traffic paths**. Each path lists who it talks to, where they are, the type and services, connections and rates.
+- Click a path to single out that device instead. Press Esc, click **Show all**, or click empty space or the router to see everything again.
+
+**Pin a device:** use **Pin** in its drawer, the pin in the strip over the map, or the pin that appears when you hover a row in Traffic, Overview or Devices.
+- A pinned device is always on the flow map, at the top of its column with a pin marker, even when it's quiet ("pinned · idle").
+- It comes first in every list: LAN hosts, Internet peers, top talkers, Devices. Its conversations come first too.
+- Pins are kept by MCC in `data/pins.json`, so every browser sees the same ones. A LAN device is remembered by its MAC as well, so its pin follows it when DHCP gives it a new address.
+
 ## Arranging the console
 
 Every panel on every page is resizable:
@@ -296,11 +309,13 @@ mcc/setup_plan.py    telemetry setup and removal plans
 mcc/hub.py           pollers, collectors, history, live event fan-out
 mcc/server.py        HTTP API, server-sent events, static console
 mcc/web/             the console (no frameworks); theme.js = Theme Studio, layout.js = resizable panels
+mcc/pins.py          pinned devices (follow a LAN device's MAC)
+mcc/names.py         remembered device / DNS names (survive restarts and DNS-cache expiry)
 mcc/geo.py           .mmdb reader (stdlib), locator, home location, opt-in DB-IP download
 mcc/geodata.py       country label points (Natural Earth) for country-level databases
 mcc/sim.py           simulated router, switch and network (demo + tests)
 data/                config.json, actions.jsonl, threats.jsonl, devices.json, setup_state.json, blocklist.txt,
-                     ignore.json + ignore.log.jsonl, geo/*.mmdb
+                     ignore.json + ignore.log.jsonl, pins.json, names.json, geo/*.mmdb
 ```
 
 ## Tests
@@ -315,5 +330,6 @@ SHOTS=out python tools/ui_check.py # ...and saves screenshots
 
 - **IPv6:** blocking and quarantine work for IPv6 addresses, but the traffic view and flow detection are IPv4-first.
 - **Geolocation is approximate:** IP geolocation places a server at its registered or data-centre location, not exactly where the content comes from. Anycast services (Cloudflare, Google DNS) show one location for many places. Country-level databases put every peer at the middle of its country.
+- **Names need the router:** device and host names come from the router's DHCP leases, ARP comments and DNS cache. After a restart MCC uses the names it remembers (`data/names.json`) until you reconnect the router in Setup, or set `MCC_ROUTER_PASSWORD` so it reconnects by itself. Devices it has never seen show as addresses until then.
 - **Flow lag:** flow records arrive in batches, so the live map's rates come from the connection table.
 - **Validation:** the SwOS field mapping is best effort (see above). Developed against RouterOS 7.x REST and SwOS 2.x behaviour, using the bundled simulator.

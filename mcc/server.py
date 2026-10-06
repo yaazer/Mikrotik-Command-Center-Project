@@ -287,6 +287,8 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840, token: Opti
             return hub.swos.probe()
         if path == "/api/ignore":
             return {"rules": hub.detector.suppressions_list()}
+        if path == "/api/pins":
+            return {"pins": hub.pins_list()}
         if path == "/api/geo":
             return dict(hub.geo.info(), home=hub.geo.home(hub.public_addrs()))
         if path == "/api/build":
@@ -367,6 +369,11 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840, token: Opti
                 return hub.detector.unsuppress(parts[2])
             except KeyError:
                 raise ApiError(404, "no such ignore rule")
+        if path == "/api/pins":
+            try:
+                return {"pins": hub.set_pin(str(b.get("ip") or "").strip(), b.get("pinned") is not False)}
+            except ValueError as e:
+                raise ApiError(400, str(e))
         if path == "/api/devices/known":
             if not hub.detector.mark_known(str(b.get("mac", ""))):
                 raise ApiError(404, "unknown MAC")

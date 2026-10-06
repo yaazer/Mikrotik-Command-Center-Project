@@ -216,8 +216,12 @@ class TrafficModel:
         return "none"
 
     def snapshot(self, now: Optional[float] = None, blocked: Optional[Set[str]] = None,
-                 threats: Optional[Dict[str, str]] = None, limit_pairs: int = 120) -> Dict[str, Any]:
+                 threats: Optional[Dict[str, str]] = None, limit_pairs: int = 120,
+                 pinned: Optional[Dict[str, bool]] = None) -> Dict[str, Any]:
+        """pinned: address -> is it a LAN host. Pinned devices lead every list (and are listed even
+        when idle); conversations involving one come first."""
         now = now or time.time()
+        pinned = pinned or {}
         src = self.source(now)
         pairs = self.conn_pairs if src == "conntrack" else self.flow_pairs(now) if src == "flows" else {}
         blocked = blocked or set()
@@ -262,7 +266,7 @@ class TrafficModel:
             tot_in += p["down"]
             tot_out += p["up"]
             plist.append(p)
-        plist.sort(key=lambda p: -(p["up"] + p["down"]))
+        plist.sort(key=lambda p: (not (p["local"] in pinned or p["remote"] in pinned), -(p["up"] + p["down"])))
         for ip, h in hosts.items():
             self.host_hist[ip].append((now, h["down"], h["up"]))
             b = self.baseline_up.get(ip)
@@ -271,12 +275,20 @@ class TrafficModel:
             c, dom = classify.rollup(x.pop("_cats", []))
             return {"cats": c, "cat": dom}
 
-        host_list = sorted(({**h, "peers": len(h["peers"]), "threat": threats.get(ip, ""),
+        for ip, lan in pinned.items():  # pinned but quiet right now: still listed
+            if lan and ip not in hosts:
+                hosts[ip] = {"ip": ip, "name": self.name_of(ip), "up": 0.0, "down": 0.0, "conns": 0, "peers": set(),
+                             "_cats": [], "idle": True}
+            elif not lan and ip not in peers:
+                peers[ip] = {"ip": ip, "name": self.name_of(ip), "up": 0.0, "down": 0.0, "conns": 0, "hosts": set(),
+                             "ports": set(), "_cats": [], "idle": True}
+        order = lambda x: (x["ip"] not in pinned, -(x["up"] + x["down"]))
+        host_list = sorted(({**h, "peers": len(h["peers"]), "threat": threats.get(ip, ""), "pinned": ip in pinned,
                              "baseline_up": self.baseline_up.get(ip, 0.0), **cats(h)}
-                            for ip, h in hosts.items()), key=lambda h: -(h["up"] + h["down"]))
-        peer_list = sorted(({**r, "hosts": sorted(r["hosts"])[:8], "ports": sorted(r["ports"])[:8],
+                            for ip, h in hosts.items()), key=order)
+        peer_list = sorted(({**r, "hosts": sorted(r["hosts"])[:8], "ports": sorted(r["ports"])[:8], "pinned": ip in pinned,
                              "blocked": ip in blocked, "threat": threats.get(ip, ""), **cats(r)}
-                            for ip, r in peers.items()), key=lambda r: -(r["up"] + r["down"]))
+                            for ip, r in peers.items()), key=order)
         type_list = sorted(({**t, "hosts": len(t["hosts"]), "peers": len(t["peers"]), "bps": t["up"] + t["down"]}
                             for t in types.values()), key=lambda t: -t["bps"])
         return {

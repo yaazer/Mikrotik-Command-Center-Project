@@ -652,6 +652,81 @@ def t_geo_in_snapshot():
 
 
 @test
+def t_pins():
+    from mcc.pins import Pins
+    with Env() as e:
+        e.hub.geo.demo = sim.demo_geo
+        snap = wait_for(lambda: (lambda s: s if len(s["traffic"]["hosts"]) > 3 and e.hub.devices else None)(e.hub.snapshot()), 10)
+        quiet = snap["traffic"]["hosts"][-1]["ip"]
+        lst = e.hub.set_pin(quiet, True)
+        eq([x["ip"] for x in lst], [quiet], "pinned")
+        ok(lst[0]["mac"], "a LAN pin remembers the device's MAC")
+        snap = e.hub.snapshot()
+        eq((snap["traffic"]["hosts"][0]["ip"], snap["traffic"]["hosts"][0]["pinned"]), (quiet, True), "a pinned host leads the list")
+        mine = [p for p in snap["traffic"]["pairs"] if quiet in (p["local"], p["remote"])]
+        if mine:
+            ok(quiet in (snap["traffic"]["pairs"][0]["local"], snap["traffic"]["pairs"][0]["remote"]),
+               "its conversations come first")
+        # an address with no traffic at all is still listed, marked idle
+        e.hub.set_pin("203.0.113.200", True)
+        peers = e.hub.snapshot()["traffic"]["peers"]
+        eq((peers[0]["ip"], peers[0]["pinned"], peers[0].get("idle")), ("203.0.113.200", True, True), "a quiet pinned peer is listed first")
+        h = e.hub.host_view(quiet)
+        ok(h["pinned"], "the drawer knows it is pinned")
+        far = e.hub.host_view(snap["traffic"]["hosts"][1]["ip"])
+        ok(any(p.get("other_geo") for p in far["pairs"]), "each path says where it goes")
+        # kept on disk; a LAN pin follows its MAC to a new address
+        again = Pins(e.dir)
+        mac = lst[0]["mac"]
+        moved = again.resolve(lambda m: "192.168.88.250" if m == mac else None)
+        ok("192.168.88.250" in moved and quiet not in moved, "a pin follows its device to a new address")
+        ok("203.0.113.200" in moved, "Internet pins kept as they are")
+        e.hub.set_pin(quiet, False)
+        eq([x["ip"] for x in e.hub.pins_list()], ["203.0.113.200"], "unpinned")
+        try:
+            e.hub.set_pin("not-an-ip", True)
+            ok(False, "a bad address is refused")
+        except ValueError:
+            pass
+        httpd, _ = make_server(e.hub, "127.0.0.1", 0)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        port = httpd.server_address[1]
+        try:
+            st, _, _ = _req(port, "POST", "/api/pins", {"ip": "8.8.8.8"})
+            eq(st, 403, "pinning needs the X-MCC header like every change")
+            st, body, _ = _req(port, "POST", "/api/pins", {"ip": "8.8.8.8", "pinned": True}, {"X-MCC": "1"})
+            eq(st, 200, "pin over the API")
+            ok("8.8.8.8" in [x["ip"] for x in body["pins"]], "and it is listed")
+            st, _, _ = _req(port, "POST", "/api/pins", {"ip": "nope"}, {"X-MCC": "1"})
+            eq(st, 400, "bad address -> 400")
+            st, body, _ = _req(port, "GET", "/api/state")
+            ok("8.8.8.8" in [x["ip"] for x in body["pins"]], "the console gets the pins with its state")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+@test
+def t_names_survive_restart():
+    from mcc.names import NameMemory
+    with Env() as e:
+        named = wait_for(lambda: dict(e.hub.ip_names), 10)
+        ip, name = next(iter(named.items()))
+        e.hub.name_memory.save()
+        fresh = Hub(e.cfg, e.dir)  # a restart: not connected to the router yet
+        eq(fresh.name_of(ip), name, "a device keeps its name after a restart, before the router is reconnected")
+        e.hub.dns_names = {}
+        eq(e.hub.name_of(ip), name, "live names win, remembered ones fill the gaps")
+        m = NameMemory(e.dir / "n2")
+        m.remember("dns", {"203.0.113.9": "old.example"}, now=time.time() - 7 * 3600)
+        m.remember("dns", {"203.0.113.10": "new.example"})
+        eq((m.get("203.0.113.9"), m.get("203.0.113.10")), ("", "new.example"), "DNS names are forgotten after 6 h")
+        m.remember("device", {"192.168.88.9": "printer"})
+        m.remember("dns", {"192.168.88.9": "printer.lan.example"})
+        eq(m.get("192.168.88.9"), "printer", "a device name beats a DNS name")
+
+
+@test
 def t_blocklist():
     tmp = Path(tempfile.mkdtemp())
     try:

@@ -1,7 +1,8 @@
 /* Live traffic map: Internet peers (left) <-> router (centre) <-> LAN hosts (right).
    Particles flow along each link; their density follows the live rate. Download is drawn in the
    "in" colour, upload in the "out" colour. Threat subjects pulse red; blocked peers are greyed and
-   their link dashed. Hover for details, click to open the host. */
+   their link dashed. Hover for details; click a device to single it out (just it and its traffic
+   paths, with its details in the drawer). Pinned devices are always shown, at the top. */
 "use strict";
 
 /* Shared by the flow map and the globe: say why nothing is moving, rather than look frozen. */
@@ -29,6 +30,9 @@ const TrafficMap = (() => {
     opts = Object.assign({ peers: 14, hosts: 12 }, opts || {});
     const cv = document.createElement("canvas");
     wrap.appendChild(cv);
+    const banner = document.createElement("div");
+    banner.className = "sel-banner hidden";
+    wrap.appendChild(banner);
     const ctx = cv.getContext("2d");
     // Theme Studio: Motion (full / calm / off) and Rendering (Lite draws at 1x resolution)
     const motion = () => (window.Theme ? Theme.motion()
@@ -36,7 +40,7 @@ const TrafficMap = (() => {
     const lite = () => !!(window.Theme && Theme.isLite());
     const nodes = new Map();
     let parts = [];
-    let W = 0, H = 0, dpr = 1, colors = {}, hover = null, snap = null, raf = 0, last = 0, alive = true;
+    let VW = 0, W = 0, H = 0, dpr = 1, colors = {}, hover = null, snap = null, raf = 0, last = 0, alive = true;
     const router = { id: "router", kind: "router", x: 0, y: 0, r: 26, alpha: 1, label: "router" };
 
     function readColors() {
@@ -60,6 +64,7 @@ const TrafficMap = (() => {
     io.observe(wrap);
     readColors();
     on("theme", () => { if (alive) { readColors(); resize(); } });
+    on("select", () => { if (alive && snap) update(snap); });
 
     const narrow = () => W < 640;  // phones: nodes hug the edges, labels point inward
     const rate = (n) => (n.up || 0) + (n.down || 0);
@@ -76,7 +81,27 @@ const TrafficMap = (() => {
         return top;
       };
       const fit = Math.max(4, Math.floor((H - 90) / 30) + 1);  // two-line labels need ~30px each
-      const peers = pick(tr.peers, Math.min(opts.peers, fit)), hosts = pick(tr.hosts, Math.min(opts.hosts, fit));
+      let peers, hosts, shown = null;
+      if (Select.ip) {
+        // singled out: only this device, on its own side, and everything it talks to on the other
+        const ip = Select.ip, h = Select.data && Select.data.ip === ip ? Select.data : null;
+        const lan = h ? h.lan : tr.hosts.some((x) => x.ip === ip);
+        const paths = Select.paths();
+        const live = (lan ? tr.hosts : tr.peers).find((x) => x.ip === ip);
+        const sum = (k) => paths.reduce((a, x) => a + x[k], 0);
+        const cats = {};
+        paths.forEach((x) => { for (const k in x.cats) cats[k] = (cats[k] || 0) + x.cats[k]; });
+        const me = Object.assign({ ip, name: (h && h.name) || "", up: sum("up"), down: sum("down"), conns: sum("conns"), cats,
+          cat: Object.entries(cats).sort((a, b) => b[1] - a[1]).map((e) => e[0])[0] || "other" }, live || {});
+        const n = Math.min(paths.length, Math.max(opts.peers, opts.hosts, fit));
+        const others = paths.slice(0, n).map((x) => Object.assign({}, x, lan ? { hosts: [ip] } : {}));
+        if (lan) { hosts = [me]; peers = others; } else { peers = [Object.assign({}, me, { hosts: paths.map((x) => x.ip) })]; hosts = others; }
+        shown = n;
+      } else {
+        peers = pick(tr.peers, Math.min(opts.peers, fit)); hosts = pick(tr.hosts, Math.min(opts.hosts, fit));
+      }
+      banner.innerHTML = Select.banner(shown);
+      banner.classList.toggle("hidden", !Select.ip);
       const add = (kind, x) => {
         const id = kind + ":" + x.ip;
         seen.add(id);
@@ -87,7 +112,7 @@ const TrafficMap = (() => {
         }
         Object.assign(n, { label: x.name || x.ip, name: x.name, up: x.up, down: x.down, conns: x.conns, threat: x.threat || "",
           blocked: !!x.blocked, peers: x.peers, hosts: x.hosts, ports: x.ports, talpha: 1, dead: false,
-          cats: x.cats || {}, cat: x.cat || "other" });
+          cats: x.cats || {}, cat: x.cat || "other", pinned: !!x.pinned || Pins.has(x.ip), sel: x.ip === Select.ip, idle: !!x.idle });
         n.tr = radius(rate(n));
       };
       peers.forEach((p) => add("peer", p));
@@ -98,19 +123,30 @@ const TrafficMap = (() => {
       layout(false);
     }
 
+    // the device drawer slides over the right of the page: lay the map out in the part still visible
+    function visibleWidth() {
+      const d = document.getElementById("drawer");
+      if (!d || !d.classList.contains("open") || narrow()) return W;
+      const r = cv.getBoundingClientRect();
+      const left = window.innerWidth - d.offsetWidth;
+      return r.right > left ? Math.max(Math.min(W, 420), left - r.left) : W;
+    }
     function layout(snapNow) {
-      router.x = W / 2; router.y = H / 2;
+      VW = visibleWidth();
+      router.x = VW / 2; router.y = H / 2;
       // evenly spaced columns that bow toward the router, leaving room for the labels outside
-      const R = narrow() ? W / 2 - 24 : Math.max(110, Math.min(W * 0.36, W / 2 - 185));
+      const R = narrow() ? W / 2 - 24 : Math.max(110, Math.min(VW * 0.36, VW / 2 - 185));
       const place = (kind, side) => {
-        const list = [...nodes.values()].filter((n) => n.kind === kind && !n.dead).sort((a, b) => rate(b) - rate(a));
+        // pinned devices at the top of their column, then the busiest
+        const list = [...nodes.values()].filter((n) => n.kind === kind && !n.dead)
+          .sort((a, b) => (b.pinned - a.pinned) || rate(b) - rate(a));
         const n = list.length;
         const gap = n > 1 ? Math.min(48, (H - 90) / (n - 1)) : 0;
         const y0 = H / 2 - (gap * (n - 1)) / 2;
         list.forEach((node, i) => {
           node.ty = y0 + i * gap;
           const rel = (node.ty - H / 2) / (H / 2);
-          node.tx = W / 2 + side * R * (1 - 0.3 * rel * rel);
+          node.tx = router.x + side * R * (1 - 0.3 * rel * rel);
           if (snapNow || node.alpha === 0) { node.x = node.tx; node.y = node.ty; }
         });
       };
@@ -194,7 +230,7 @@ const TrafficMap = (() => {
       ctx.textAlign = "left";
       ctx.fillText("INTERNET", 14, 20);
       ctx.textAlign = "right";
-      ctx.fillText("LAN", W - 14, 20);
+      ctx.fillText("LAN", (VW || W) - 14, 20);
       // faint dot grid
       ctx.fillStyle = colors.soft;
       for (let x = 20; x < W; x += 28) for (let y = 34; y < H; y += 28) ctx.fillRect(x, y, 1, 1);
@@ -242,9 +278,16 @@ const TrafficMap = (() => {
           ctx.beginPath(); ctx.arc(n.x, n.y, n.r + 3 + ph * 16, 0, Math.PI * 2); ctx.stroke();
           ctx.globalAlpha = n.alpha * (rel ? 1 : 0.3);
         }
+        if (n.sel) {  // the singled-out device
+          ctx.strokeStyle = colors.accent;
+          ctx.lineWidth = 2;
+          ctx.globalAlpha = n.alpha * (0.55 + 0.35 * Math.sin(t * 3));
+          ctx.beginPath(); ctx.arc(n.x, n.y, n.r + 7, 0, Math.PI * 2); ctx.stroke();
+          ctx.globalAlpha = n.alpha * (rel ? 1 : 0.3);
+        }
         ctx.fillStyle = colors.panel;
         ctx.strokeStyle = col;
-        ctx.lineWidth = n === hover ? 3 : 1.8;
+        ctx.lineWidth = n === hover || n.sel ? 3 : 1.8;
         ctx.beginPath(); ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
         if (n.blocked) {
           ctx.beginPath(); ctx.moveTo(n.x - n.r * 0.6, n.y - n.r * 0.6); ctx.lineTo(n.x + n.r * 0.6, n.y + n.r * 0.6); ctx.stroke();
@@ -256,7 +299,8 @@ const TrafficMap = (() => {
         }
         // label
         const left = (n.kind === "peer") !== narrow();
-        const lx = n.x + (left ? -(n.r + 7) : n.r + 7);
+        let lx = n.x + (left ? -(n.r + 7) : n.r + 7);
+        if (n.pinned) { pinGlyph(left ? lx - 5 : lx + 5, n.y - 5); lx += left ? -14 : 14; }
         ctx.textAlign = left ? "right" : "left";
         ctx.textBaseline = "alphabetic";
         ctx.font = "600 12px " + colors.sans;
@@ -266,7 +310,7 @@ const TrafficMap = (() => {
         ctx.fillText(lbl, lx, n.y - 1);
         ctx.font = "11px " + colors.mono;
         ctx.fillStyle = colors.muted;
-        ctx.fillText(narrow() ? fmt.bps(rate(n)) : `↓${fmt.bps(n.down)} ↑${fmt.bps(n.up)}`, lx, n.y + 12);
+        ctx.fillText(n.idle ? "pinned · idle" : narrow() ? fmt.bps(rate(n)) : `↓${fmt.bps(n.down)} ↑${fmt.bps(n.up)}`, lx, n.y + 12);
       }
       ctx.globalAlpha = 1;
 
@@ -297,6 +341,15 @@ const TrafficMap = (() => {
       if (motion() === "off") motionOffNote(ctx, W / 2, H - 14, colors);
     }
 
+    // a small map pin: head and needle, in the accent colour
+    function pinGlyph(x, y) {
+      ctx.save();
+      ctx.fillStyle = colors.accent; ctx.strokeStyle = colors.accent; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(x, y - 1.5, 3.4, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(x, y + 1.5); ctx.lineTo(x, y + 7); ctx.stroke();
+      ctx.restore();
+    }
+
     function hit(x, y) {
       if (Math.abs(x - router.x) < router.r && Math.abs(y - router.y) < router.r) return router;
       let best = null, bd = 1e9;
@@ -321,10 +374,15 @@ const TrafficMap = (() => {
         : `${n.peers || 0} Internet peer${n.peers === 1 ? "" : "s"} · ${n.conns || 0} conns`;
       tip.show(`<b>${esc(n.label)}</b>${n.name ? `<span class="mono muted">${esc(n.ip)}</span><br>` : ""}<span class="in">↓ ${fmt.bps(n.down)}</span> · <span class="out">↑ ${fmt.bps(n.up)}</span><br><span class="muted">${esc(extra)}</span>` +
         Types.mixHtml(n.cats) +
-        (n.threat ? `<br><span style="color:var(--crit)">⚠ ${esc(n.threat)} threat</span>` : "") + (n.blocked ? '<br><span class="muted">blocked by MCC</span>' : ""), e.clientX, e.clientY);
+        (n.threat ? `<br><span style="color:var(--crit)">⚠ ${esc(n.threat)} threat</span>` : "") + (n.blocked ? '<br><span class="muted">blocked by MCC</span>' : "") +
+        (n.pinned ? '<br><span class="muted">pinned</span>' : "") + `<br><span class="faint">${n.sel ? "singled out" : "click to single it out"}</span>`, e.clientX, e.clientY);
     });
     cv.addEventListener("mouseleave", () => { hover = null; tip.hide(); });
-    cv.addEventListener("click", () => { if (hover && hover !== router) { tip.hide(); openHost(hover.ip); } });
+    cv.addEventListener("click", () => {
+      tip.hide();
+      if (hover && hover !== router) openHost(hover.ip);  // single it out
+      else if (Select.ip) closeDrawer();                 // the router or empty space: back to everything
+    });
 
     function destroy() {
       alive = false;
@@ -333,7 +391,10 @@ const TrafficMap = (() => {
       io.disconnect();
     }
     raf = requestAnimationFrame(frame);
-    return { update, destroy };
+    // for the UI checks: where each device is drawn, and what is pinned / singled out
+    const stats = () => ({ parts: parts.length, nodes: [...nodes.values()].filter((n) => !n.dead)
+      .map((n) => ({ ip: n.ip, kind: n.kind, x: n.x, y: n.y, sel: !!n.sel, pinned: !!n.pinned })) });
+    return { update, destroy, stats };
   }
   return { create, SEV_RANK };
 })();

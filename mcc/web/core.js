@@ -67,6 +67,8 @@ const ICON = {
   bolt: '<svg viewBox="0 0 24 24"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg>',
   page: '<svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>',
   alert: '<svg viewBox="0 0 24 24"><path d="M12 3l9.5 17h-19z"/><path d="M12 10v4M12 17.5v.01"/></svg>',
+  pin: '<svg viewBox="0 0 24 24"><path d="M9 3h6l-1 6 3 3v2H7v-2l3-3z"/><path d="M12 14v7"/></svg>',
+  target: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/></svg>',
 };
 
 /* ---------------- API ---------------- */
@@ -92,7 +94,7 @@ const api = {
 /* ---------------- state + events ---------------- */
 const S = {
   snap: null, hist: { ifaces: {}, health: [], switch: {} }, threats: new Map(), actions: new Map(), logs: [],
-  entries: [], config: {}, rules: {}, ignore: [], connected: false, lastTick: 0, seenThreats: new Set(),
+  entries: [], config: {}, rules: {}, ignore: [], pins: [], connected: false, lastTick: 0, seenThreats: new Set(),
 };
 const HIST_MAX = 1800;
 const bus = {};
@@ -120,6 +122,7 @@ function connectStream() {
     S.config = st.config || {};
     S.rules = st.rules || {};
     S.ignore = st.ignore || [];
+    S.pins = st.pins || [];
     S.categories = st.categories || [];
     if (onBuild(st.build)) return;
     checkSkew(st);
@@ -166,6 +169,7 @@ function connectStream() {
   });
   es.addEventListener("status", () => {});
   es.addEventListener("ignore", (e) => { S.ignore = JSON.parse(e.data); emit("ignore"); });
+  es.addEventListener("pins", (e) => { S.pins = JSON.parse(e.data); emit("pins"); });
   es.addEventListener("setup", (e) => emit("setup", JSON.parse(e.data)));
   es.addEventListener("resync", () => { es.close(); setTimeout(connectStream, 300); });
   es.onerror = () => { setReconnect(true); };
@@ -489,6 +493,89 @@ function cliRemove(c) {
   return `/${p} remove [find .id=${c.id}]`;
 }
 
+/* ---------------- pinned devices ---------------- */
+// Pinned devices are always on the traffic map and first in every list (the server orders them).
+// Kept on the MCC server (data/pins.json), so every browser sees the same pins.
+const Pins = {
+  has(ip) { return (S.pins || []).some((p) => p.ip === ip); },
+  async toggle(ip) {
+    const pinned = !this.has(ip);
+    try {
+      const r = await api.post("/api/pins", { ip, pinned });
+      S.pins = r.pins;
+      emit("pins");
+      toast(pinned ? "Pinned " + ip : "Unpinned " + ip, pinned ? "Always on the traffic map and at the top of the lists." : "", { good: true });
+    } catch (err) { toast("Couldn't change the pin", err.message, { bad: true }); }
+  },
+  /* the small pin toggle in a table row (shown on hover, always when pinned) */
+  button(ip) {
+    const on = this.has(ip);
+    return `<button class="pin-btn ${on ? "on" : ""}" data-pin="${esc(ip)}" title="${on ? "Unpin" : "Pin: always on the map and at the top of the lists"}" aria-label="${on ? "Unpin" : "Pin"} ${esc(ip)}" aria-pressed="${on}">${ICON.pin}</button>`;
+  },
+};
+// capture phase: a pin button sits inside a clickable row, and the row must not open the host as well
+document.addEventListener("click", (e) => {
+  const b = e.target.closest && e.target.closest("[data-pin]");
+  if (!b) return;
+  e.stopPropagation(); e.preventDefault();
+  Pins.toggle(b.dataset.pin);
+}, true);
+on("pins", () => {
+  $$("[data-pin]").forEach((b) => {
+    const on = Pins.has(b.dataset.pin);
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", on);
+  });
+  if (drawerIp) loadHost();
+});
+
+/* ---------------- one device singled out ---------------- */
+// Opening a device (click it on the map or globe, or in any list) singles it out: the map and globe
+// show only it and its traffic paths while its drawer is open. Closing the drawer shows everything.
+const Select = {
+  ip: null, data: null,
+  set(ip) { if (this.ip !== ip) { this.ip = ip; this.data = null; emit("select"); } },
+  clear() { if (this.ip) { this.ip = null; this.data = null; emit("select"); } },
+  loaded(h) { if (h && h.ip === this.ip) { this.data = h; emit("select"); } },
+  /* its traffic paths: one per device it talks to, biggest first.
+     up/down are seen from the LAN side, like everywhere else */
+  paths() {
+    const h = this.data;
+    if (!h) return [];
+    const by = new Map();
+    for (const p of h.pairs || []) {
+      const mine = p.local === h.ip;
+      const other = mine ? p.remote : p.local;
+      let x = by.get(other);
+      if (!x) {
+        x = { ip: other, name: (mine ? p.remote_name : p.local_name) || "", up: 0, down: 0, conns: 0, cats: {}, services: [],
+          geo: p.other_geo || null, lan: !h.lan || p.dir === "lan" };
+        by.set(other, x);
+      }
+      // a LAN-to-LAN conversation where the singled-out host is the far end: turn it around
+      const flip = h.lan && !mine;
+      x.up += flip ? p.down : p.up; x.down += flip ? p.up : p.down;
+      x.conns += p.conns;
+      const c = p.cat || "other";
+      x.cats[c] = (x.cats[c] || 0) + p.up + p.down;
+      if (p.service && !x.services.includes(p.service)) x.services.push(p.service);
+    }
+    const list = [...by.values()];
+    list.forEach((x) => { x.cat = Object.entries(x.cats).sort((a, b) => b[1] - a[1]).map((e) => e[0])[0] || "other"; });
+    return list.sort((a, b) => b.up + b.down - (a.up + a.down));
+  },
+  /* the strip over the map / globe while something is singled out */
+  banner(shown) {
+    if (!this.ip) return "";
+    const h = this.data, n = h ? this.paths().length : 0;
+    const name = (h && h.name) || this.ip;
+    return `<span class="sb-dot"></span><span class="sb-t"><b>${esc(name)}</b>${name !== this.ip ? ` <span class="mono faint">${esc(this.ip)}</span>` : ""}
+      <span class="faint">· ${h ? `${n} path${n === 1 ? "" : "s"}${shown != null && shown < n ? ` (top ${shown} shown)` : ""}` : "loading…"}</span></span>
+      ${Pins.button(this.ip)}<button class="btn sm ghost" data-unselect title="Show all traffic (Esc)">${ICON.x} Show all</button>`;
+  },
+};
+document.addEventListener("click", (e) => { if (e.target.closest("[data-unselect]")) closeDrawer(); });
+
 /* ---------------- host / peer drawer ---------------- */
 let drawerIp = null, drawerTimer = null, drawerChart = null;
 function openHost(ip) {
@@ -497,11 +584,12 @@ function openHost(ip) {
   const d = $("#drawer");
   d.classList.add("open");
   d.setAttribute("aria-hidden", "false");
+  Select.set(ip);  // (after opening: the map lays itself out around the drawer)
   d.innerHTML = `<header><div class="grow"><div class="faint">${esc(ip)}</div><h2>Loading…</h2></div><button class="icon-btn" data-x aria-label="Close">${ICON.x}</button></header>`;
   $("[data-x]", d).onclick = closeDrawer;
   loadHost();
   clearInterval(drawerTimer);
-  drawerTimer = setInterval(loadHost, 3000);
+  drawerTimer = setInterval(loadHost, 2000);
 }
 function closeDrawer() {
   drawerIp = null;
@@ -509,6 +597,7 @@ function closeDrawer() {
   const d = $("#drawer");
   d.classList.remove("open");
   d.setAttribute("aria-hidden", "true");
+  Select.clear();
   drawerChart = null;
 }
 async function loadHost() {
@@ -517,6 +606,7 @@ async function loadHost() {
   let h;
   try { h = await api.get("/api/host?ip=" + encodeURIComponent(ip)); } catch (e) { return; }
   if (ip !== drawerIp) return;
+  Select.loaded(h);
   const d = $("#drawer");
   const peer = !h.lan;
   const dev = h.device || {};
@@ -530,8 +620,14 @@ async function loadHost() {
     blocked ? '<span class="pill red">blocked</span>' : "",
     quarantined ? '<span class="pill amber">quarantined</span>' : "",
     h.protected ? `<span class="pill" title="${esc(h.protected)}">protected</span>` : "",
+    h.pinned ? '<span class="pill blue">pinned</span>' : "",
   ].join(" ");
-  const acts = [];
+  const paths = Select.ip === ip ? Select.paths() : [];
+  const where = (g) => (g ? [g.city, g.cc].filter(Boolean).join(", ") : "");
+  const pmax = Math.max(1, ...paths.map((x) => Math.max(x.up, x.down)));
+  // rate history is kept for LAN hosts; an Internet host's rates are the sum of its paths
+  const rateNow = (i, k) => (now ? now[i] : paths.reduce((a, x) => a + x[k], 0));
+  const acts = [`<button class="btn sm ${h.pinned ? "on" : ""}" data-pin="${esc(ip)}" title="Pinned devices are always on the traffic map and first in every list">${ICON.pin} ${h.pinned ? "Pinned" : "Pin"}</button>`];
   if (!h.protected) {
     if (blocked) acts.push(`<button class="btn sm" data-act="remove_entry" data-list="mcc-blocked">${ICON.undo} Unblock</button>`);
     else acts.push(`<button class="btn sm danger" data-act="block_ip">${ICON.block} Block</button>`);
@@ -548,8 +644,8 @@ async function loadHost() {
       ${h.protected ? `<div class="callout">MCC won't block or cut off this address: ${esc(h.protected)}.</div>` : ""}
       <div class="btnrow">${acts.join("")}</div>
       <div class="kpis" style="grid-template-columns:repeat(3,1fr);margin:0">
-        <div class="panel kpi"><div class="k in">↓ ${peer ? "to LAN" : "download"}</div><div class="v">${fmt.bps(now ? now[1] : 0)}</div></div>
-        <div class="panel kpi"><div class="k out">↑ ${peer ? "from LAN" : "upload"}</div><div class="v">${fmt.bps(now ? now[2] : 0)}</div></div>
+        <div class="panel kpi"><div class="k in">↓ ${peer ? "to LAN" : "download"}</div><div class="v">${fmt.bps(rateNow(1, "down"))}</div></div>
+        <div class="panel kpi"><div class="k out">↑ ${peer ? "from LAN" : "upload"}</div><div class="v">${fmt.bps(rateNow(2, "up"))}</div></div>
         <div class="panel kpi"><div class="k">Conversations</div><div class="v">${h.pairs.length}</div></div>
       </div>
       ${!peer ? `<div class="panel"><div class="body" style="padding:8px"><div class="chart short"><canvas id="hchart"></canvas></div></div></div>` : ""}
@@ -559,9 +655,13 @@ async function loadHost() {
         <dt>Coordinates</dt><dd>${h.geo.lat}, ${h.geo.lon}${h.geo.precision === "country" ? " (country centre)" : ""}</dd></dl></div>` : ""}
       ${h.device ? `<div><h4>Device</h4><dl class="kv"><dt>MAC</dt><dd>${esc(dev.mac)}</dd><dt>Hostname</dt><dd>${esc(dev.hostname || "—")}</dd>
         <dt>Port</dt><dd>${esc(dev.port || dev.iface || "—")}</dd><dt>DHCP</dt><dd>${dev.dhcp ? esc(dev.status || "yes") : "no (ARP only)"}</dd></dl></div>` : ""}
-      <div><h4>Conversations now</h4>${h.pairs.length ? `<table class="t"><thead><tr><th>${peer ? "LAN host" : "Remote"}</th><th>Service</th><th class="r">↓</th><th class="r">↑</th></tr></thead><tbody>
-        ${h.pairs.slice(0, 40).map((p) => { const other = p.local === ip ? p.remote : p.local; const nm = p.local === ip ? p.remote_name : p.local_name;
-          return `<tr class="click" data-ip="${esc(other)}"><td><div class="who"><b>${esc(nm || other)}</b>${nm ? `<span>${esc(other)}</span>` : ""}</div></td><td><span class="tchip" title="${esc(Types.label(p.cat || "other"))}${p.cat_why ? " · " + esc(p.cat_why) : ""}"><i class="tdot" style="background:${Types.color(p.cat || "other")}"></i>${esc(p.service)}</span></td><td class="r num in">${fmt.bps(p.down)}</td><td class="r num out">${fmt.bps(p.up)}</td></tr>`; }).join("")}
+      <div><h4>Traffic paths · ${paths.length}</h4>
+        <div class="note" style="margin-bottom:8px">${ICON.target} Singled out on the traffic map and globe. Close this panel (Esc) to see everything again.</div>
+        ${paths.length ? `<table class="t paths"><thead><tr><th>${peer ? "LAN host" : "Talks to"}</th><th>Type · services</th><th class="r">Conns</th><th class="r">↓</th><th class="r">↑</th><th></th></tr></thead><tbody>
+        ${paths.map((x) => `<tr class="click" data-ip="${esc(x.ip)}"><td><div class="who"><b>${esc(x.name || x.ip)}</b><span>${esc(x.name ? x.ip : "")}${x.lan ? (x.name ? " · " : "") + "LAN" : where(x.geo) ? (x.name ? " · " : "") + esc(where(x.geo)) : ""}</span></div></td>
+          <td><span class="tchip" title="${esc(Object.keys(x.cats).map((k) => Types.label(k)).join(", "))}"><i class="tdot" style="background:${Types.color(x.cat)}"></i>${esc(Types.label(x.cat))}</span>
+            <div class="faint" style="font-size:11.5px">${esc(x.services.slice(0, 4).join(", "))}${x.services.length > 4 ? ` +${x.services.length - 4}` : ""}</div></td>
+          <td class="r num">${x.conns}</td><td class="r num in">${fmt.bps(x.down)}</td><td class="r num out">${fmt.bps(x.up)}</td><td style="width:70px">${rateBars(x.down, x.up, pmax)}</td></tr>`).join("")}
         </tbody></table>` : '<div class="note">No traffic right now.</div>'}</div>
       ${h.threats.length ? `<div><h4>Threats</h4>${h.threats.map((t) => `<div class="tcard ${t.status !== "open" ? "dim" : ""}" style="--sv:var(--${sevVar(t.severity)});border:1px solid var(--line-soft);border-radius:8px;margin-bottom:6px" data-tid="${esc(t.id)}">
         <div class="row1"><span class="sev sv-${esc(t.severity)}">${esc(t.severity)}</span><span class="grow"></span><span class="pill">${esc(t.status)}</span></div><h3>${esc(t.title)}</h3><p>${esc(t.summary)}</p></div>`).join("")}</div>` : ""}

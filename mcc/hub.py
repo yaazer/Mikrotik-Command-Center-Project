@@ -19,6 +19,8 @@ from .config import Config
 from .classify import CATEGORIES
 from .detect import RULES, Detector
 from .geo import Geo
+from .names import NameMemory
+from .pins import Pins
 from .routeros import CertificateChanged, RouterOS, RouterOSError, local_ip_toward
 from .setup_plan import SetupPlanner
 from .rosswitch import RouterOSSwitch, detect_os
@@ -94,6 +96,7 @@ class Hub:
         self.devices: Dict[str, Dict[str, Any]] = {}
         self.ip_names: Dict[str, str] = {}
         self.dns_names: Dict[str, str] = {}
+        self.name_memory = NameMemory(self.data_dir)  # names seen before: kept across restarts and DNS-cache expiry
         self.router_addrs: Set[str] = set()
         self.router_nets: List[Tuple[str, Any]] = []  # (interface, network)
         self.gateways: Set[str] = set()
@@ -125,6 +128,7 @@ class Hub:
         self.actions = ActionEngine(self, self.data_dir)
         self.setup = SetupPlanner(self, self.data_dir)
         self.geo = Geo(cfg, self.data_dir)
+        self.pins = Pins(self.data_dir)
         self.flow_parser = FlowParser()
         col = cfg.get("collectors")
         self.flow_col = UdpCollector("flows", col["bind"], int(col["flow_port"]), self._on_flow, self._allowed)
@@ -155,6 +159,7 @@ class Hub:
         self._wake.set()
         self.flow_col.stop()
         self.syslog_col.stop()
+        self.name_memory.save()
         for r in (self.ros, self._ros_slow):
             if r:
                 r.close()
@@ -279,7 +284,24 @@ class Hub:
         return in_networks(o, self.lan_nets()) or is_local_scope(o)
 
     def name_of(self, ip: str) -> str:
-        return self.ip_names.get(ip) or self.dns_names.get(ip) or ""
+        return self.ip_names.get(ip) or self.dns_names.get(ip) or self.name_memory.get(ip)
+
+    # -- pinned devices: always on the map, first in the lists ------------------------------------
+    def pinned(self) -> Dict[str, Dict[str, Any]]:
+        """Current address -> pin (a LAN device's pin follows its MAC to a new address)."""
+        devs = self.devices
+        return self.pins.resolve(lambda mac: (devs.get(mac) or {}).get("ip") or None)
+
+    def pins_list(self) -> List[Dict[str, Any]]:
+        return sorted(({**x, "name": self.name_of(ip) or x.get("name", ""), "lan": self.is_lan(ip)}
+                       for ip, x in self.pinned().items()), key=lambda x: x.get("added", 0))
+
+    def set_pin(self, ip: str, pinned: bool) -> List[Dict[str, Any]]:
+        lan = self.is_lan(ip)
+        dev = next((d for d in self.devices.values() if d.get("ip") == ip), None) if lan else None
+        if self.pins.set(ip, pinned, mac=(dev or {}).get("mac", ""), name=self.name_of(ip), lan=lan):
+            self.publish("pins", self.pins_list())
+        return self.pins_list()
 
     def mcc_ip(self) -> str:
         adv = (self.cfg.get("collectors.advertise_ip") or "").strip()
@@ -620,6 +642,7 @@ class Hub:
         with self.lock:
             self.devices = devs
             self.ip_names = names
+        self.name_memory.remember("device", names, now)
         self.detector.on_devices(list(devs.values()), now)
 
     def _poll_dns(self, ros: RouterOS, now: float) -> None:
@@ -635,6 +658,7 @@ class Hub:
                     names[data] = r["name"].rstrip(".")
         with self.lock:
             self.dns_names = names
+        self.name_memory.remember("dns", names, now)
 
     def _switch_loop(self) -> None:
         while not self._stop.is_set():
@@ -735,8 +759,10 @@ class Hub:
 
     def snapshot(self, now: Optional[float] = None) -> Dict[str, Any]:
         now = now or time.time()
+        pins = {ip: self.is_lan(ip) for ip in self.pinned()}
         with self.lock:
-            traffic = self.traffic.snapshot(now, self.blocked, self.detector.subject_threats(), limit_pairs=80)
+            traffic = self.traffic.snapshot(now, self.blocked, self.detector.subject_threats(), limit_pairs=80,
+                                            pinned=pins)
             ifaces = sorted(self.ifaces.values(), key=lambda i: (not i["wan"], i["name"]))
             wan = [i for i in ifaces if i["wan"]]
             info = dict(self.router_info)
@@ -797,10 +823,11 @@ class Hub:
         return {"snapshot": snap, "history": {"ifaces": hist, "health": health, "switch": sw},
                 "threats": self.detector.list(), "actions": self.actions.list(), "logs": logs,
                 "entries": self.entries, "config": self.cfg.public(), "rules": RULES,
-                "ignore": self.detector.suppressions_list(), "categories": CATEGORIES}
+                "ignore": self.detector.suppressions_list(), "categories": CATEGORIES, "pins": self.pins_list()}
 
     def devices_view(self) -> List[Dict[str, Any]]:
         known = self.detector.known_devices()
+        pins = self.pinned()
         snap_hosts = {h["ip"]: h for h in self.traffic.snapshot(time.time())["hosts"]}
         out = []
         with self.lock:
@@ -808,19 +835,24 @@ class Hub:
                 k = known.get(mac, {})
                 h = snap_hosts.get(d.get("ip", ""), {})
                 out.append(dict(d, known=bool(k.get("known", True)), first_seen=k.get("first_seen", ""),
+                                pinned=d.get("ip", "") in pins,
                                 up=h.get("up", 0.0), down=h.get("down", 0.0), conns=h.get("conns", 0),
                                 threat=self.detector.subject_threats().get(d.get("ip", ""), ""),
                                 quarantined=any(e["ip"] == d.get("ip") and e["list"] == QUARANTINE_LIST
                                                 for e in self.entries)))
-        out.sort(key=lambda d: (d["known"], [int(x) if x.isdigit() else 0 for x in d.get("ip", "").split(".")]))
+        out.sort(key=lambda d: (not d["pinned"], d["known"], [int(x) if x.isdigit() else 0 for x in d.get("ip", "").split(".")]))
         return out
 
     def host_view(self, ip: str) -> Dict[str, Any]:
         det = self.traffic.host_detail(ip)
+        for p in det["pairs"]:  # where each path goes (the drawer and the globe single it out)
+            other = p["remote"] if p["local"] == ip else p["local"]
+            p["other_geo"] = None if self.is_lan(other) else self.geo.locate(other)
         dev = next((d for d in self.devices.values() if d.get("ip") == ip), None)
         threats = [t for t in self.detector.list() if t.get("subject") == ip or t.get("target") == ip]
         actions = [a for a in self.actions.list() if a["params"].get("ip") == ip]
         entries = [e for e in self.entries if e["ip"] == ip]
         return {"ip": ip, "name": self.name_of(ip), "lan": self.is_lan(ip), "device": dev, "threats": threats[:20],
                 "actions": actions[:20], "entries": entries, "protected": self.protected_ips().get(ip, ""),
-                "blocklisted": self.detector.blocklist.contains(ip), "geo": self.geo.locate(ip), **det}
+                "blocklisted": self.detector.blocklist.contains(ip), "geo": self.geo.locate(ip),
+                "pinned": ip in self.pinned(), **det}
