@@ -14,7 +14,7 @@ Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 WorkingDirectory=/opt/mcc
 ExecStart=/usr/bin/python3 /opt/mcc/mcc.py --data /var/lib/mcc --no-browser
 Restart=on-failure
-RestartSec=5
+RestartSec=10
 TimeoutStopSec=15
 
 # Hardening: MCC needs the network and its data directory, nothing else

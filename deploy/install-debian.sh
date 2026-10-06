@@ -94,10 +94,30 @@ say "installing the service"
 install -m 0644 "$APP/deploy/mcc.service" "$UNIT"
 systemctl daemon-reload
 systemctl enable mcc >/dev/null 2>&1
-systemctl restart mcc
+
+# --- make sure nothing else holds the console port ------------------------------------------------
+# Typically a copy of MCC started by hand (`python3 mcc.py` in the clone) before the service existed:
+# the service can't listen until it's gone. Anything that isn't MCC is left alone.
+PORT="$(sed -n 's/^MCC_PORT=//p' "$ENVF" | tail -1)"; PORT="${PORT:-8840}"
+systemctl stop mcc 2>/dev/null || true
+holder() { ss -ltnpH "sport = :$PORT" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1; }
+for _ in 1 2 3; do
+  PID="$(holder)"
+  [ -n "$PID" ] || break
+  CMD="$(tr '\0' ' ' </proc/"$PID"/cmdline 2>/dev/null || true)"
+  if printf '%s' "$CMD" | grep -q 'mcc\.py'; then
+    say "stopping a copy of MCC started by hand on port $PORT (pid $PID: $CMD)"
+    kill "$PID" 2>/dev/null || true
+    for _ in $(seq 1 20); do [ -d /proc/"$PID" ] || break; sleep 0.5; done
+    [ -d /proc/"$PID" ] && kill -9 "$PID" 2>/dev/null || true
+    sleep 1
+  else
+    die "port $PORT is used by another program (pid $PID: ${CMD:-unknown}). Stop it, or set another MCC_PORT in $ENVF and re-run."
+  fi
+done
+systemctl start mcc
 
 # --- firewall (Debian has none enabled by default; open the ports if ufw is on) -------------------
-PORT="$(sed -n 's/^MCC_PORT=//p' "$ENVF" | tail -1)"; PORT="${PORT:-8840}"
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
   say "opening ufw: $PORT/tcp (console), 2055/udp (flows), 5514/udp (syslog)"
   ufw allow "$PORT"/tcp >/dev/null; ufw allow 2055/udp >/dev/null; ufw allow 5514/udp >/dev/null

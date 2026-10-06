@@ -92,8 +92,14 @@ def main(argv=None) -> int:
     try:
         httpd, token = make_server(hub, bind, port, os.environ.get("MCC_TOKEN"))
     except OSError as e:
-        print("Cannot listen on {}:{} -- {}. MCC is probably already running: restart it with\n"
-              "  python mcc.py --replace   (or pick another --port)".format(bind, port, e), file=sys.stderr)
+        if os.environ.get("INVOCATION_ID"):  # running as a systemd service
+            print("Cannot listen on {}:{} -- {}. Another program holds the port -- often a copy of MCC started "
+                  "by hand. Find it with:  sudo ss -ltnp 'sport = :{}'   then stop it, or re-run "
+                  "deploy/install-debian.sh (it stops a stray MCC for you).".format(bind, port, e, port),
+                  file=sys.stderr)
+        else:
+            print("Cannot listen on {}:{} -- {}. MCC is probably already running: restart it with\n"
+                  "  python mcc.py --replace   (or pick another --port)".format(bind, port, e), file=sys.stderr)
         hub.stop()
         return 2
     url = "http://{}:{}/".format("127.0.0.1" if bind in ("0.0.0.0", "::") else bind, httpd.server_address[1])
