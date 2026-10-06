@@ -82,6 +82,9 @@ const Globe = (() => {
     }
     const ro = new ResizeObserver(resize);
     ro.observe(wrap);
+    let onScreen = true;
+    const io = new IntersectionObserver((e) => { onScreen = e[e.length - 1].isIntersecting; });
+    io.observe(wrap);
     resize();
 
     const R = () => Math.min(w, h) * 0.42 * zoom;
@@ -192,6 +195,7 @@ const Globe = (() => {
       if (!alive) return;
       if (!wrap.isConnected) { destroy(); return; }
       raf = requestAnimationFrame(frame);
+      if (!onScreen) { last = 0; return; }  // scrolled out of view: draw nothing (the Traffic page has two of these)
       if (last && now - last < 15) return;  // ~60 fps cap (high-refresh screens would draw 2x for nothing)
       const dt = Math.min(0.1, last ? (now - last) / 1000 : 0.016);
       last = now;
@@ -552,6 +556,7 @@ const Globe = (() => {
       alive = false;
       cancelAnimationFrame(raf);
       ro.disconnect();
+      io.disconnect();
     }
     raf = requestAnimationFrame(frame);
     // for the UI checks: how far the oldest particle has travelled (0..1) and how many there are

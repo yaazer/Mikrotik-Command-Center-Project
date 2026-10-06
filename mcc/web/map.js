@@ -55,6 +55,9 @@ const TrafficMap = (() => {
     }
     const ro = new ResizeObserver(resize);
     ro.observe(wrap);
+    let onScreen = true;
+    const io = new IntersectionObserver((e) => { onScreen = e[e.length - 1].isIntersecting; });
+    io.observe(wrap);
     readColors();
     on("theme", () => { if (alive) { readColors(); resize(); } });
 
@@ -131,6 +134,7 @@ const TrafficMap = (() => {
       if (!alive) return;
       if (!wrap.isConnected) { destroy(); return; }
       raf = requestAnimationFrame(frame);
+      if (!onScreen) { last = 0; return; }  // scrolled out of view: draw nothing (the Traffic page has two of these)
       if (last && now - last < 15) return;  // ~60 fps cap (high-refresh screens would draw 2x for nothing)
       const dt = Math.min(0.1, last ? (now - last) / 1000 : 0.016);
       last = now;
@@ -326,6 +330,7 @@ const TrafficMap = (() => {
       alive = false;
       cancelAnimationFrame(raf);
       ro.disconnect();
+      io.disconnect();
     }
     raf = requestAnimationFrame(frame);
     return { update, destroy };

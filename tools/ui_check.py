@@ -76,7 +76,12 @@ def shot(b: Browser, name: str) -> None:
 
 
 def click(b: Browser, sel: str) -> bool:
-    return bool(b.eval("(() => { const e = document.querySelector(%r); if (!e) return false; e.click(); return true; })()" % sel))
+    return bool(b.eval("(() => { const e = document.querySelector(%r); if (!e) return false; e.scrollIntoView({block: 'nearest'}); e.click(); return true; })()" % sel))
+
+
+def see(b: Browser, sel: str) -> None:
+    """Scroll to a panel, as a person would: live tables off screen wait until they're scrolled to."""
+    b.until("(() => { const e = document.querySelector(%r); if (e) e.scrollIntoView({block: 'nearest'}); return !!e; })()" % sel, 10)
 
 
 # ------------------------------------------------------------------------------------------
@@ -84,6 +89,7 @@ def sc_pages(d: Demo, c: Check) -> None:
     with Browser(1600, 1000) as b:
         b.nav(d.url + "#/overview")
         c(b.until("document.querySelectorAll('.kpi').length === 7", 10), "overview shows 7 KPIs")
+        see(b, "#talkers")
         c(b.until("!!document.querySelector('#live canvas') && document.querySelectorAll('#talkers tr[data-ip]').length > 3", 15),
           "live traffic canvas and top talkers render")
         c(b.eval("document.querySelector('#router-id').innerText.includes('core-router')"), "header names the router")
@@ -395,9 +401,11 @@ def sc_types(d: Demo, c: Check) -> None:
         first = b.eval("document.querySelector('#live .type-legend .tl').dataset.type")
         click(b, "#live .type-legend .tl")
         c(b.eval("Types.focus") == first, "clicking a legend entry focuses that type ({})".format(first))
+        see(b, "#types")
         c(b.until("!!document.querySelector('#types .trow.on[data-type=\"%s\"]')" % first, 3), "the types panel marks it")
         c(b.until("VIEWS.overview.map.stats().parts > 0", 8), "globe keeps drawing while focused")
         b.nav(d.url + "#/traffic")
+        see(b, "#pairs")
         c(b.until("document.querySelectorAll('#pairs tbody tr').length > 0", 10), "Traffic page conversations")
         cats = b.eval("[...new Set([...document.querySelectorAll('#pairs .tchip')].map(x => x.innerText.trim()))]")
         c(cats == [b.eval("Types.label(Types.focus)")], "conversations filtered to the focused type ({})".format(cats))
@@ -525,8 +533,29 @@ def sc_theme(d: Demo, c: Check) -> None:
         c(not b.errors, "no console errors: {}".format(b.errors[:3]))
 
 
+def sc_offscreen(d: Demo, c: Check) -> None:
+    """The Traffic page runs a flow map and a globe: whatever is scrolled out of view must stop costing frames."""
+    with Browser(1600, 520) as b:  # short window: the globe starts below the fold
+        b.nav(d.url + "#/traffic")
+        b.until("!!document.querySelector('#globe canvas') && S.snap && document.querySelectorAll('#pairs tr').length > 0", 15)
+        b.wait(1.0)
+        c(b.eval("document.getElementById('globe').getBoundingClientRect().top") > b.eval("innerHeight"), "(the globe is below the fold)")
+        t0 = b.eval("VIEWS.traffic.globe.stats().oldest")
+        b.wait(1.0)
+        c(b.eval("VIEWS.traffic.globe.stats().oldest") == t0, "the globe doesn't animate while out of view")
+        b.eval("document.getElementById('globe').scrollIntoView()")
+        c(b.until("VIEWS.traffic.globe.stats().parts > 0 && VIEWS.traffic.globe.stats().oldest !== %r" % t0, 5),
+          "and starts once scrolled to")
+        # off screen, a table refresh waits; scrolled to, it lands at once
+        c(b.until("document.getElementById('countries')._pending != null", 5), "an off-screen table's refresh waits")
+        b.eval("document.getElementById('countries').scrollIntoView()")
+        c(b.until("document.getElementById('countries')._pending == null && document.querySelectorAll('#countries tr').length > 2", 3),
+          "a waiting table refresh lands as soon as it is visible")
+        c(not b.errors, "no console errors: {}".format(b.errors[:3]))
+
+
 SCENARIOS = {"pages": sc_pages, "setup": sc_setup, "respond": sc_respond, "ignore": sc_ignore, "layout": sc_layout, "globe-fade": sc_globe_fade, "theme": sc_theme, "update": sc_update, "types": sc_types, "drawer": sc_drawer, "phone": sc_phone,
-             "light": sc_light}
+             "light": sc_light, "offscreen": sc_offscreen}
 
 
 def main(argv) -> int:

@@ -88,6 +88,44 @@ function bindRows(root) {
   $$("tr[data-ip]", root).forEach((tr) => (tr.onclick = () => openHost(tr.dataset.ip)));
 }
 
+/* Per-second panel refreshes without stutter. Rewriting a few thousand table cells every second costs
+   one long frame, and the globe and flow map visibly hitch on it. So a refresh
+   - is dropped when the HTML hasn't changed,
+   - waits while its panel is scrolled out of view (it's applied the moment the panel comes back),
+   - and is applied a few panels per animation frame, never all in one. */
+const Live = (() => {
+  const queue = new Map();  // element -> after() callback
+  let raf = 0;
+  const seen = new IntersectionObserver((entries) => entries.forEach((e) => {
+    e.target._onScreen = e.isIntersecting;
+    if (e.isIntersecting && e.target._pending != null) queue.set(e.target, e.target._after), kick();
+  }), { rootMargin: "200px" });
+  function kick() { if (!raf) raf = requestAnimationFrame(flush); }
+  function flush() {
+    raf = 0;
+    const t0 = performance.now();
+    for (const [el, after] of queue) {
+      queue.delete(el);
+      if (el.isConnected && el._pending != null) {
+        el.innerHTML = el._html = el._pending;
+        el._pending = null;
+        if (after) after(el);
+      }
+      if (performance.now() - t0 > 4) break;  // the rest next frame
+    }
+    if (queue.size) kick();
+  }
+  /* set(el, html, after): after(el) runs once the HTML is in (e.g. to bind row clicks) */
+  function set(el, html, after) {
+    if (!el) return;
+    if (!el._watched) { el._watched = true; el._onScreen = true; seen.observe(el); }
+    if (html === el._html) { el._pending = null; return; }
+    el._pending = html; el._after = after;
+    if (el._onScreen) { queue.set(el, after); kick(); }
+  }
+  return { set };
+})();
+
 function portsHtml(ports) {
   if (!ports || !ports.length) {
     const sw = S.snap.status.switch;
@@ -290,15 +328,14 @@ VIEWS.overview = {
     if (this.kind === "map") $("#map-src").textContent = { conntrack: "live · connection table", flows: "flow records (IPFIX)", none: "no data yet" }[tr.source];
     Charts.line($("#wan-chart"), [{ data: rx, color: cssVar("--in"), fill: true, label: "↓" }, { data: tx, color: cssVar("--out"), fill: true, label: "↑" }],
       { window: 1800, yfmt: fmt.bps, mirror: true });
-    $("#ports").innerHTML = portsHtml(s.switch.ports);
-    $$("[data-port]", $("#ports")).forEach((p) => (p.onclick = () => go("interfaces", { port: p.dataset.port })));
+    Live.set($("#ports"), portsHtml(s.switch.ports),
+      (el) => $$("[data-port]", el).forEach((p) => (p.onclick = () => go("interfaces", { port: p.dataset.port }))));
     const sys = s.switch.sys || {};
     $("#sw-id").textContent = [sys.identity, sys.model, sys.version && (sys.os === "routeros" ? sys.version : "SwOS " + sys.version)].filter(Boolean).join(" · ");
-    $("#talkers").innerHTML = hostsTable(tr.hosts, "host", 10);
-    $("#dests").innerHTML = hostsTable(tr.peers, "peer", 10);
-    $("#types").innerHTML = typesHtml(tr.types);
+    Live.set($("#talkers"), hostsTable(tr.hosts, "host", 10), bindRows);
+    Live.set($("#dests"), hostsTable(tr.peers, "peer", 10), bindRows);
+    Live.set($("#types"), typesHtml(tr.types));
     refreshTypeUI();
-    bindRows($("#talkers")); bindRows($("#dests"));
     if (++this.n % 10 === 0) this.feedKey = null;
     this.drawFeed();
   },
@@ -317,7 +354,7 @@ VIEWS.overview = {
     bindThreatCards(feed, (id) => go("threats", { id }));
   },
   onThreat() { this.drawFeed(); },
-  onTypes() { const el = $("#types"); if (el && S.snap) el.innerHTML = typesHtml(S.snap.traffic.types); },
+  onTypes() { const el = $("#types"); if (el && S.snap) Live.set(el, typesHtml(S.snap.traffic.types)); },
   mountLive(kind) {
     if (this.map) this.map.destroy();
     this.kind = kind;
@@ -379,7 +416,7 @@ VIEWS.traffic = {
     this.map.update(S.snap);
     this.globe.update(S.snap);
     $("#g-src").textContent = geoHint(S.snap);
-    $("#countries").innerHTML = countriesTable((S.snap.geo || {}).countries);
+    Live.set($("#countries"), countriesTable((S.snap.geo || {}).countries));
     $("#t-src").textContent = `${tr.conns.toLocaleString()} connections · source: ${tr.source}`;
     const names = {};
     tr.hosts.forEach((h) => (names[h.ip] = h.name));
@@ -389,19 +426,18 @@ VIEWS.traffic = {
     const rows = tr.pairs.filter((p) => (!focus || p.cat === focus) &&
       (!q || [p.local, p.remote, names[p.local], names[p.remote], p.service, Types.label(p.cat)].some((v) => (v || "").toLowerCase().includes(q))));
     const max = Math.max(...rows.map((p) => Math.max(p.down, p.up)), 1);
-    $("#types").innerHTML = typesHtml(tr.types);
+    Live.set($("#types"), typesHtml(tr.types));
     refreshTypeUI();
     const note = focus ? `<div class="focus-note"><i class="tdot" style="background:${Types.color(focus)}"></i>Showing only <b>${esc(Types.label(focus))}</b>
       <button class="btn sm ghost" data-type-filter="${esc(focus)}">${ICON.x} Show all types</button></div>` : "";
-    $("#pairs").innerHTML = note + (rows.length ? `<table class="t"><thead><tr><th>LAN host</th><th></th><th>Remote</th><th>Type</th><th>Service</th><th class="r">Conns</th><th class="r">↓</th><th class="r">↑</th><th></th></tr></thead><tbody>
+    Live.set($("#pairs"), note + (rows.length ? `<table class="t"><thead><tr><th>LAN host</th><th></th><th>Remote</th><th>Type</th><th>Service</th><th class="r">Conns</th><th class="r">↓</th><th class="r">↑</th><th></th></tr></thead><tbody>
       ${rows.map((p) => `<tr class="click" data-ip="${esc(p.dir === "lan" ? p.local : p.remote)}"><td>${whoCell(names[p.local], p.local)}</td><td class="faint">${p.dir === "in" ? "⇠" : p.dir === "lan" ? "⇄" : "⇢"}</td>
         <td>${whoCell(names[p.remote], p.remote)}</td><td><span class="tchip" title="${esc(p.cat_why || "")}">${typeDot(p.cat)}${esc(Types.label(p.cat))}</span></td>
         <td>${esc(p.service)}</td><td class="r num">${p.conns}</td><td class="r num in">${fmt.bps(p.down)}</td><td class="r num out">${fmt.bps(p.up)}</td><td style="width:100px">${rateBars(p.down, p.up, max)}</td></tr>`).join("")}
-      </tbody></table>` : '<div class="empty">No conversations match.</div>');
-    $("#hosts").innerHTML = hostsTable(tr.hosts, "host", 60);
-    $("#peers").innerHTML = hostsTable(tr.peers, "peer", 80);
-    $("#svcs").innerHTML = servicesHtml(tr.services);
-    bindRows($("#pairs")); bindRows($("#hosts")); bindRows($("#peers"));
+      </tbody></table>` : '<div class="empty">No conversations match.</div>'), bindRows);
+    Live.set($("#hosts"), hostsTable(tr.hosts, "host", 60), bindRows);
+    Live.set($("#peers"), hostsTable(tr.peers, "peer", 80), bindRows);
+    Live.set($("#svcs"), servicesHtml(tr.services));
   },
   onTypes() { if (S.snap && $("#pairs")) this.tick(); },
   leave() { if (this.map) this.map.destroy(); if (this.globe) this.globe.destroy(); },
