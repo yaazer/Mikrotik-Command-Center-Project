@@ -48,6 +48,8 @@ DEFAULTS: Dict[str, Any] = {
         "worm_ports": [23, 25, 445, 2323, 3389],
         "worm_dsts": 30,
         "watch_ports": [23, 1337, 2323, 4444, 5555, 6667, 6697, 9001, 31337],
+        # firewall rules you log with one of these prefixes are VPN kill switches: a hit is a VPN leak
+        "leak_prefixes": ["VPN-LEAK"],
         "exfil_mbps": 50,
         "exfil_s": 120,
         "exfil_factor": 4,

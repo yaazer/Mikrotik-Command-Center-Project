@@ -788,6 +788,7 @@ VIEWS.setup = {
         ${num("login_failures", "Login failures")}${num("login_window_s", "Login window (s)")}${num("service_conns", "Brute force: conns")}
         ${num("fanout_peers", "Fan-out: peers / min")}${num("worm_dsts", "Worm: dsts / min")}${num("exfil_mbps", "Upload alert (Mb/s)")}
         ${num("exfil_s", "Sustained for (s)")}${num("cpu_pct", "CPU alert (%)")}${num("temp_c", "Temperature alert (°C)")}${num("quiet_s", "Quiet after (s)")}
+        <label for="d-leak">VPN leak log prefixes</label><input type="text" id="d-leak" value="${esc((d.leak_prefixes || []).join(", "))}" placeholder="VPN-LEAK" title="A firewall rule logged with one of these prefixes is a VPN kill switch: every hit raises a VPN leak threat">
       </div></details></div>
       <span></span><div class="btnrow"><button class="btn primary" type="submit">Save settings</button></div></form>`;
   },
@@ -835,6 +836,7 @@ VIEWS.setup = {
       const lines = (id) => $(id).value.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
       const detect = {};
       $$("[data-detect]").forEach((i) => { if (i.value !== "") detect[i.dataset.detect] = +i.value; });
+      detect.leak_prefixes = lines("#d-leak");
       try {
         S.config = await api.post("/api/settings", { lan_networks: lines("#x-lan"), never_block: lines("#x-never"),
           wan: { interfaces: lines("#x-wan"), down_mbps: +$("#x-down").value || 0, up_mbps: +$("#x-up").value || 0 },

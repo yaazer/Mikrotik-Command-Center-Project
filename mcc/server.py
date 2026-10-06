@@ -420,7 +420,12 @@ def clean_settings(b: Dict[str, Any]) -> Dict[str, Any]:
                 if k not in DEFAULTS[section]:
                     raise ApiError(400, "unknown setting {}.{}".format(section, k))
                 d = DEFAULTS[section][k]
-                if isinstance(d, list):
+                if k == "leak_prefixes":  # firewall log prefixes, not ports
+                    items = [str(x).strip() for x in v or [] if str(x).strip()]
+                    if any(len(x) > 50 for x in items):
+                        raise ApiError(400, "a log prefix is at most 50 characters")
+                    out[section][k] = items
+                elif isinstance(d, list):
                     out[section][k] = sorted({int(x) for x in v if 0 < int(x) < 65536})
                 else:
                     num = float(v)

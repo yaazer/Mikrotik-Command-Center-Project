@@ -3,7 +3,7 @@
   World       a small LAN (NAS, workstation, TV, cameras...) talking to the Internet, plus a
               repeating script of incidents: SSH brute force on a port forward, router login
               guessing, a port scan, a worm-like camera, a C2 beacon, a new device, a link flap,
-              a big upload, an IRC connection.
+              a big upload, an IRC connection, a VPN leak caught by a kill-switch rule.
   FakeRouter  RouterOS 7 REST API over the World (Basic auth). Changes made through it have
               effect: blocked attackers stop, quarantined hosts go quiet, disabled ports drop.
   FakeSwOS    a CRS309 running SwOS: link.b / stats.b / sys.b behind HTTP digest auth.
@@ -111,7 +111,7 @@ SWITCH_PORTS = ["ether1", "sfp1", "sfp2", "sfp3", "sfp4", "sfp5", "sfp6", "sfp7"
 
 # (offset s, event, duration s) within each cycle
 SCRIPT = [(6, "ssh_brute", 50), (20, "login_fail", 45), (40, "scan", 40), (75, "worm", 40), (100, "c2", 60),
-          (125, "new_device", 1), (140, "link_flap", 20), (165, "exfil", 150), (185, "irc", 60)]
+          (125, "new_device", 1), (140, "link_flap", 20), (165, "exfil", 150), (185, "irc", 60), (235, "vpn_leak", 30)]
 CYCLE = 330
 
 
@@ -510,6 +510,16 @@ class World:
         if not self.blocked(irc) and not self.quarantined("192.168.88.21"):
             self.new_conn("192.168.88.21", 49999, irc, 6667, "tcp", 2e3, 4e3, 60 / self.speed, "attack",
                           "192.168.88.21")
+
+    def _step_vpn_leak(self, e: Dict[str, Any], now: float) -> None:
+        # the phone's VPN drops; a kill-switch rule logged VPN-LEAK catches it going straight out the WAN
+        if self.quarantined("192.168.88.22"):
+            return
+        for _ in range(self._every(e, 2.5, now)):
+            dst = self.rng.choice([SERVICES["google.com"], SERVICES["icloud.com"], SERVICES["scontent.cdninstagram.com"]])
+            self.log("firewall,info", "VPN-LEAK forward: in:bridge out:ether1, connection-state:new src-mac "
+                                      "3c:22:fb:00:00:22, proto TCP (SYN), 192.168.88.22:{}->{}:443, len 60".format(
+                                          self.rng.randint(40000, 65000), dst))
 
     # -- telemetry out -------------------------------------------------------------------------
     def _fwlog(self, chain: str, src: str, sport: int, dst: str, dport: int) -> None:

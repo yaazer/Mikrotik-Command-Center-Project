@@ -52,6 +52,10 @@ RULES: Dict[str, Dict[str, str]] = {
              "spread over (SMB, Telnet, SMTP, RDP)."},
     "watchport": {"name": "Suspicious outbound port", "why": "A LAN host is talking to a port commonly used for "
                   "backdoors, botnet control (IRC), Tor or ADB."},
+    "vpn_leak": {"name": "VPN leak", "why": "A firewall rule you set up as a VPN kill switch (logged with a VPN "
+                 "leak prefix, VPN-LEAK by default) caught a device sending traffic outside its VPN. The VPN on "
+                 "that device is probably down or misrouted; anything that got past the rule showed your real "
+                 "address."},
     "exfil": {"name": "Unusual upload", "why": "A LAN host has been uploading far above its own normal rate for a "
               "while. Could be a backup -- or data leaving."},
     "new_device": {"name": "New device", "why": "A MAC address never seen before joined the network."},
@@ -571,11 +575,34 @@ class Detector:
             ":{}".format(e["dport"]) if e.get("dport") else "", e.get("chain", ""),
             " " + e["flags"] if e.get("flags") else "", e.get("in_if", ""))
         with self.lock:
+            if self._is_leak_prefix(e.get("prefix") or ""):
+                self._vpn_leak(e, ts, text)
             if not self.is_lan(src):
                 self._inbound_attempt(src, dst, int(e.get("dport") or 0), e.get("proto", ""), ts, text)
                 self._blocklisted(dst, src, False, ts, text)
             elif dst and not self.is_lan(dst):
                 self._blocklisted(src, dst, True, ts, text)
+
+    def _is_leak_prefix(self, prefix: str) -> bool:
+        p = prefix.strip().rstrip(":").upper()
+        return bool(p) and any(p == str(x).strip().rstrip(":").upper() for x in self.d("leak_prefixes") or [])
+
+    def _vpn_leak(self, e: Dict[str, Any], ts: float, text: str) -> None:
+        """A VPN kill-switch rule fired: one threat per device, its count and destinations growing."""
+        src, dst = e["src"], e.get("dst", "")
+        out_if = (e.get("out_if") or "").strip() or "?"
+        self._note(src, ts, text)
+        win = self.w("leak", 600)
+        win.add(src, ts, dst)
+        n, dsts = win.count(src, ts), win.distinct(src, ts)
+        self.raise_threat("vpn_leak", src, "high",
+                          "VPN leak: {} tried to go out {} instead of its VPN".format(src, out_if),
+                          "{} attempt{} to {} address{} outside the VPN in the last 10 min, caught by your {} rule "
+                          "({} chain, out {}). The VPN on {} is probably down.".format(
+                              n, "" if n == 1 else "s", len(dsts), "" if len(dsts) == 1 else "es",
+                              e.get("prefix", "").strip(), e.get("chain", ""), out_if, src),
+                          ts, subject=src, role="host", target=dst, evidence=self.recent[src],
+                          proposals=[self._kill(src), self._quarantine(src)], count=n)
 
     def on_login(self, src: str, user: str, via: str, ok: bool, ts: Optional[float] = None) -> None:
         ts = ts or time.time()

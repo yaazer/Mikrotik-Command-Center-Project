@@ -143,9 +143,18 @@ Blocks and quarantines also drop the address's open connections. Without that, c
 | Worm-like spreading | ≥ 30 destinations/min on 23/25/445/2323/3389 | quarantine |
 | Suspicious outbound port | a LAN host connects out on 23, 4444, 6667, 9001, … | block peer / quarantine |
 | Unusual upload | ≥ 50 Mb/s and ≥ 4× the host's normal rate, for 2 min | drop connections / quarantine |
+| VPN leak | a firewall rule logged with the `VPN-LEAK` prefix (your VPN kill switch) catches a device; prefixes in Settings | drop connections / quarantine |
 | New device | a MAC never seen before (the first run is the baseline) | quarantine, or mark known |
 | Link down | a router or switch port that was up loses link | — |
 | Router CPU / temperature | ≥ 90 % for 30 s / ≥ 75 °C | — |
+
+**VPN leaks.** Give your kill-switch rule a log prefix, and every hit becomes a *VPN leak* threat for the device it caught, with the interface it tried to use:
+
+```
+/ip firewall filter set [find comment="Kill-switch: .42 must never use Bell"] log=yes log-prefix=VPN-LEAK
+```
+
+MCC sees the hit through syslog (approve *Syslog to MCC* in Setup) or the router's own log. Other prefixes can be added in **Settings › Detection thresholds › VPN leak log prefixes**.
 
 A threat is keyed by rule and subject, so a ten-minute scan is one threat whose count and evidence grow, not a thousand alerts.
 

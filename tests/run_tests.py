@@ -372,6 +372,43 @@ def t_detect_outbound_rules():
 
 
 @test
+def t_detect_vpn_leak():
+    from mcc.collectors import classify as classify_log, split_syslog
+    tmp = tempfile.mkdtemp()
+    try:
+        d, _ = _detector(tmp)
+        # what RouterOS logs for: /ip firewall filter set [find comment="Kill-switch: .42 must never use Bell"]
+        #                         log=yes log-prefix=VPN-LEAK
+        line = (b"<134>Oct  6 14:02:11 core-router firewall,info VPN-LEAK forward: in:bridge out:ether1-bell, "
+                b"connection-state:new src-mac 3c:22:fb:00:00:42, proto TCP (SYN), 192.168.88.42:51515->"
+                b"142.250.72.46:443, len 60")
+        info = classify_log(*split_syslog(line))
+        eq((info["kind"], info["prefix"], info["out_if"]), ("fw", "VPN-LEAK", "ether1-bell"), "parsed")
+        d.on_fw(info, 1000.0)
+        t = next(t for t in d.list() if t["rule"] == "vpn_leak")
+        eq((t["subject"], t["severity"], t["status"]), ("192.168.88.42", "high", "open"), "one hit is a leak")
+        ok("ether1-bell" in t["title"] and "VPN-LEAK" in t["summary"], "says where it tried to go: " + t["title"])
+        eq([p["kind"] for p in t["proposals"]], ["kill_connections", "quarantine_host"], "drop its connections first")
+        nat = ("VPN-LEAK forward: in:bridge out:ether1-bell, connection-state:new,snat proto UDP, "
+               "192.168.88.42:5353->8.8.8.8:53, NAT (192.168.88.42:5353->203.0.113.7:5353)->8.8.8.8:53, len 72")
+        d.on_fw(classify_log("firewall,info", nat), 1001.0)
+        t = next(t for t in d.list() if t["rule"] == "vpn_leak")
+        eq(t["count"], 2, "repeat hits grow one threat")
+        ok("2 addresses" in t["summary"], t["summary"])
+        # other prefixes are not leaks; the prefix list is a setting (case-insensitive)
+        d.on_fw(classify_log("firewall,info", nat.replace("VPN-LEAK", "MCC-FWD").replace(".42", ".43")), 1002.0)
+        ok(not any(x["subject"] == "192.168.88.43" for x in d.list() if x["rule"] == "vpn_leak"), "MCC-FWD is not a leak")
+        d.cfg.update({"detect": {"leak_prefixes": ["KS-BELL"]}})
+        d.on_fw(classify_log("firewall,info", nat.replace("VPN-LEAK", "ks-bell").replace(".42", ".44")), 1003.0)
+        ok(any(x["subject"] == "192.168.88.44" for x in d.list() if x["rule"] == "vpn_leak"), "a custom prefix works")
+        from mcc.server import clean_settings
+        eq(clean_settings({"detect": {"leak_prefixes": [" VPN-LEAK ", "", "KS-BELL"]}}),
+           {"detect": {"leak_prefixes": ["VPN-LEAK", "KS-BELL"]}}, "Settings keeps the prefixes as text, not ports")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
 def t_detect_state_rules():
     tmp = tempfile.mkdtemp()
     try:
@@ -997,7 +1034,7 @@ def t_e2e_detect_and_block():
 def t_e2e_scripted_incidents():
     """The demo's incident script, sped up: the conntrack/log-based rules fire with no setup at all."""
     with Env(script=True, speed=12) as e:
-        want = {"bruteforce", "login", "worm", "blocklist", "new_device", "link_down", "watchport"}
+        want = {"bruteforce", "login", "worm", "blocklist", "new_device", "link_down", "watchport", "vpn_leak"}
         got = wait_for(lambda: (lambda r: r if want <= r else None)({t["rule"] for t in e.hub.detector.list()}), 40, 0.5)
         ok(got, "scripted incidents detected: {}".format(sorted({t["rule"] for t in e.hub.detector.list()})))
 
