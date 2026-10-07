@@ -40,23 +40,26 @@ VPN_HOSTS = ("192.168.88.21", "192.168.88.22")
 
 HOSTS = [
     # ip, mac, name, router port, switch port, apps: (service, port, proto, down_mbps, up_mbps, conns)
-    ("192.168.88.10", "DC:2C:6E:10:00:10", "nas", "sfp-sfpplus1", 2,
+    ("192.168.88.10", "00:11:32:10:00:10", "nas", "sfp-sfpplus1", 2,
      [("s3.amazonaws.com", 443, "tcp", 0.2, 1.5, 2), ("plex.tv", 32400, "tcp", 0.1, 4.0, 1)]),
-    ("192.168.88.20", "DC:2C:6E:10:00:20", "workstation", "sfp-sfpplus1", 3,
+    ("192.168.88.20", "F4:8E:38:10:00:20", "workstation", "sfp-sfpplus1", 3,
      [("github.com", 443, "tcp", 1.5, 0.2, 3), ("zoom.us", 8801, "udp", 3.0, 2.2, 1),
+      ("www.msftconnecttest.com", 80, "tcp", 0.001, 0.001, 1),
       ("cloudflare.com", 443, "tcp", 0.6, 0.05, 4), ("tlu.dl.delivery.mp.microsoft.com", 443, "tcp", 4.0, 0.05, 1)]),
-    ("192.168.88.70", "DC:2C:6E:10:00:70", "homelab", "sfp-sfpplus1", 4,
+    ("192.168.88.70", "DC:A6:32:10:00:70", "homelab", "sfp-sfpplus1", 4,
      [("deb.debian.org", 443, "tcp", 2.0, 0.1, 1)]),
     ("192.168.88.21", "3C:22:FB:00:00:21", "laptop", "ether2", 0,
-     [("youtube.com", 443, "tcp", 6.0, 0.2, 2), ("icloud.com", 443, "tcp", 0.3, 0.1, 2)]),
+     [("youtube.com", 443, "tcp", 6.0, 0.2, 2), ("icloud.com", 443, "tcp", 0.3, 0.1, 2),
+      ("captive.apple.com", 80, "tcp", 0.001, 0.001, 1)]),
     ("192.168.88.22", "3C:22:FB:00:00:22", "phone", "ether2", 0,
      [("icloud.com", 443, "tcp", 0.2, 0.05, 2), ("google.com", 443, "tcp", 0.5, 0.05, 2),
+      ("courier.push.apple.com", 5223, "tcp", 0.001, 0.001, 1),
       ("scontent.cdninstagram.com", 443, "tcp", 1.5, 0.1, 1)]),
     ("192.168.88.30", "A4:77:33:00:00:30", "living-room-tv", "ether3", 0,
-     [("netflix.com", 443, "tcp", 16.0, 0.3, 2)]),
+     [("netflix.com", 443, "tcp", 16.0, 0.3, 2), ("connectivitycheck.gstatic.com", 80, "tcp", 0.001, 0.001, 1)]),
     ("192.168.88.40", "18:C0:4D:00:00:40", "gaming-pc", "ether4", 0,
-     [("steampowered.com", 27015, "udp", 1.2, 0.6, 1), ("steampowered.com", 443, "tcp", 9.0, 0.1, 1)]),
-    ("192.168.88.50", "9C:8E:CD:00:00:50", "ip-camera", "ether5", 0,
+     [("www.msftconnecttest.com", 80, "tcp", 0.001, 0.001, 1), ("steampowered.com", 27015, "udp", 1.2, 0.6, 1), ("steampowered.com", 443, "tcp", 9.0, 0.1, 1)]),
+    ("192.168.88.50", "2C:AA:8E:00:00:50", "ip-camera", "ether5", 0,
      [("api.wyzecam.com", 443, "tcp", 0.05, 1.2, 1)]),
     ("192.168.88.60", "00:1B:A9:00:00:60", "printer", "ether5", 0,
      [("time.cloudflare.com", 123, "udp", 0.001, 0.001, 1)]),
@@ -69,7 +72,31 @@ SERVICES = {
     "netflix.com": "45.57.40.1", "steampowered.com": "155.133.248.36", "api.wyzecam.com": "47.88.10.20",
     "tlu.dl.delivery.mp.microsoft.com": "13.107.4.50", "scontent.cdninstagram.com": "157.240.11.174",
     "time.cloudflare.com": "162.159.200.1", "irc.libera.chat": "203.0.113.200", "update-check.biz": "192.0.2.66",
+    "www.msftconnecttest.com": "13.107.4.52", "captive.apple.com": "17.253.144.11",
+    "courier.push.apple.com": "17.57.146.20", "connectivitycheck.gstatic.com": "142.250.72.35",
+    "m1.tuyaus.com": "52.40.130.12",
 }
+# DHCP vendor class (option 60) some clients send; RouterOS shows it on the lease
+CLASS_IDS = {"192.168.88.20": "MSFT 5.0", "192.168.88.40": "MSFT 5.0", "192.168.88.50": "udhcp 1.24.1",
+             "192.168.88.70": "dhcpcd-9.4.1:Linux-6.6.31+rpt-rpi-v8:aarch64:BCM2835"}
+# Devices that announce themselves (MNDP / LLDP): (ip, mac, router port, /ip/neighbor fields)
+NEIGHBORS = [
+    ("192.168.88.2", "DC:2C:6E:30:09:01", "sfp-sfpplus1",
+     {"identity": "crs309", "platform": "MikroTik", "board": "CRS309-1G-8S+", "version": "2.17",
+      "discovered-by": "mndp,lldp", "system-caps": "bridge", "system-caps-enabled": "bridge"}),
+    ("192.168.88.3", "F0:9F:C2:30:00:03", "ether2",
+     {"identity": "U6-Lite-Hall", "platform": "", "system-description": "Ubiquiti U6-Lite, 6.6.65",
+      "discovered-by": "lldp", "system-caps": "bridge,wlan-ap", "system-caps-enabled": "bridge,wlan-ap"}),
+]
+# Who joins in the "new device" incident, in turn: (name, MAC prefix or "" for a private one, class id, apps)
+NEWCOMERS = [
+    ("ESP_{}", "3C:61:05", "", [("m1.tuyaus.com", 8883, "tcp", 0.01, 0.01, 1)]),
+    ("Galaxy-S24", "", "android-dhcp-14", [("connectivitycheck.gstatic.com", 80, "tcp", 0.001, 0.001, 1),
+                                          ("google.com", 443, "tcp", 0.4, 0.05, 1)]),
+    ("", "", "", [("captive.apple.com", 80, "tcp", 0.001, 0.001, 1), ("courier.push.apple.com", 5223, "tcp", 0.01,
+                                                                     0.01, 1)]),
+    ("", "2C:AA:8E", "udhcp 1.24.1", [("api.wyzecam.com", 443, "tcp", 0.05, 0.8, 1)]),
+]
 
 C2_IP = "192.0.2.66"  # on the demo blocklist
 
@@ -183,6 +210,7 @@ class World:
         self.sw_link = [True, True, True, True, True, True, False, False, False]
         self.attackers: Dict[str, str] = {}
         self.extra_hosts: List[Tuple[str, str, str, str, int, list]] = []
+        self.class_ids: Dict[str, str] = dict(CLASS_IDS)
         self._stop = threading.Event()
         self._udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._new_attackers()
@@ -273,6 +301,12 @@ class World:
                                                 **({"remote": "0.0.0.0", "remote-port": 514} if target == "remote" else {})})
         for h in HOSTS:
             self._add_host(*h)
+        for ip, mac, port, fields in NEIGHBORS:
+            self.add("/ip/arp", {"address": ip, "mac-address": mac, "interface": "bridge", "dynamic": True,
+                                 "complete": True, "status": "reachable"})
+            self.add("/interface/bridge/host", {"mac-address": mac, "on-interface": port, "interface": "bridge",
+                                                "local": False, "dynamic": True})
+            self.add("/ip/neighbor", dict(fields, **{"address": ip, "mac-address": mac, "interface": port}))
         for name, ip in SERVICES.items():
             self.add("/ip/dns/cache", {"name": name, "type": "A", "data": ip, "ttl": "1h"})
         self.single["/system/identity"] = {"name": "core-router"}
@@ -285,7 +319,8 @@ class World:
     def _add_host(self, ip: str, mac: str, name: str, rport: str, sport: int, apps: list) -> None:
         self.add("/ip/dhcp-server/lease", {"address": ip, "mac-address": mac, "host-name": name, "server": "defconf",
                                            "status": "bound", "dynamic": True, "last-seen": "5s",
-                                           "active-address": ip, "active-mac-address": mac})
+                                           "active-address": ip, "active-mac-address": mac,
+                                           **({"class-id": self.class_ids[ip]} if ip in self.class_ids else {})})
         self.add("/ip/arp", {"address": ip, "mac-address": mac, "interface": "bridge", "dynamic": True,
                              "complete": True, "status": "reachable"})
         self.add("/interface/bridge/host", {"mac-address": mac, "on-interface": rport, "interface": "bridge",
@@ -498,9 +533,18 @@ class World:
     def _start_new_device(self, e: Dict[str, Any]) -> None:
         n = len(self.extra_hosts) + 1
         ip = "192.168.88.{}".format(150 + n)
-        mac = "F0:9F:C2:{:02X}:{:02X}:{:02X}".format(self.rng.randint(0, 255), self.rng.randint(0, 255),
-                                                     self.rng.randint(0, 255))
-        host = (ip, mac, "", "ether2", 0, [("google.com", 443, "tcp", 0.4, 0.05, 1)])
+        name, prefix, class_id, apps = NEWCOMERS[(n - 1) % len(NEWCOMERS)]
+        tail = [self.rng.randint(0, 255) for _ in range(3)]
+        if prefix:
+            mac = "{}:{:02X}:{:02X}:{:02X}".format(prefix, *tail)
+        else:  # a phone's private Wi-Fi address: locally administered (x2, x6, xA, xE in the first byte)
+            mac = "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}".format(self.rng.randint(1, 63) * 4 + 2,
+                                                                     self.rng.randint(0, 255), self.rng.randint(0, 255),
+                                                                     *tail)
+        name = name.format("".join("{:02X}".format(x) for x in tail))
+        if class_id:
+            self.class_ids[ip] = class_id
+        host = (ip, mac, name, "ether2", 0, apps)
         self.extra_hosts.append(host)
         self._add_host(*host)
         self.log("dhcp,info", "defconf assigned {} for {}".format(ip, mac))

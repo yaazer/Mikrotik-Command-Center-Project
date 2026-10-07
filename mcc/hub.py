@@ -19,7 +19,9 @@ from .config import Config
 from .classify import CATEGORIES
 from .detect import RULES, Detector
 from .geo import Geo
+from .identify import Fingerprints, identify
 from .names import NameMemory
+from .oui import MacVendors, normalise_mac
 from .pins import Pins
 from .routeros import CertificateChanged, RouterOS, RouterOSError, local_ip_toward
 from .setup_plan import SetupPlanner
@@ -29,6 +31,11 @@ from .traffic import TrafficModel
 from .util import in_networks, is_local_scope, ip_obj, parse_duration, parse_networks, to_bool, to_float, to_int
 
 HIST = 900  # points kept per series (30 min at the default 2 s poll)
+# Optional tables read to identify devices: a router without the package (or menu) answers with an error, and
+# MCC then leaves that table alone for a while instead of asking every poll.
+WIFI_TABLES = ("/interface/wifi/registration-table", "/interface/wireless/registration-table",
+               "/caps-man/registration-table", "/interface/wifiwave2/registration-table")
+RETRY_TABLE_S = 600
 
 
 # RouterOS interface types that are VPN tunnels (pppoe-out is an Internet uplink, not a VPN)
@@ -99,6 +106,10 @@ class Hub:
         self._sw_prev: Dict[int, Tuple[float, float, float]] = {}
         self.switch_hist: Dict[int, Deque[Tuple[float, float, float]]] = defaultdict(lambda: deque(maxlen=HIST))
         self.devices: Dict[str, Dict[str, Any]] = {}
+        self.mac_of: Dict[str, str] = {}  # LAN address -> MAC
+        self.vendors = MacVendors(self.data_dir)  # IEEE MAC vendor registry (bundled snapshot, or refreshed in Setup)
+        self.fingerprints = Fingerprints(self.data_dir)  # what each device's traffic revealed about it
+        self._table_off: Dict[str, float] = {}  # optional router tables that errored -> retry after
         self.ip_names: Dict[str, str] = {}
         self.dns_names: Dict[str, str] = {}
         self.name_memory = NameMemory(self.data_dir)  # names seen before: kept across restarts and DNS-cache expiry
@@ -168,6 +179,7 @@ class Hub:
         self.flow_col.stop()
         self.syslog_col.stop()
         self.name_memory.save()
+        self.fingerprints.save()
         for r in (self.ros, self._ros_slow):
             if r:
                 r.close()
@@ -210,6 +222,7 @@ class Hub:
         except OSError:
             self.router_host_ip = host
         self._mcc_ip = ""
+        self._table_off.clear()
         old = (self.ros, self._ros_slow)
         with self.lock:
             self.ros, self._ros_slow = ros, ros.clone()
@@ -451,10 +464,15 @@ class Hub:
         with self.lock:
             self.flow_records += len(flows)
             self._flow_rate.append((now, len(flows)))
+            seen = []
             for f in flows:
                 g = self.traffic.ingest_flow(f, now)
                 if g is not None:
                     self.detector.on_flow(g, now)
+                    seen.append(g)
+        if seen and self.traffic.source(now) != "conntrack":  # the connection table already covers it
+            self.fingerprints.observe(self.mac_of, [_flow_conn(g) for g in seen], self.name_of, now,
+                                      self.router_addrs)
 
     def _on_syslog(self, data: bytes, sender: str) -> None:
         topics, msg = split_syslog(data)
@@ -661,6 +679,7 @@ class Hub:
         with self.lock:
             conns = self.traffic.ingest_conns(rows, now)
         self.detector.on_conns(conns, now)
+        self.fingerprints.observe(self.mac_of, conns, self.name_of, now, self.router_addrs)
         required = set(self.cfg.get("vpn.required") or [])
         if required:
             vpn = self.vpn_ifaces()
@@ -703,7 +722,7 @@ class Hub:
     def _poll_devices(self, ros: RouterOS, now: float) -> None:
         leases, arp, hosts = [], [], []
         try:
-            leases = ros.get_list("/ip/dhcp-server/lease")
+            leases = ros.get_list("/ip/dhcp-server/lease")  # incl. class-id (DHCP option 60) where reported
         except RouterOSError:
             pass
         arp = ros.get_list("/ip/arp")
@@ -722,7 +741,7 @@ class Hub:
                 continue
             devs[mac] = {"mac": mac, "ip": l.get("active-address") or l.get("address", ""),
                          "name": l.get("comment") or l.get("host-name") or "", "hostname": l.get("host-name", ""),
-                         "dhcp": True, "status": l.get("status", ""), "static": not to_bool(l.get("dynamic")),
+                         "class_id": l.get("class-id", ""), "dhcp": True, "status": l.get("status", ""), "static": not to_bool(l.get("dynamic")),
                          "last_seen": l.get("last-seen", ""), "iface": ""}
         for a in arp:
             mac = (a.get("mac-address") or "").upper()
@@ -730,19 +749,55 @@ class Hub:
             if not mac or not ip:
                 continue
             d = devs.setdefault(mac, {"mac": mac, "ip": ip, "name": a.get("comment", ""), "hostname": "",
-                                      "dhcp": False, "status": a.get("status", "") or "arp",
+                                      "class_id": "", "dhcp": False, "status": a.get("status", "") or "arp",
                                       "static": not to_bool(a.get("dynamic")), "last_seen": "", "iface": ""})
             d["iface"] = a.get("interface", "")
             if not d.get("ip"):
                 d["ip"] = ip
+        neighbors = self._optional_table(ros, "/ip/neighbor", now)
+        nb_mac = {(n.get("mac-address") or "").upper(): n for n in neighbors if n.get("mac-address")}
+        nb_ip = {n.get("address"): n for n in neighbors if n.get("address")}
+        wifi: Dict[str, Dict[str, Any]] = {}
+        for path in WIFI_TABLES:
+            for r in self._optional_table(ros, path, now):
+                mac = (r.get("mac-address") or "").upper()
+                if mac:
+                    wifi.setdefault(mac, {"interface": r.get("interface", ""), "ssid": r.get("ssid", ""),
+                                          "band": r.get("band", ""),
+                                          "signal": r.get("signal") or r.get("signal-strength") or r.get("rx-signal") or ""})
+        wifi_ifaces = {n for n, i in list(self.ifaces.items()) if i.get("type") in ("wlan", "wifi", "wifiwave2", "cap")}
         for mac, d in devs.items():
             d["port"] = port_of.get(mac, "")
+            w = wifi.get(mac) or ({"interface": d["port"]} if d["port"] in wifi_ifaces else None)
+            nb = nb_mac.get(mac) or nb_ip.get(d.get("ip"))
+            d["vendor"] = self.vendors.lookup(mac)
+            d["identity"] = identify(d, d["vendor"], self.fingerprints.hints(mac), nb, w)
         names = {d["ip"]: d["name"] for d in devs.values() if d.get("ip") and d.get("name")}
         with self.lock:
             self.devices = devs
+            self.mac_of = {d["ip"]: mac for mac, d in devs.items() if d.get("ip")}
             self.ip_names = names
         self.name_memory.remember("device", names, now)
         self.detector.on_devices(list(devs.values()), now)
+
+    def _optional_table(self, ros: RouterOS, path: str, now: float) -> List[Dict[str, Any]]:
+        """A table only some routers have (a package, or a menu of a newer version): [] when it's missing."""
+        if now < self._table_off.get(path, 0):
+            return []
+        try:
+            return ros.get_list(path)
+        except RouterOSError:
+            self._table_off[path] = now + RETRY_TABLE_S
+            return []
+
+    def identify_mac(self, mac: str) -> Dict[str, Any]:
+        """What MCC knows about a MAC: its vendor, and its identity if it's on the network."""
+        mac = ":".join(normalise_mac(mac)[i:i + 2] for i in range(0, 12, 2))
+        vendor = self.vendors.lookup(mac)
+        dev = self.devices.get(mac)
+        ident = dev["identity"] if dev and dev.get("identity") else identify({"mac": mac}, vendor,
+                                                                             self.fingerprints.hints(mac))
+        return {"mac": mac, "vendor": vendor, "device": dev, "identity": ident}
 
     def _poll_dns(self, ros: RouterOS, now: float) -> None:
         try:
@@ -957,3 +1012,13 @@ class Hub:
                 "actions": actions[:20], "entries": entries, "protected": self.protected_ips().get(ip, ""),
                 "blocklisted": self.detector.blocklist.contains(ip), "geo": self.geo.locate(ip),
                 "pinned": ip in self.pinned(), **det}
+
+
+def _flow_conn(g: Dict[str, Any]) -> Dict[str, Any]:
+    """A flow record in the connection table's shape (for device fingerprints): the port is the responder's."""
+    initiator_side = g["src"] == g["local"]
+    if g["dir"] in ("out", "lan"):
+        port = g["dport"] if initiator_side else g["sport"]
+    else:
+        port = g["sport"] if initiator_side else g["dport"]
+    return {"local": g["local"], "remote": g["remote"], "dir": g["dir"], "proto": g.get("proto_name", ""), "port": port}

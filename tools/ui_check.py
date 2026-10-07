@@ -676,7 +676,46 @@ def sc_vpn(d: Demo, c: Check) -> None:
         c(not b.errors, "no console errors: {}".format(b.errors[:3]))
 
 
-SCENARIOS = {"pages": sc_pages, "setup": sc_setup, "respond": sc_respond, "ignore": sc_ignore, "layout": sc_layout, "globe-fade": sc_globe_fade, "theme": sc_theme, "update": sc_update, "types": sc_types, "drawer": sc_drawer, "phone": sc_phone,
+def sc_identify(d: Demo, c: Check) -> None:
+    """Devices says what each device is (and why); the drawer, Setup and Ctrl+K do too."""
+    with Browser(1600, 1000) as b:
+        b.nav(d.url + "#/devices")
+        c(b.until("document.querySelectorAll('#devs .ident').length >= 9", 15), "Devices has an 'Identified as' column")
+        row = "[...document.querySelectorAll('#devs tr[data-ip]')].find(r => r.dataset.ip === %r)"
+        c(b.until("(%s || {innerText: ''}).innerText.includes('Brother printer')" % (row % "192.168.88.60"), 10),
+          "the printer is identified from its MAC vendor and name")
+        c(b.until("(%s || {innerText: ''}).innerText.includes('Synology NAS')" % (row % "192.168.88.10"), 10),
+          "the NAS is identified")
+        c(b.until("(%s || {innerText: ''}).innerText.includes('CRS309')" % (row % "192.168.88.2"), 10),
+          "the switch is identified from neighbor discovery")
+        b.eval("(() => { const i = document.querySelector('#dq'); i.value = 'camera'; i.dispatchEvent(new Event('input')); })()")
+        c(b.until("document.querySelectorAll('#devs tr[data-ip]').length === 1", 5), "filtering by kind finds the camera")
+        shot(b, "devices-identified")
+        click(b, "#devs tr[data-ip]")
+        c(b.until("document.querySelector('#drawer.open .ident-hero') && document.querySelectorAll('#drawer .clues li').length >= 2", 8),
+          "the drawer explains what the device is and why")
+        shot(b, "drawer-identity")
+        b.eval("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
+        b.until("!document.querySelector('#drawer').classList.contains('open')", 3)
+        b.eval("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'k', ctrlKey: true}))")
+        b.until("document.querySelector('#cmdk.open input') !== null", 3)
+        b.eval("(() => { const i = document.querySelector('#cmdk input'); i.value = '3c:22:fb:00:00:22'; i.dispatchEvent(new Event('input')); })()")
+        c(b.until("document.querySelector('#cmdk li.on') && document.querySelector('#cmdk li.on').innerText.includes('What is')", 3),
+          "pasting a MAC into Ctrl+K offers to identify it")
+        b.eval("document.querySelector('#cmdk input').dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter'}))")
+        c(b.until("document.querySelector('#modal.open h2') && document.querySelector('#modal h2').innerText === 'Apple'", 5),
+          "the lookup names the vendor")
+        c(b.eval("document.querySelector('#modal').innerText.includes('iPhone')"), "and the device it is")
+        b.eval("document.querySelector('#modal [data-x]').click()")
+        b.nav(d.url + "#/setup")
+        see(b, "#ident-panel")
+        c(b.until("document.querySelector('#ident-panel .callout.good') && /prefixes/.test(document.querySelector('#ident-panel').innerText)", 8),
+          "Setup shows the MAC vendor registry")
+        shot(b, "setup-identification")
+        c(not b.errors, "no console errors: {}".format(b.errors[:3]))
+
+
+SCENARIOS = {"pages": sc_pages, "identify": sc_identify, "setup": sc_setup, "respond": sc_respond, "ignore": sc_ignore, "layout": sc_layout, "globe-fade": sc_globe_fade, "theme": sc_theme, "update": sc_update, "types": sc_types, "drawer": sc_drawer, "phone": sc_phone,
              "light": sc_light, "offscreen": sc_offscreen,
              "single-out": sc_single_out, "globe-fit": sc_globe_fit,
              "vpn": sc_vpn}

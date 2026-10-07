@@ -291,6 +291,13 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840, token: Opti
             return {"pins": hub.pins_list()}
         if path == "/api/geo":
             return dict(hub.geo.info(), home=hub.geo.home(hub.public_addrs()))
+        if path == "/api/oui":
+            return hub.vendors.info()
+        if path == "/api/identify":
+            mac = q.get("mac", "")
+            if len("".join(c for c in mac.upper() if c in "0123456789ABCDEF")) != 12:
+                raise ApiError(400, "give a full MAC address, e.g. 3C:22:FB:12:34:56")
+            return hub.identify_mac(mac)
         if path == "/api/build":
             return {"build": build, "build_disk": disk_build_id()}
         if path == "/api/status":
@@ -384,6 +391,13 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840, token: Opti
             try:
                 return hub.geo.start_download(str(b.get("edition") or "country"),
                                               on_done=lambda: hub.publish("geo", hub.geo.info()))
+            except ValueError as e:
+                raise ApiError(409, str(e))
+        if path == "/api/oui/download":
+            if b.get("confirm") is not True:
+                raise ApiError(400, "confirm must be true")
+            try:
+                return hub.vendors.start_download(on_done=lambda: hub.refresh_soon("devices"))
             except ValueError as e:
                 raise ApiError(409, str(e))
         if path == "/api/settings":

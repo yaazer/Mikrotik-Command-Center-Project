@@ -587,3 +587,24 @@ table.t tr.selected td { background: oklch(from var(--accent) l c h / 0.1); }
 .share i { display: block; height: 100%; background: var(--accent); }
 td.num.bad { color: var(--crit); font-weight: 600; }
 table.t tr.leakrow td:first-child { box-shadow: inset 2px 0 0 var(--crit); }
+
+/* ---------- device identification (mcc/identify.py) ---------- */
+.kicon { width: 18px; height: 18px; flex: none; color: var(--accent); }
+.ident { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.ident .who { min-width: 0; }
+.ident .who b { max-width: 220px; }
+.ident.tline { font-size: 13px; margin: 6px 0 2px; }
+.ident.tline > span:not(.conf) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conf { display: inline-flex; gap: 2px; flex: none; margin-left: auto; padding-left: 4px; }
+.conf i { width: 5px; height: 12px; border-radius: 2px; background: var(--line); }
+.conf i.on { background: var(--accent); }
+.ident-hero { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line-soft); border-radius: 10px;
+              background: var(--bg2); margin-bottom: 8px; }
+.ident-hero .kicon { width: 28px; height: 28px; }
+.ident-hero b { font-size: 15px; }
+.clues { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; }
+.clues li { display: grid; grid-template-columns: 74px minmax(0, 1fr); gap: 8px; align-items: baseline; }
+.clues .src { font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); white-space: nowrap; }
+.clues li.faint .src { opacity: .7; }
+h4.mini { margin: 0 0 8px; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); font-weight: 600; }
+.tcard .clues { margin: 4px 0 2px; }

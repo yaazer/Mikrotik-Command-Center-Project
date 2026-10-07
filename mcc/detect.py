@@ -791,23 +791,46 @@ class Detector:
                 if not mac:
                     continue
                 k = self._known.get(mac)
+                ident = dev.get("identity") or {}
                 if k is None:
                     self._known[mac] = {"first_seen": now_iso(), "known": baseline, "name": dev.get("name", ""),
-                                        "ip": dev.get("ip", "")}
+                                        "ip": dev.get("ip", ""), "guess": ident.get("label", "")}
                     changed = True
                     if not baseline:
-                        label = dev.get("name") or dev.get("ip") or mac
-                        self.raise_threat("new_device", mac, "low", "New device: {}".format(label),
-                                          "{} / {} on {}".format(dev.get("ip", "?"), mac, dev.get("iface") or "?"),
-                                          ts, subject=dev.get("ip", ""), role="device", target=mac,
-                                          evidence=[(ts, "first seen {} {} {}".format(mac, dev.get("ip", ""),
-                                                                                       dev.get("name", "")))],
-                                          proposals=[self._quarantine(dev["ip"])] if dev.get("ip") else [])
-                elif dev.get("ip") and k.get("ip") != dev.get("ip"):
-                    k["ip"] = dev["ip"]
-                    changed = True
+                        title, summary = _new_device_text(dev, mac)
+                        t = self.raise_threat("new_device", mac, "low", title, summary,
+                                              ts, subject=dev.get("ip", ""), role="device", target=mac,
+                                              evidence=[(ts, "first seen {} {} {}".format(mac, dev.get("ip", ""),
+                                                                                           dev.get("name", "")))] +
+                                              [(ts, c["text"]) for c in ident.get("clues", [])[:4]],
+                                              proposals=[self._quarantine(dev["ip"])] if dev.get("ip") else [])
+                        if t is not None:
+                            t["identity"] = _ident_brief(ident)
+                            self.on_change(t)
+                else:
+                    if dev.get("ip") and k.get("ip") != dev.get("ip"):
+                        k["ip"] = dev["ip"]
+                        changed = True
+                    if ident.get("label") and k.get("guess") != ident["label"]:
+                        k["guess"] = ident["label"]
+                        changed = True
+                        self._refine_new_device(mac, dev, ts)
             if changed:
                 self._save_known(path)
+
+    def _refine_new_device(self, mac: str, dev: Dict[str, Any], ts: float) -> None:
+        """A new device's traffic says more about it than it did when it joined: update the alert's guess."""
+        tid = self.by_key.get(("new_device", mac))
+        t = self.threats.get(tid) if tid else None
+        if t is None or t["status"] not in ("open", "acknowledged"):
+            return
+        ident = dev.get("identity") or {}
+        t["title"], t["summary"] = _new_device_text(dev, mac)
+        t["identity"] = _ident_brief(ident)
+        t["evidence"].append({"ts": ts, "text": "now identified as {} ({} confidence): {}".format(
+            ident.get("label", "?"), ident.get("confidence", "?"), (ident.get("clues") or [{}])[0].get("text", ""))})
+        del t["evidence"][:-25]
+        self.on_change(t)
 
     def _save_known(self, path: Path) -> None:
         try:
@@ -874,3 +897,38 @@ class Detector:
             for k in list(self.recent):
                 if self.recent[k] and now - self.recent[k][-1][0] > 900:
                     del self.recent[k]
+
+
+def _new_device_text(dev: Dict[str, Any], mac: str) -> Tuple[str, str]:
+    """'New device: Janes-iPhone (Apple iPhone)' and what was seen, including MCC's best guess."""
+    ident = dev.get("identity") or {}
+    guess = ident.get("label", "")
+    name = dev.get("name") or dev.get("hostname") or ""
+    if name and guess and guess != "Unknown device":
+        title = "New device: {} ({})".format(name, guess)
+    else:
+        title = "New device: {}".format(name or (guess if guess and guess != "Unknown device" else "")
+                                        or dev.get("ip") or mac)
+    vendor = (dev.get("vendor") or {}).get("vendor", "")
+    if ident.get("random"):
+        made = "private (randomized) MAC"
+    elif vendor == "Private":
+        made = "privately registered MAC"
+    else:
+        made = "made by {}".format(vendor) if vendor else "unregistered MAC"
+    summary = "{} / {} on {} · {}".format(dev.get("ip", "?"), mac, dev.get("port") or dev.get("iface") or "?", made)
+    if guess and ident.get("confidence") not in (None, "none"):
+        if not ident.get("brand") and guess.split()[0] in ("Phone", "Tablet", "Computer", "Server", "Camera",
+                                                          "Printer", "Wearable", "Vehicle", "Private-address"):
+            guess = guess[0].lower() + guess[1:]  # "a phone (private address)"
+        summary += " · looks like {} ({} confidence)".format(_article(guess), ident["confidence"])
+    return title, summary
+
+
+def _ident_brief(ident: Dict[str, Any]) -> Dict[str, Any]:
+    keep = ("label", "kind", "kind_label", "brand", "os", "model", "vendor", "random", "confidence")
+    return dict({k: ident.get(k) for k in keep}, clues=(ident.get("clues") or [])[:6])
+
+
+def _article(what: str) -> str:
+    return ("an " if what[:1].lower() in tuple("aeiou") else "a ") + what
