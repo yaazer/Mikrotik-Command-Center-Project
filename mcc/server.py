@@ -29,7 +29,7 @@ from .actions import ActionError
 from .config import DEFAULTS
 from .routeros import RouterOSError
 from .swos import SwOSError
-from .util import parse_networks
+from .util import ip_obj, parse_networks
 
 WEB = Path(__file__).resolve().parent / "web"
 
@@ -443,6 +443,17 @@ def clean_settings(b: Dict[str, Any]) -> Dict[str, Any]:
         if "accept_from" in c:
             items = [str(x).strip() for x in c["accept_from"] if str(x).strip()]
             out["collectors"]["accept_from"] = items
+    if "vpn" in b:
+        v = b["vpn"] or {}
+        out["vpn"] = {}
+        if "interfaces" in v:
+            out["vpn"]["interfaces"] = [str(x).strip() for x in v["interfaces"] or [] if str(x).strip()]
+        if "required" in v:
+            items = [str(x).strip() for x in v["required"] or [] if str(x).strip()]
+            bad = [x for x in items if ip_obj(x) is None]
+            if bad:
+                raise ApiError(400, "not an IP address: {}".format(", ".join(bad)))
+            out["vpn"]["required"] = sorted(set(items), key=items.index)
     if "actions" in b and "default_block" in (b["actions"] or {}):
         v = str(b["actions"]["default_block"])
         if v not in ("15m", "1h", "24h", "7d", "0"):

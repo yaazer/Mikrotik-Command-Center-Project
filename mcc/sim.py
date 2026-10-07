@@ -32,6 +32,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 WAN_IP = "198.51.100.2"
 GATEWAY = "198.51.100.1"
 LAN_IP = "192.168.88.1"
+# a WireGuard tunnel to a commercial VPN; the laptop and the phone are policy-routed through it
+VPN_IF = "wg-proton"
+VPN_IP = "10.2.0.2"
+VPN_SERVER = "185.159.157.13"
+VPN_HOSTS = ("192.168.88.21", "192.168.88.22")
 
 HOSTS = [
     # ip, mac, name, router port, switch port, apps: (service, port, proto, down_mbps, up_mbps, conns)
@@ -86,6 +91,7 @@ _CITY = {  # name: (lat, lon, cc, country)
     "Lagos": (6.52, 3.38, "NG", "Nigeria"), "Hong Kong": (22.32, 114.17, "HK", "Hong Kong"),
     "Jakarta": (-6.21, 106.85, "ID", "Indonesia"), "Warsaw": (52.23, 21.01, "PL", "Poland"),
     "Madrid": (40.42, -3.70, "ES", "Spain"), "Buenos Aires": (-34.60, -58.38, "AR", "Argentina"),
+    "Zurich": (47.37, 8.54, "CH", "Switzerland"),
 }
 _SERVICE_CITY = {
     "s3.amazonaws.com": "Ashburn", "plex.tv": "Ashburn", "github.com": "Ashburn", "zoom.us": "San Jose",
@@ -95,12 +101,12 @@ _SERVICE_CITY = {
     "scontent.cdninstagram.com": "Atlanta", "time.cloudflare.com": "San Francisco", "irc.libera.chat": "Stockholm",
     "update-check.biz": "Bucharest",
 }
-_WORLD = sorted(c for c in _CITY if c != "Dallas")
+_WORLD = sorted(c for c in _CITY if c not in ("Dallas", "Zurich"))
 
 
 def demo_geo(ip: str) -> Optional[Dict[str, Any]]:
     by_ip = {SERVICES[s]: c for s, c in _SERVICE_CITY.items()}
-    city = "Dallas" if ip == WAN_IP else by_ip.get(ip)
+    city = "Dallas" if ip == WAN_IP else "Zurich" if ip == VPN_SERVER else by_ip.get(ip)
     if city is None:
         city = _WORLD[int(hashlib.md5(ip.encode()).hexdigest(), 16) % len(_WORLD)]
     lat, lon, cc, country = _CITY[city]
@@ -210,6 +216,18 @@ class World:
                                     "mtu": 1500})
         self.add("/interface", {"name": "bridge", "type": "bridge", "running": True, "disabled": False,
                                 "rx-byte": 0, "tx-byte": 0, "mac-address": "48:A9:8A:00:00:10", "comment": "defconf"})
+        self.add("/interface", {"name": VPN_IF, "type": "wg", "running": True, "disabled": False, "rx-byte": 0,
+                                "tx-byte": 0, "rx-packet": 0, "tx-packet": 0, "comment": "ProtonVPN CH#12", "mtu": 1420})
+        self.add("/interface/wireguard", {"name": VPN_IF, "listen-port": 13231, "mtu": 1420, "running": True})
+        self.add("/interface/wireguard/peers", {"interface": VPN_IF, "name": "proton-ch-12",
+                                                "endpoint-address": VPN_SERVER, "endpoint-port": 51820,
+                                                "current-endpoint-address": VPN_SERVER, "current-endpoint-port": 51820,
+                                                "allowed-address": "0.0.0.0/0", "persistent-keepalive": "25s",
+                                                "last-handshake": "20s", "rx": 0, "tx": 0, "disabled": False})
+        self.add("/ip/address", {"address": VPN_IP + "/32", "network": VPN_IP, "interface": VPN_IF})
+        self.add("/routing/table", {"name": "vpn", "fib": True})
+        for h in VPN_HOSTS:
+            self.add("/routing/rule", {"src-address": h + "/32", "action": "lookup-only-in-table", "table": "vpn"})
         self.add("/interface/list", {"name": "WAN", "comment": "defconf"})
         self.add("/interface/list", {"name": "LAN", "comment": "defconf"})
         self.add("/interface/list/member", {"list": "WAN", "interface": "ether1"})
@@ -219,6 +237,9 @@ class World:
         self.add("/ip/route", {"dst-address": "0.0.0.0/0", "gateway": GATEWAY, "immediate-gw": GATEWAY + "%ether1",
                                "active": True, "distance": 1})
         self.add("/ip/route", {"dst-address": "192.168.88.0/24", "gateway": "bridge", "active": True, "distance": 0})
+        # the VPN's own default route, in its own table (policy routing): not the router's uplink
+        self.add("/ip/route", {"dst-address": "0.0.0.0/0", "gateway": VPN_IF, "immediate-gw": VPN_IF,
+                               "routing-table": "vpn", "active": True, "distance": 1})
         for chain, action, extra, comment in (
                 ("input", "accept", {"connection-state": "established,related,untracked"}, "defconf: accept established,related,untracked"),
                 ("input", "drop", {"connection-state": "invalid"}, "defconf: drop invalid"),
@@ -230,8 +251,14 @@ class World:
                 ("forward", "drop", {"connection-state": "new", "connection-nat-state": "!dstnat", "in-interface-list": "WAN"},
                  "defconf: drop all from WAN not DSTNATed")):
             self.add("/ip/firewall/filter", dict(chain=chain, action=action, comment=comment, **extra))
+        # the phone has a kill switch (logged VPN-LEAK); the laptop doesn't
+        self.add("/ip/firewall/filter", {"chain": "forward", "action": "drop", "src-address": "192.168.88.22",
+                                         "out-interface": "ether1", "log": True, "log-prefix": "VPN-LEAK",
+                                         "comment": "Kill-switch: phone must never use the ISP"})
         self.add("/ip/firewall/nat", {"chain": "srcnat", "action": "masquerade", "out-interface-list": "WAN",
                                       "comment": "defconf: masquerade"})
+        self.add("/ip/firewall/nat", {"chain": "srcnat", "action": "masquerade", "out-interface": VPN_IF,
+                                      "comment": "VPN masquerade"})
         self.add("/ip/firewall/nat", {"chain": "dstnat", "action": "dst-nat", "protocol": "tcp", "dst-port": "22",
                                       "in-interface-list": "WAN", "to-addresses": "192.168.88.70", "comment": "homelab ssh"})
         self.add("/ip/firewall/nat", {"chain": "dstnat", "action": "dst-nat", "dst-port": "51413",
@@ -322,14 +349,16 @@ class World:
         self.conn_seq += 1
         cid = "*{:X}".format(self.conn_seq)
         inbound = bool(nat_to)
+        vpn = not inbound and src in VPN_HOSTS and self.iface_up(VPN_IF)
         c = {".id": cid, "protocol": proto, "src-address": "{}:{}".format(src, sport),
              "dst-address": "{}:{}".format(dst, dport),
              "reply-src-address": "{}:{}".format(nat_to or dst, dport),
-             "reply-dst-address": "{}:{}".format(src if inbound else WAN_IP, sport if inbound else self.rng.randint(20000, 60000)),
+             "reply-dst-address": "{}:{}".format(src if inbound else VPN_IP if vpn else WAN_IP,
+                                                 sport if inbound else self.rng.randint(20000, 60000)),
              "orig-bytes": 0, "repl-bytes": 0, "orig-packets": 0, "repl-packets": 0,
              "tcp-state": state if proto == "tcp" else "", "timeout": "23h59m59s",
              "_up": up, "_down": down, "_born": time.time(), "_life": life, "_kind": kind, "_host": host,
-             "_exported": (0, 0), "_src": src, "_dst": dst, "_sport": sport, "_dport": dport, "_in": inbound,
+             "_exported": (0, 0), "_src": src, "_dst": dst, "_sport": sport, "_dport": dport, "_in": inbound, "_vpn": vpn,
              "_phase": self.rng.random() * 6.28}
         self.conns[cid] = c
         return c
@@ -345,6 +374,8 @@ class World:
         for ip, mac, name, rport, sport, apps in self.host_list():
             if not self.iface_up(rport) or self.quarantined(ip):
                 continue
+            if ip == "192.168.88.22" and not self.iface_up(VPN_IF):
+                continue  # kill switch
             for svc, port, proto, down, up, n in apps:
                 rip = SERVICES.get(svc, svc)
                 key = (ip, rip + ":" + str(port))
@@ -511,6 +542,18 @@ class World:
             self.new_conn("192.168.88.21", 49999, irc, 6667, "tcp", 2e3, 4e3, 60 / self.speed, "attack",
                           "192.168.88.21")
 
+    def _start_vpn_leak(self, e: Dict[str, Any]) -> None:
+        r = self.iface(VPN_IF)
+        if r:
+            r["running"] = "false"  # the tunnel drops: the phone's kill switch blocks it, the laptop leaks
+
+    def _end_vpn_leak(self, e: Dict[str, Any]) -> None:
+        r = self.iface(VPN_IF)
+        if r:
+            r["running"] = "true"
+        for peer in self.tables["/interface/wireguard/peers"]:
+            peer["_hs"] = 0.0
+
     def _step_vpn_leak(self, e: Dict[str, Any], now: float) -> None:
         # the phone's VPN drops; a kill-switch rule logged VPN-LEAK catches it going straight out the WAN
         if self.quarantined("192.168.88.22"):
@@ -610,6 +653,9 @@ class World:
                 if c["_in"] and self.blocked(c["_src"]) or (not c["_in"] and self.blocked(c["_dst"])):
                     del self.conns[cid]
                     continue
+                if c.get("_vpn") and not self.iface_up(VPN_IF):
+                    del self.conns[cid]  # the tunnel went down under it
+                    continue
                 jitter = (0.6 + 0.4 * math.sin(now / 7.0 + c["_phase"])) * (wave if c["_kind"] == "app" else 1)
                 up, down = c["_up"] * jitter, c["_down"] * jitter
                 # orig = initiator -> responder
@@ -621,6 +667,9 @@ class World:
                 c["orig-rate"], c["repl-rate"] = int(o_bps), int(r_bps)
                 wan_rx += down
                 wan_tx += up
+                if c.get("_vpn"):
+                    port_rx[VPN_IF] += down
+                    port_tx[VPN_IF] += up
                 if h:
                     port_tx[h[3]] += down
                     port_rx[h[3]] += up
@@ -631,8 +680,17 @@ class World:
                         sw_rx[1] += down
             port_rx["ether1"] += wan_rx
             port_tx["ether1"] += wan_tx
-            port_rx["bridge"] = sum(v for k, v in port_rx.items() if k != "ether1")
-            port_tx["bridge"] = sum(v for k, v in port_tx.items() if k != "ether1")
+            port_rx["bridge"] = sum(v for k, v in port_rx.items() if k not in ("ether1", VPN_IF))
+            port_tx["bridge"] = sum(v for k, v in port_tx.items() if k not in ("ether1", VPN_IF))
+            for peer in self.tables["/interface/wireguard/peers"]:
+                if self.iface_up(VPN_IF):
+                    # with persistent keepalive, WireGuard re-handshakes every 2 minutes
+                    peer["_hs"] = (peer.get("_hs", 20.0) + dt) % 120
+                    peer["rx"] = str(int(peer["rx"]) + int(port_rx[VPN_IF] * dt / 8))
+                    peer["tx"] = str(int(peer["tx"]) + int(port_tx[VPN_IF] * dt / 8))
+                else:
+                    peer["_hs"] = peer.get("_hs", 20.0) + dt
+                peer["last-handshake"] = "{}m{}s".format(int(peer["_hs"] // 60), int(peer["_hs"] % 60))
             for r in self.tables["/interface"]:
                 if r["running"] != "true" or r["disabled"] != "false":
                     continue

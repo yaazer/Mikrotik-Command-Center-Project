@@ -314,6 +314,10 @@ function renderHeader() {
   $("#nb-threats").textContent = nOpen || "";
   $("#nb-actions").textContent = s.counts.actions_pending || "";
   $("#nb-actions").className = "badge info";
+  // VPN tab: a tunnel that is down (or silent) shows on the tab wherever you are
+  const tun = ((s.vpn || {}).tunnels || []).filter((t) => t.status === "down" || t.status === "stale");
+  const nv = $("#nb-vpn");
+  if (nv) { nv.textContent = tun.length ? "!" : ""; nv.title = tun.map((t) => `${t.name} ${t.status}`).join(", "); }
   const needSetup = st.router.state === "ok" && !st.flows.live && !st.syslog.live;
   $("#nb-setup").textContent = st.router.state !== "ok" ? "!" : needSetup ? "1" : "";
   document.title = (nOpen ? `(${nOpen}) ` : "") + "Mikrotik Command Center";
@@ -549,7 +553,7 @@ const Select = {
       let x = by.get(other);
       if (!x) {
         x = { ip: other, name: (mine ? p.remote_name : p.local_name) || "", up: 0, down: 0, conns: 0, cats: {}, services: [],
-          geo: p.other_geo || null, lan: !h.lan || p.dir === "lan" };
+          geo: p.other_geo || null, lan: !h.lan || p.dir === "lan", via: [] };
         by.set(other, x);
       }
       // a LAN-to-LAN conversation where the singled-out host is the far end: turn it around
@@ -559,6 +563,7 @@ const Select = {
       const c = p.cat || "other";
       x.cats[c] = (x.cats[c] || 0) + p.up + p.down;
       if (p.service && !x.services.includes(p.service)) x.services.push(p.service);
+      if (p.via && !x.via.includes(p.via)) x.via.push(p.via);
     }
     const list = [...by.values()];
     list.forEach((x) => { x.cat = Object.entries(x.cats).sort((a, b) => b[1] - a[1]).map((e) => e[0])[0] || "other"; });
@@ -659,7 +664,7 @@ async function loadHost() {
         <div class="note" style="margin-bottom:8px">${ICON.target} Singled out on the traffic map and globe. Close this panel (Esc) to see everything again.</div>
         ${paths.length ? `<table class="t paths"><thead><tr><th>${peer ? "LAN host" : "Talks to"}</th><th>Type · services</th><th class="r">Conns</th><th class="r">↓</th><th class="r">↑</th><th></th></tr></thead><tbody>
         ${paths.map((x) => `<tr class="click" data-ip="${esc(x.ip)}"><td><div class="who"><b>${esc(x.name || x.ip)}</b><span>${esc(x.name ? x.ip : "")}${x.lan ? (x.name ? " · " : "") + "LAN" : where(x.geo) ? (x.name ? " · " : "") + esc(where(x.geo)) : ""}</span></div></td>
-          <td><span class="tchip" title="${esc(Object.keys(x.cats).map((k) => Types.label(k)).join(", "))}"><i class="tdot" style="background:${Types.color(x.cat)}"></i>${esc(Types.label(x.cat))}</span>
+          <td><span class="tchip" title="${esc(Object.keys(x.cats).map((k) => Types.label(k)).join(", "))}"><i class="tdot" style="background:${Types.color(x.cat)}"></i>${esc(Types.label(x.cat))}</span>${vpnChip(x.via)}
             <div class="faint" style="font-size:11.5px">${esc(x.services.slice(0, 4).join(", "))}${x.services.length > 4 ? ` +${x.services.length - 4}` : ""}</div></td>
           <td class="r num">${x.conns}</td><td class="r num in">${fmt.bps(x.down)}</td><td class="r num out">${fmt.bps(x.up)}</td><td style="width:70px">${rateBars(x.down, x.up, pmax)}</td></tr>`).join("")}
         </tbody></table>` : '<div class="note">No traffic right now.</div>'}</div>
@@ -770,7 +775,7 @@ const cmdk = {
   search(q) {
     q = q.trim().toLowerCase();
     const out = [];
-    const pages = ["overview", "traffic", "threats", "actions", "devices", "interfaces", "logs", "setup"];
+    const pages = ["overview", "traffic", "vpn", "threats", "actions", "devices", "interfaces", "logs", "setup"];
     pages.forEach((p) => out.push({ kind: "page", label: p[0].toUpperCase() + p.slice(1), run: () => go(p) }));
     out.push({ kind: "layout", label: "Reset this page's layout", run: () => Layout.resetPage() });
     out.push({ kind: "look & feel", label: "Open Theme Studio", key: "theme", run: () => Theme.open() });

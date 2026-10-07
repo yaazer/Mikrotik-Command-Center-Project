@@ -573,3 +573,17 @@ table.t tr.selected td { background: oklch(from var(--accent) l c h / 0.1); }
 .sel-banner .pin-btn { margin-left: 0; }
 .drawer .note svg { width: 14px; height: 14px; vertical-align: -2px; color: var(--accent); }
 @media (max-width: 720px) { .sel-banner { max-width: calc(100% - 24px); top: auto; bottom: 34px; } }
+
+/* ---------- VPN ---------- */
+.pill.vpn { margin-left: 6px; font-size: 10.5px; padding: 0 6px; color: var(--accent); border-color: oklch(from var(--accent) l c h / 0.5);
+            background: oklch(from var(--accent) l c h / 0.1); }
+.tunnel { border: 1px solid var(--line-soft); border-left: 3px solid var(--ok); border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; }
+.tunnel.down { border-left-color: var(--crit); }
+.tunnel.stale { border-left-color: var(--high); }
+.tunnel.disabled, .tunnel.missing { border-left-color: var(--faint); }
+.tunnel .row1 { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.tunnel .kv { margin-top: 8px; }
+.share { display: inline-block; width: 110px; height: 6px; border-radius: 3px; background: var(--line-soft); overflow: hidden; vertical-align: middle; margin-right: 8px; }
+.share i { display: block; height: 100%; background: var(--accent); }
+td.num.bad { color: var(--crit); font-weight: 600; }
+table.t tr.leakrow td:first-child { box-shadow: inset 2px 0 0 var(--crit); }

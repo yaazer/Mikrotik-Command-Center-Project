@@ -764,6 +764,45 @@ def t_names_survive_restart():
 
 
 @test
+def t_vpn_tunnel_view_and_alerts():
+    from mcc.server import clean_settings
+    with Env() as e:
+        snap = wait_for(lambda: (lambda s: s if s["traffic"]["vpn"]["pairs"] and s["vpn"]["tunnels"] else None)(e.hub.snapshot()), 15)
+        eq(e.hub.vpn_ifaces(), {sim.VPN_IF}, "a WireGuard interface is found as a VPN tunnel")
+        eq(e.hub.wan_ifaces(), {"ether1"}, "the VPN's own default route (table vpn) doesn't make it a WAN")
+        t = snap["vpn"]["tunnels"][0]
+        eq((t["kind"], t["status"], t["endpoint"], t["addresses"]), ("WireGuard", "up", sim.VPN_SERVER, [sim.VPN_IP]), "tunnel status")
+        tv = snap["traffic"]["vpn"]
+        eq({h["ip"] for h in tv["hosts"]}, set(sim.VPN_HOSTS), "the policy-routed devices are on the VPN")
+        ok(all(p["via"] == sim.VPN_IF and p["local"] in sim.VPN_HOSTS for p in tv["pairs"]), "only tunnel traffic is in the VPN view")
+        ok(tv["in_bps"] > 0 and tv["known"], "with its rates")
+        others = [p for p in snap["traffic"]["pairs"] if p["local"] not in sim.VPN_HOSTS and p["dir"] == "out"]
+        ok(others and all(p["via"] == "ether1" for p in others), "everything else leaves by the WAN")
+        # the tunnel drops: an alert; the laptop (no kill switch, must use the VPN) leaks out the WAN
+        e.cfg.update({"vpn": {"required": ["192.168.88.21"]}})
+        e.world.iface(sim.VPN_IF)["running"] = "false"
+        down = wait_for(lambda: next((x for x in e.hub.detector.list() if x["rule"] == "vpn_down" and x["status"] == "open"), None), 20)
+        ok(down and down["severity"] == "high" and sim.VPN_IF in down["title"], "tunnel down -> alert: {}".format(down and down["title"]))
+        leak = wait_for(lambda: next((x for x in e.hub.detector.list() if x["rule"] == "vpn_leak" and x["key"] == "192.168.88.21:direct"), None), 20)
+        ok(leak and leak["severity"] == "critical" and "ether1" in leak["title"], "a required device going out directly is a critical leak")
+        ok(not any(x["key"] == "192.168.88.22:direct" for x in e.hub.detector.list()), "a device not on the list is not a leak")
+        e.world.iface(sim.VPN_IF)["running"] = "true"
+        ok(wait_for(lambda: e.hub.detector.threats[down["id"]]["status"] == "resolved", 20), "back up -> the alert resolves")
+        # a silent WireGuard peer is reported stale
+        with e.hub.lock:
+            e.hub.vpn_peers = [{"interface": sim.VPN_IF, "endpoint": sim.VPN_SERVER, "handshake_s": 9999.0}]
+            st = e.hub.vpn_status()["tunnels"][0]["status"]
+        eq(st, "stale", "no handshake for minutes -> stale")
+    eq(clean_settings({"vpn": {"interfaces": [" wg0 ", ""], "required": ["192.168.88.42", "192.168.88.42"]}}),
+       {"vpn": {"interfaces": ["wg0"], "required": ["192.168.88.42"]}}, "VPN settings cleaned")
+    try:
+        clean_settings({"vpn": {"required": ["laptop"]}})
+        ok(False, "a name is not an address")
+    except Exception as ex:
+        ok("not an IP address" in str(ex), str(ex))
+
+
+@test
 def t_blocklist():
     tmp = Path(tempfile.mkdtemp())
     try:

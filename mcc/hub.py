@@ -31,6 +31,11 @@ from .util import in_networks, is_local_scope, ip_obj, parse_duration, parse_net
 HIST = 900  # points kept per series (30 min at the default 2 s poll)
 
 
+# RouterOS interface types that are VPN tunnels (pppoe-out is an Internet uplink, not a VPN)
+VPN_TYPES = {"wg": "WireGuard", "wireguard": "WireGuard", "ovpn-out": "OpenVPN", "ovpn-client": "OpenVPN",
+             "l2tp-out": "L2TP", "sstp-out": "SSTP", "pptp-out": "PPTP", "gre-tunnel": "GRE", "ipip-tunnel": "IPIP",
+             "eoip-tunnel": "EoIP", "6to4-tunnel": "6to4", "vxlan": "VXLAN", "zerotier": "ZeroTier"}
+
 class Broadcaster:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -99,6 +104,8 @@ class Hub:
         self.name_memory = NameMemory(self.data_dir)  # names seen before: kept across restarts and DNS-cache expiry
         self.router_addrs: Set[str] = set()
         self.router_nets: List[Tuple[str, Any]] = []  # (interface, network)
+        self.addr_iface: Dict[str, str] = {}  # router address -> its interface
+        self.vpn_peers: List[Dict[str, Any]] = []  # WireGuard peers
         self.gateways: Set[str] = set()
         self._wan: Set[str] = set()
         self.entries: List[Dict[str, Any]] = []
@@ -118,6 +125,7 @@ class Hub:
         self.started = time.time()
 
         self.traffic = TrafficModel(self.lan_nets, lambda: self.router_addrs, self.name_of)
+        self.traffic.path_of = self._path_of
         # Threat updates are coalesced and sent with the tick: during a scan or a busy torrent swarm a
         # threat can be updated hundreds of times a second, and each update carries its evidence.
         self._threat_dirty: Dict[str, Dict[str, Any]] = {}
@@ -316,7 +324,87 @@ class Hub:
 
     def wan_ifaces(self) -> Set[str]:
         configured = set(self.cfg.get("wan.interfaces") or [])
-        return configured or set(self._wan)
+        # a VPN's own default route (in its routing table) doesn't make the tunnel a WAN: its traffic is
+        # already counted on the real WAN, encrypted
+        return configured or (set(self._wan) - self.vpn_ifaces())
+
+    # -- VPN tunnels -------------------------------------------------------------------------------
+    def vpn_ifaces(self) -> Set[str]:
+        configured = {str(x).strip() for x in self.cfg.get("vpn.interfaces") or [] if str(x).strip()}
+        if configured:
+            return configured
+        return {n for n, i in list(self.ifaces.items()) if i.get("type") in VPN_TYPES}
+
+    def _path_of(self, direction: str, src: str, dst: str, reply_dst: str) -> str:
+        """The router interface a connection used: the interface owning the address it was NAT'd to
+        (outbound), or the one it arrived at (inbound); else a tunnel whose own subnet holds the far end."""
+        if direction == "out" and reply_dst and reply_dst != src:
+            return self.addr_iface.get(reply_dst, "")
+        if direction == "in":
+            hit = self.addr_iface.get(dst, "")
+            if hit:
+                return hit
+        far = dst if direction == "out" else src
+        o = ip_obj(far)
+        if o is not None:
+            vpn = self.vpn_ifaces()
+            for iface, net in self.router_nets:
+                if iface in vpn and o.version == net.version and o in net:
+                    return iface
+        return ""
+
+    def vpn_status(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """Each tunnel: up / down / stale (WireGuard: no recent handshake) / disabled, with its peers."""
+        stale_s = float(self.cfg.get("detect.vpn_handshake_s") or 300)
+        tunnels = []
+        with self.lock:
+            ifaces = dict(self.ifaces)
+            peers = list(self.vpn_peers)
+            addrs = dict(self.addr_iface)
+        for name in sorted(self.vpn_ifaces()):
+            i = ifaces.get(name, {})
+            mine = [p for p in peers if p.get("interface") == name]
+            hs = [p["handshake_s"] for p in mine if p.get("handshake_s") is not None]
+            if not i:
+                status = "missing"
+            elif i.get("disabled"):
+                status = "disabled"
+            elif not i.get("running"):
+                status = "down"
+            elif mine and (not hs or min(hs) > stale_s):
+                status = "stale"
+            else:
+                status = "up"
+            ep = next((p["endpoint"] for p in mine if p.get("endpoint")), "")
+            tunnels.append({"name": name, "type": i.get("type", ""), "kind": VPN_TYPES.get(i.get("type", ""), "Tunnel"),
+                            "status": status, "rx_bps": i.get("rx_bps", 0.0), "tx_bps": i.get("tx_bps", 0.0),
+                            "comment": i.get("comment", ""), "addresses": sorted(a for a, n in addrs.items() if n == name),
+                            "endpoint": ep, "endpoint_geo": self.geo.locate(ep) if ep else None,
+                            "handshake_s": min(hs) if hs else None, "peers": mine})
+        return {"tunnels": tunnels, "configured": bool(self.cfg.get("vpn.interfaces")),
+                "required": list(self.cfg.get("vpn.required") or [])}
+
+    def _poll_vpn(self, ros: RouterOS, now: float) -> None:
+        peers: List[Dict[str, Any]] = []
+        vpn = self.vpn_ifaces()
+        if any(self.ifaces.get(n, {}).get("type") in ("wg", "wireguard") for n in vpn):
+            try:
+                rows = ros.get_list("/interface/wireguard/peers")
+            except RouterOSError:
+                rows = []
+            for r in rows:
+                if r.get("interface") not in vpn:
+                    continue
+                hs = r.get("last-handshake")
+                peers.append({"interface": r.get("interface"), "name": r.get("name") or r.get("comment") or "",
+                              "endpoint": r.get("current-endpoint-address") or r.get("endpoint-address") or "",
+                              "port": to_int(r.get("current-endpoint-port") or r.get("endpoint-port")),
+                              "handshake_s": parse_duration(hs) if hs else None,
+                              "rx": to_int(r.get("rx")), "tx": to_int(r.get("tx")),
+                              "allowed": r.get("allowed-address", ""), "disabled": to_bool(r.get("disabled"))})
+        with self.lock:
+            self.vpn_peers = peers
+        self.detector.on_vpn(self.vpn_status(now)["tunnels"], now)
 
     def protected_ips(self) -> Dict[str, str]:
         p: Dict[str, str] = {}
@@ -445,7 +533,7 @@ class Hub:
         p = lambda k: (lambda: self.cfg.get("poll." + k))  # noqa: E731
         self._run_tasks([("meta", lambda: 60, self._poll_meta), ("conns", p("conns_s"), self._poll_conns),
                          ("log", p("log_s"), self._poll_log), ("devices", p("devices_s"), self._poll_devices),
-                         ("dns", p("dns_s"), self._poll_dns)], "slow")
+                         ("dns", p("dns_s"), self._poll_dns), ("vpn", lambda: 10, self._poll_vpn)], "slow")
 
     def _poll_fast(self, ros: RouterOS, now: float) -> None:
         res = ros.get("/system/resource") or {}
@@ -517,7 +605,7 @@ class Hub:
 
     def _poll_meta(self, ros: RouterOS, now: float) -> None:
         ident = ros.get("/system/identity") or {}
-        addrs, nets = set(), []
+        addrs, nets, owner = set(), [], {}
         for base in ("/ip/address", "/ipv6/address"):
             try:
                 rows = ros.get_list(base)
@@ -532,10 +620,13 @@ class Hub:
                 except ValueError:
                     continue
                 addrs.add(str(iface.ip))
+                owner[str(iface.ip)] = r.get("interface", "")
                 nets.append((r.get("interface", ""), iface.network))
         gws, wan = set(), set()
         try:
             for r in ros.get_list("/ip/route", {"dst-address": "0.0.0.0/0"}):
+                if r.get("routing-table", "main") != "main":
+                    continue  # e.g. a VPN's own table: policy routing, not the router's Internet uplink
                 if to_bool(r.get("active", "true")) or r.get("active") is None:
                     gw = str(r.get("immediate-gw") or r.get("gateway") or "")
                     ip, _, ifn = gw.partition("%")
@@ -554,6 +645,7 @@ class Hub:
         with self.lock:
             self.router_info["identity"] = ident.get("name", self.router_info.get("identity", ""))
             self.router_addrs, self.router_nets, self.gateways, self._wan = addrs, nets, gws, wan
+            self.addr_iface = owner
         self._refresh_entries()
 
     def _refresh_entries(self) -> None:
@@ -569,6 +661,13 @@ class Hub:
         with self.lock:
             conns = self.traffic.ingest_conns(rows, now)
         self.detector.on_conns(conns, now)
+        required = set(self.cfg.get("vpn.required") or [])
+        if required:
+            vpn = self.vpn_ifaces()
+            # path known (NAT'd to an interface address) and not a tunnel: it got out directly
+            bypass = [c for c in conns if c["local"] in required and c["dir"] != "lan" and c["via"] and c["via"] not in vpn]
+            if bypass:
+                self.detector.on_vpn_bypass(bypass, now)
         if "meta" in self._force or now - getattr(self, "_entries_at", 0) > 15:
             self._entries_at = now
             self._refresh_entries()
@@ -762,7 +861,8 @@ class Hub:
         pins = {ip: self.is_lan(ip) for ip in self.pinned()}
         with self.lock:
             traffic = self.traffic.snapshot(now, self.blocked, self.detector.subject_threats(), limit_pairs=80,
-                                            pinned=pins)
+                                            pinned=pins, vpn=self.vpn_ifaces(),
+                                            vpn_required=self.cfg.get("vpn.required") or [])
             ifaces = sorted(self.ifaces.values(), key=lambda i: (not i["wan"], i["name"]))
             wan = [i for i in ifaces if i["wan"]]
             info = dict(self.router_info)
@@ -780,6 +880,7 @@ class Hub:
                     "down_mbps": self.cfg.get("wan.down_mbps"), "up_mbps": self.cfg.get("wan.up_mbps")},
             "switch": {"ports": ports, "sys": self.switch_sys},
             "traffic": traffic,
+            "vpn": self.vpn_status(now),
             "geo": self._geo_view(traffic),
             "counts": {"threats_open": len(open_t),
                        "threats_new": len([t for t in open_t if now - t.get("first_ts", 0) < 300]),

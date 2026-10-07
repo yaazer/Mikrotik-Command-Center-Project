@@ -645,9 +645,41 @@ def sc_globe_fit(d: Demo, c: Check) -> None:
         c(not b.errors, "no console errors: {}".format(b.errors[:3]))
 
 
+def sc_vpn(d: Demo, c: Check) -> None:
+    """The VPN page: the tunnel, only its traffic on the map, devices, and requiring the VPN."""
+    with Browser(1600, 1000) as b:
+        b.nav(d.url + "#/vpn")
+        c(b.until("S.snap && S.snap.traffic.vpn && S.snap.traffic.vpn.pairs.length > 0", 25), "VPN traffic arrives")
+        c(b.until("document.querySelectorAll('#vpn-kpis .kpi').length === 6", 5), "six VPN KPIs")
+        c(b.until("/WireGuard/.test(document.querySelector('#vpn-tunnels').innerText) && !!document.querySelector('#vpn-tunnels .tunnel.up')", 8),
+          "the tunnel card: WireGuard, up")
+        c("Zurich" in b.eval("document.querySelector('#vpn-tunnels').innerText"), "with its server's location")
+        c(b.until("VIEWS.vpn.map.stats().nodes.filter(n => n.kind === 'host').length === 2", 10), "the map shows the two VPN devices")
+        hosts = b.eval("VIEWS.vpn.map.stats().nodes.filter(n => n.kind === 'host').map(n => n.ip).sort()")
+        c(hosts == ["192.168.88.21", "192.168.88.22"], "and only them ({})".format(hosts))
+        c(b.eval("VIEWS.vpn.map.stats().nodes.filter(n => n.kind === 'peer').every(n => S.snap.traffic.vpn.peers.some(p => p.ip === n.ip))"),
+          "its destinations are the ones reached through the tunnel")
+        see(b, "#vpn-hosts")
+        c(b.until("document.querySelectorAll('#vpn-hosts tr[data-ip]').length === 2", 5), "devices on the VPN")
+        click(b, '#vpn-hosts [data-req="192.168.88.21"]')
+        c(b.until("(S.config.vpn.required || []).includes('192.168.88.21')", 5), "Require puts it on the must-use-the-VPN list")
+        c(not b.eval("!!document.querySelector('#drawer.open')"), "(the button doesn't open the row)")
+        c(b.until("!!document.querySelector('#vpn-hosts [data-req=\"192.168.88.21\"].on')", 5), "the row shows it")
+        click(b, '#vpn-hosts [data-req="192.168.88.21"]')
+        c(b.until("!(S.config.vpn.required || []).includes('192.168.88.21')", 5), "and again takes it off")
+        see(b, "#vpn-pairs")
+        c(b.until("document.querySelectorAll('#vpn-pairs tbody tr').length > 0", 5), "conversations through the VPN")
+        shot(b, "vpn")
+        b.nav(d.url + "#/traffic")
+        see(b, "#pairs")
+        c(b.until("document.querySelectorAll('#pairs .pill.vpn').length > 0", 10), "Traffic › Conversations marks what went through the tunnel")
+        c(not b.errors, "no console errors: {}".format(b.errors[:3]))
+
+
 SCENARIOS = {"pages": sc_pages, "setup": sc_setup, "respond": sc_respond, "ignore": sc_ignore, "layout": sc_layout, "globe-fade": sc_globe_fade, "theme": sc_theme, "update": sc_update, "types": sc_types, "drawer": sc_drawer, "phone": sc_phone,
              "light": sc_light, "offscreen": sc_offscreen,
-             "single-out": sc_single_out, "globe-fit": sc_globe_fit}
+             "single-out": sc_single_out, "globe-fit": sc_globe_fit,
+             "vpn": sc_vpn}
 
 
 def main(argv) -> int:
