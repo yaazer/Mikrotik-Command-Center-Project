@@ -28,7 +28,10 @@ from mcc.actions import ActionError  # noqa: E402
 from mcc.collectors import FlowParser, UdpCollector, classify, split_syslog  # noqa: E402
 from mcc.config import Config  # noqa: E402
 from mcc.detect import Blocklist, Detector  # noqa: E402
+from mcc import hub as hub_mod  # noqa: E402
 from mcc.hub import Hub  # noqa: E402
+from mcc.identify import Fingerprints, brand_of, identify  # noqa: E402
+from mcc.oui import MacVendors, build as oui_build, is_random, short_name  # noqa: E402
 from mcc.routeros import RouterOS, RouterOSError, cli_line  # noqa: E402
 from mcc.server import make_server  # noqa: E402
 from mcc.swos import SwOS, SwOSError, hexstr, parse_js  # noqa: E402
@@ -1132,6 +1135,169 @@ def t_switch_os_detection():
         finally:
             ros_switch.shutdown()
             sw_world.stop()
+
+
+# ============================================================================================
+# device identification
+# ============================================================================================
+@test
+def t_oui_registry():
+    """The bundled IEEE snapshot: longest prefix wins (MA-S > MA-M > MA-L), private MACs have no vendor,
+    and a refresh is built from the IEEE CSVs and installed over the bundled copy."""
+    tmp = Path(tempfile.mkdtemp(prefix="mcc-oui-"))
+    try:
+        v = MacVendors(tmp)
+        ok(v.info()["entries"] > 30000 and v.info()["origin"] == "bundled", "bundled snapshot loads ({})".format(v.info()))
+        eq(v.lookup("3c-22-fb-00-00-21")["vendor"], "Apple", "MA-L, dashes")
+        eq(v.lookup("3c22.fb00.0021")["vendor"], "Apple", "Cisco-style dots")
+        eq(v.lookup("DA:12:34:56:78:9A"), {"random": True}, "locally administered = private, no vendor")
+        ok(is_random("02:42:ac:11:00:02") and not is_random("00:11:32:00:00:01"), "the local bit")
+        eq(v.lookup("nonsense"), {}, "not a MAC")
+        eq(short_name("HUAWEI TECHNOLOGIES CO.,LTD"), "Huawei Technologies", "legal suffixes trimmed")
+        eq(short_name("Apple, Inc."), "Apple", "Apple, Inc.")
+
+        def csv_of(reg, rows):
+            return ("Registry,Assignment,Organization Name,Organization Address\r\n" + "".join(
+                '{},{},"{}",somewhere\r\n'.format(reg, a, n) for a, n in rows)).encode()
+
+        big = [("{:06X}".format(i), "Vendor {} Inc.".format(i)) for i in range(12000)]
+        fake = {"https://standards-oui.ieee.org/oui/oui.csv": csv_of("MA-L", big + [("70B3D5", "IEEE Registration Authority")]),
+                "https://standards-oui.ieee.org/oui28/mam.csv": csv_of("MA-M", [("70B3D51", "Mid Block Ltd")]),
+                "https://standards-oui.ieee.org/oui36/oui36.csv": csv_of("MA-S", [("70B3D5123", "Small Block GmbH")])}
+        blob, n = oui_build(lambda url: fake[url], today="2026-01-02")
+        eq(n, 12002, "entries (the subdivided MA-L block left out)")
+        (tmp / "oui").mkdir()
+        (tmp / "oui" / "oui.tsv.gz").write_bytes(blob)
+        v.load()
+        eq((v.info()["origin"], v.info()["built"]), ("downloaded", "2026-01-02"), "a refreshed copy wins")
+        eq(v.lookup("70:B3:D5:12:3F:FF")["vendor"], "Small Block", "MA-S (36-bit) prefix")
+        eq(v.lookup("70:B3:D5:12:3F:FF")["prefix"], "70:B3:D5:12:3/36", "shown as a 36-bit prefix")
+        eq(v.lookup("70:B3:D5:1F:00:00")["vendor"], "Mid Block", "MA-M (28-bit) prefix")
+        eq(v.lookup("70:B3:D5:FF:00:00"), {}, "the rest of a subdivided block is unknown")
+        eq(v.lookup("00:00:2A:00:00:01")["vendor"], "Vendor 42", "MA-L")
+        (tmp / "oui" / "oui.tsv.gz").write_bytes(b"garbage")
+        v.load()
+        eq(v.info()["origin"], "bundled", "an unreadable refresh falls back to the bundled copy")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_identify_guesses():
+    v = MacVendors(Path(tempfile.gettempdir()) / "mcc-none")
+
+    def guess(mac, hostname="", hints=(), class_id="", nb=None, name=""):
+        return identify({"mac": mac, "hostname": hostname, "name": name or hostname, "class_id": class_id},
+                        v.lookup(mac), hints, nb)
+
+    cases = [
+        (guess("3C:22:FB:00:00:22", "Janes-iPhone"), "Apple iPhone", "phone", "iOS", "high"),
+        (guess("00:1B:A9:00:00:60", "BRW001BA9000060"), "Brother printer", "printer", "", "high"),
+        (guess("00:11:32:00:00:10", "nas"), "Synology NAS", "nas", "", "high"),
+        (guess("18:C0:4D:00:00:40", "gaming-pc", class_id="MSFT 5.0"), "Gigabyte computer", "computer", "Windows", "high"),
+        (guess("AC:DE:48:00:11:22", "DESKTOP-4F1K2LQ"), "Windows computer", "computer", "Windows", "high"),
+        (guess("12:34:56:78:9A:BC", "Galaxy-S24", class_id="android-dhcp-14"), "Samsung Galaxy phone", "phone",
+         "Android 14", "high"),
+        (guess("3C:61:05:3A:1F:2C", "ESP_3A1F2C", [("name:tuya", "a2.tuyaus.com")]), "Espressif ESP32/ESP8266 module",
+         "smarthome", "", "high"),
+        (guess("DC:A6:32:00:00:70", "homelab", [("serve-wan:22", "tcp/22")],
+               "dhcpcd-9.4.1:Linux-6.1.21-v8+:aarch64:BCM2835"), "Raspberry Pi", "computer", "Linux", "high"),
+        (guess("52:54:00:12:34:56", "docker01"), "QEMU / KVM VM", "vm", "", "medium"),
+        (guess("00:0E:58:00:00:01", "Sonos-Kitchen"), "Sonos smart speaker", "speaker", "", "high"),
+        (guess("48:A9:8A:AA:00:01", nb={"identity": "crs309", "platform": "MikroTik", "board": "CRS309-1G-8S+",
+                                        "version": "2.17", "discovered-by": "mndp"}),
+         "MikroTik CRS309-1G-8S+", "network", "SwOS 2.17", "high"),
+        (guess("00:04:20:00:00:01", nb={"identity": "SEP001122", "platform": "Cisco IP Phone 8841",
+                                        "system-caps": "bridge,telephone", "discovered-by": "cdp"}),
+         "Cisco IP Phone 8841", "voip", "", "high"),
+        (guess("DA:A1:19:00:00:01"), "Phone (private address)", "phone", "", "low"),
+        (guess("DA:A1:19:00:00:01", hints=[("name:captive.apple.com", "captive.apple.com"),
+                                           ("name:push.apple.com", "courier.push.apple.com")]),
+         "Apple iPhone", "phone", "iOS", "low"),
+        (identify({"mac": "0C:00:00:00:00:01"}, {}), "Unknown device", "", "", "none"),  # not in the registry
+    ]
+    for got, label, kind, os_, conf in cases:
+        eq((got["label"], got["kind"], got["os"], got["confidence"]), (label, kind, os_, conf), "guess")
+    r = cases[0][0]
+    ok(r["clues"] and r["clues"][0]["w"] >= r["clues"][-1]["w"], "clues come strongest first")
+    ok(any("Apple" in c["text"] for c in r["clues"]), "every guess says why: {}".format(r["clues"]))
+    lab = guess("00:1B:A9:00:00:61", "", name="office printer")
+    eq(lab["kind"], "printer", "the name you gave it on the router counts too")
+    eq(brand_of("Hangzhou Hikvision Digital Technology"), "Hikvision", "brands tidied")
+    eq(brand_of("Wyze Labs"), "Wyze", "generic words trimmed")
+
+
+@test
+def t_fingerprints_remember_traffic():
+    tmp = Path(tempfile.mkdtemp(prefix="mcc-fp-"))
+    try:
+        fp = Fingerprints(tmp)
+        names = {"17.253.144.11": "captive.apple.com", "1.2.3.4": "example.com"}
+        mac_of = {"192.168.88.22": "AA:BB:CC:00:00:22", "192.168.88.60": "AA:BB:CC:00:00:60"}
+        fp.observe(mac_of, [
+            {"local": "192.168.88.22", "remote": "17.253.144.11", "dir": "out", "proto": "TCP", "port": 80},
+            {"local": "192.168.88.22", "remote": "1.2.3.4", "dir": "out", "proto": "TCP", "port": 443},
+            {"local": "192.168.88.22", "remote": "17.57.146.20", "dir": "out", "proto": "TCP", "port": 5223},
+            {"local": "192.168.88.20", "remote": "192.168.88.60", "dir": "lan", "proto": "TCP", "port": 9100},
+            {"local": "192.168.88.99", "remote": "17.253.144.11", "dir": "out", "proto": "TCP", "port": 80},
+        ], lambda ip: names.get(ip, ""), time.time())
+        eq(sorted(k for k, _ in fp.hints("aa:bb:cc:00:00:22")), ["name:captive.apple.com", "port:TCP/5223"],
+           "a revealing name and port are remembered; an ordinary one isn't")
+        eq([k for k, _ in fp.hints("AA:BB:CC:00:00:60")], ["serve:9100"], "a host others print to")
+        fp._saved_at = 0
+        fp.save()
+        again = Fingerprints(tmp)
+        eq(len(again.hints("AA:BB:CC:00:00:22")), 2, "kept across restarts (data/fingerprints.json)")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_devices_identified_live():
+    """Against the simulator: every device gets a guess from its MAC, name, DHCP class, neighbor discovery
+    and traffic; tables the router doesn't have are left alone; a new device's alert says what it is."""
+    with Env() as e:
+        ok(wait_for(lambda: len(e.hub.devices) >= 11, 15), "devices listed, incl. the ones found by neighbor discovery")
+        devs = lambda: {d["ip"]: d["identity"] for d in e.hub.devices_view()}  # noqa: E731
+        eq(devs()["192.168.88.60"]["label"], "Brother printer", "printer")
+        eq(devs()["192.168.88.2"]["label"], "MikroTik CRS309-1G-8S+", "switch, from MNDP")
+        eq(devs()["192.168.88.3"]["label"], "Ubiquiti U6-Lite", "access point, from LLDP")
+        eq(devs()["192.168.88.20"]["os"], "Windows", "DHCP vendor class")
+        ok(wait_for(lambda: (e.hub.refresh_soon("devices"), devs()["192.168.88.22"]["label"] == "Apple iPhone")[1], 15),
+           "the phone's traffic (Apple push, captive check) adds to its vendor and name")
+        ok(all(p in e.hub._table_off for p in hub_mod.WIFI_TABLES), "Wi-Fi tables this router lacks: backed off")
+        for _ in range(3):  # three newcomers: an ESP32 smart plug, a Galaxy, and an iPhone with a private MAC
+            e.world._start_new_device({})
+        threat_of = lambda mac: e.hub.detector.threats.get(e.hub.detector.by_key.get(("new_device", mac), ""))  # noqa: E731
+        macs = [h[1] for h in e.world.extra_hosts]
+        ok(wait_for(lambda: (e.hub.refresh_soon("devices"), all(threat_of(m) for m in macs))[1], 15),
+           "each newcomer raises New device")
+        ok("Espressif" in threat_of(macs[0])["title"], "the ESP32: {}".format(threat_of(macs[0])["title"]))
+        ok("Samsung Galaxy phone" in threat_of(macs[1])["title"], "the Galaxy: {}".format(threat_of(macs[1])["title"]))
+        t = threat_of(macs[2])
+        ok("private (randomized) MAC" in t["summary"], "the alert says its MAC is private: {}".format(t["summary"]))
+        ok(wait_for(lambda: (e.hub.refresh_soon("devices"), t.get("identity", {}).get("label") == "Apple iPhone")[1], 20),
+           "as its traffic arrives the alert's guess sharpens ({})".format(t.get("identity", {}).get("label")))
+        ok("Apple iPhone" in t["title"] and any("now identified as" in x["text"] for x in t["evidence"]),
+           "title and evidence follow: {}".format(t["title"]))
+        httpd, _ = make_server(e.hub, "127.0.0.1", 0)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        port = httpd.server_address[1]
+        try:
+            st, body, _ = _req(port, "GET", "/api/identify?mac=00-1b-a9-00-00-60")
+            eq((st, body["vendor"]["vendor"], body["identity"]["label"]), (200, "Brother industries", "Brother printer"),
+               "look up a MAC on the network")
+            st, body, _ = _req(port, "GET", "/api/identify?mac=00:0E:58:01:02:03")
+            eq((st, body["device"], body["identity"]["kind"]), (200, None, "speaker"), "or one that isn't")
+            st, _, _ = _req(port, "GET", "/api/identify?mac=12:34")
+            eq(st, 400, "half a MAC -> 400")
+            st, body, _ = _req(port, "GET", "/api/oui")
+            ok(st == 200 and body["entries"] > 30000, "registry status")
+            st, _, _ = _req(port, "POST", "/api/oui/download", {}, {"X-MCC": "1"})
+            eq(st, 400, "the IEEE download needs confirm (MCC never calls out on its own)")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 # ============================================================================================

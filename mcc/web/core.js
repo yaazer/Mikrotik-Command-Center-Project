@@ -497,6 +497,81 @@ function cliRemove(c) {
   return `/${p} remove [find .id=${c.id}]`;
 }
 
+/* ---------------- what a device is (mcc/identify.py) ---------------- */
+// The server's best guess for each device, with the clues behind it. Shown in Devices, the drawer,
+// "New device" threats, Setup and the command palette (type a MAC).
+const Ident = {
+  ICONS: {
+    phone: '<rect x="7" y="2.5" width="10" height="19" rx="2"/><path d="M11 18.5h2"/>',
+    tablet: '<rect x="4.5" y="3" width="15" height="18" rx="2"/><path d="M11 18h2"/>',
+    computer: '<rect x="3.5" y="4.5" width="17" height="11" rx="1.5"/><path d="M1.5 19.5h21"/>',
+    server: '<rect x="4" y="3.5" width="16" height="7" rx="1.5"/><rect x="4" y="13.5" width="16" height="7" rx="1.5"/><path d="M7.5 7h.01M7.5 17h.01"/>',
+    nas: '<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8.5 7.5h7M8.5 11.5h7M8.5 15.5h7"/>',
+    tv: '<rect x="2.5" y="4" width="19" height="13" rx="1.5"/><path d="M8 21h8"/>',
+    streamer: '<rect x="4" y="8" width="16" height="9" rx="2.5"/><path d="M10.5 10.5l3.5 2-3.5 2z"/>',
+    speaker: '<rect x="6" y="2.5" width="12" height="19" rx="3"/><circle cx="12" cy="14.5" r="3.5"/><path d="M12 7h.01"/>',
+    console: '<path d="M7 8h10a4 4 0 0 1 4 4v2.5a2.5 2.5 0 0 1-4.5 1.5L15 14H9l-1.5 2A2.5 2.5 0 0 1 3 14.5V12a4 4 0 0 1 4-4z"/><path d="M8 11v2M7 12h2M15.5 11.5h.01M17 13h.01"/>',
+    camera: '<rect x="3" y="7" width="13" height="10" rx="2"/><path d="M16 11l5-3v8l-5-3"/>',
+    printer: '<path d="M7 9V3h10v6"/><rect x="3" y="9" width="18" height="8" rx="1.5"/><path d="M7 14h10v7H7z"/>',
+    smarthome: '<path d="M3.5 11L12 4l8.5 7"/><path d="M6 9.5V20h12V9.5"/><path d="M9.5 14.5a3.5 3.5 0 0 1 5 0M12 17.5h.01"/>',
+    network: '<rect x="3" y="13" width="18" height="6" rx="1.5"/><path d="M7 16h.01M10 16h.01"/><path d="M8.5 9.5a5 5 0 0 1 7 0M6 7a8.5 8.5 0 0 1 12 0"/>',
+    voip: '<path d="M6 3h3l1.5 4.5-2 1.5a11 11 0 0 0 6.5 6.5l1.5-2L21 15v3a2 2 0 0 1-2 2A16 16 0 0 1 4 5a2 2 0 0 1 2-2z"/>',
+    wearable: '<rect x="7" y="7" width="10" height="10" rx="2.5"/><path d="M9 7l.7-4h4.6L15 7M9 17l.7 4h4.6l.6-4"/>',
+    car: '<path d="M4 15l1.5-5.5A2 2 0 0 1 7.4 8h9.2a2 2 0 0 1 1.9 1.5L20 15v4H4z"/><path d="M7 19v2M17 19v2M7.5 15h.01M16.5 15h.01"/>',
+    vm: '<rect x="3" y="3" width="13" height="13" rx="1.5"/><rect x="8" y="8" width="13" height="13" rx="1.5"/>',
+    unknown: '<circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .9-1 1.6v.6M12 17h.01"/>',
+  },
+  SOURCE: { mac: "MAC", hostname: "Host name", label: "Name", dhcp: "DHCP", neighbor: "Discovery", wifi: "Wi-Fi", traffic: "Traffic", service: "Service" },
+  icon(kind) { return `<svg viewBox="0 0 24 24" class="kicon" aria-hidden="true">${this.ICONS[kind] || this.ICONS.unknown}</svg>`; },
+  conf(c) {
+    const n = { high: 3, medium: 2, low: 1 }[c] || 0;
+    return `<span class="conf" title="${esc(c && c !== "none" ? c + " confidence" : "not enough to go on")}" aria-label="${esc(c || "no")} confidence">${[1, 2, 3].map((i) => `<i class="${i <= n ? "on" : ""}"></i>`).join("")}</span>`;
+  },
+  // "Wi-Fi · iOS · Apple": the second line under a guess
+  sub(id) {
+    if (!id) return "";
+    const bits = [];
+    if (id.os) bits.push(id.os);
+    if (id.random) bits.push("private MAC");
+    else if (id.vendor && !(id.brand && id.vendor.toLowerCase().includes(id.brand.toLowerCase()))) bits.push(id.vendor);  // "Giga-byte Technology", not "Wyze Labs" again
+    if (id.wifi) bits.push("Wi-Fi");
+    return bits.join(" · ");
+  },
+  /* a compact table cell: icon, guess, and what it runs / who made it */
+  cell(id) {
+    if (!id) return '<span class="faint">—</span>';
+    return `<div class="ident" title="${esc(Ident.why(id))}">${this.icon(id.kind)}<div class="who"><b>${esc(id.label)}</b><span>${esc(this.sub(id))}</span></div>${this.conf(id.confidence)}</div>`;
+  },
+  why(id) { return (id.clues || []).filter((c) => c.w > 0).slice(0, 4).map((c) => "• " + c.text).join("\n") || "No clue yet"; },
+  clues(list) {
+    return `<ul class="clues">${(list || []).map((c) => `<li class="${c.w > 0 ? "" : "faint"}"><span class="src">${esc(this.SOURCE[c.source] || c.source)}</span><span>${esc(c.text)}</span></li>`).join("")}</ul>`;
+  },
+  /* the drawer / lookup block: the guess, then every clue behind it */
+  block(id) {
+    if (!id) return "";
+    return `<div class="ident-hero">${this.icon(id.kind)}<div class="grow"><b>${esc(id.label)}</b><div class="note">${esc([id.kind_label, this.sub(id)].filter(Boolean).join(" · ") || "Not enough to go on yet")}</div></div>
+      <span class="pill ${{ high: "green", medium: "blue", low: "yellow" }[id.confidence] || ""}">${esc(id.confidence === "none" ? "unknown" : id.confidence + " confidence")}</span></div>
+      ${this.clues(id.clues)}`;
+  },
+  isMac(q) { return /^[0-9a-f]{2}([:\-]?[0-9a-f]{2}){5}$/i.test(q.trim()) || /^[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}$/i.test(q.trim()); },
+  async lookup(mac) {
+    let r;
+    try { r = await api.get("/api/identify?mac=" + encodeURIComponent(mac)); } catch (err) { toast("Couldn't look it up", err.message, { bad: true }); return; }
+    const v = r.vendor || {};
+    openModal(`<header><div class="grow"><div class="faint mono">${esc(r.mac)}</div><h2>${esc(v.vendor ? v.vendor : v.random ? "Private (randomized) address" : "Not in the IEEE registry")}</h2></div><button class="icon-btn" data-x aria-label="Close">${ICON.x}</button></header>
+      <div class="mbody">
+        ${v.vendor ? `<dl class="kv"><dt>Prefix</dt><dd>${esc(v.prefix)}</dd><dt>Registry</dt><dd>IEEE ${esc(v.registry)}</dd></dl>` : ""}
+        ${r.device ? `<div class="note">On your network now as <b>${esc(r.device.name || r.device.hostname || r.device.ip)}</b> (${esc(r.device.ip || "no address")}).</div>` : '<div class="note">Not on your network right now: this guess comes from the MAC alone.</div>'}
+        ${this.block(r.identity)}
+      </div>
+      <footer><span class="grow"></span>${r.device && r.device.ip ? `<button class="btn" data-open="${esc(r.device.ip)}">Open device</button>` : ""}<button class="btn primary" data-x>Close</button></footer>`,
+    (mm) => {
+      $$("[data-x]", mm).forEach((b) => (b.onclick = closeModal));
+      $$("[data-open]", mm).forEach((b) => (b.onclick = () => { closeModal(); openHost(b.dataset.open); }));
+    });
+  },
+};
+
 /* ---------------- pinned devices ---------------- */
 // Pinned devices are always on the traffic map and first in every list (the server orders them).
 // Kept on the MCC server (data/pins.json), so every browser sees the same pins.
@@ -658,7 +733,11 @@ async function loadHost() {
         return `<div><h4>Traffic types</h4>${Types.barHtml(cats)}<div style="margin-top:8px">${Types.mixHtml(cats, 8)}</div></div>`; })() : ""}
       ${h.geo ? `<div><h4>Location</h4><dl class="kv"><dt>Where</dt><dd>${esc([h.geo.city, h.geo.region, h.geo.country].filter(Boolean).join(", "))}</dd>
         <dt>Coordinates</dt><dd>${h.geo.lat}, ${h.geo.lon}${h.geo.precision === "country" ? " (country centre)" : ""}</dd></dl></div>` : ""}
-      ${h.device ? `<div><h4>Device</h4><dl class="kv"><dt>MAC</dt><dd>${esc(dev.mac)}</dd><dt>Hostname</dt><dd>${esc(dev.hostname || "—")}</dd>
+      ${dev.identity ? `<div><h4>What it is</h4>${Ident.block(dev.identity)}
+        <div class="note" style="margin-top:6px">A best guess from what MCC can see. MCC never scans or probes a device to identify it.</div></div>` : ""}
+      ${h.device ? `<div><h4>Device</h4><dl class="kv"><dt>MAC</dt><dd>${esc(dev.mac)}</dd>
+        <dt>Vendor</dt><dd>${dev.vendor && dev.vendor.vendor ? esc(dev.vendor.vendor + " · " + dev.vendor.prefix) : dev.vendor && dev.vendor.random ? "private (randomized) address" : "—"}</dd>
+        <dt>Hostname</dt><dd>${esc(dev.hostname || "—")}</dd>${dev.class_id ? `<dt>DHCP class</dt><dd>${esc(dev.class_id)}</dd>` : ""}
         <dt>Port</dt><dd>${esc(dev.port || dev.iface || "—")}</dd><dt>DHCP</dt><dd>${dev.dhcp ? esc(dev.status || "yes") : "no (ARP only)"}</dd></dl></div>` : ""}
       <div><h4>Traffic paths · ${paths.length}</h4>
         <div class="note" style="margin-bottom:8px">${ICON.target} Singled out on the traffic map and globe. Close this panel (Esc) to see everything again.</div>
@@ -786,7 +865,9 @@ const cmdk = {
     snap.traffic.peers.forEach((p) => out.push({ kind: "Internet", label: `${p.name || p.ip}  ${p.name ? p.ip : ""}`, key: p.ip, run: () => openHost(p.ip) }));
     for (const t of S.threats.values()) if (t.status === "open" || t.status === "acknowledged") out.push({ kind: "threat", label: t.title, run: () => go("threats", { id: t.id }) });
     let res = q ? out.filter((i) => fuzzy(q, i.label.toLowerCase()) || (i.key || "").startsWith(q)) : out.slice(0, 12);
-    if (/^[0-9a-f.:]{3,}$/i.test(q) && /^\d{1,3}(\.\d{1,3}){3}$|:/.test(q)) {
+    if (Ident.isMac(q)) {
+      res = [{ kind: "identify", label: `What is ${q.toUpperCase()}? (MAC vendor and best guess)`, run: () => Ident.lookup(q) }].concat(res);
+    } else if (/^[0-9a-f.:]{3,}$/i.test(q) && /^\d{1,3}(\.\d{1,3}){3}$|:/.test(q)) {
       res = [{ kind: "inspect", label: `Inspect ${q}`, run: () => openHost(q) },
         { kind: "respond", label: `Block ${q}…`, run: () => respond("block_ip", { ip: q }, "from the command palette") }].concat(res);
     }

@@ -5,9 +5,10 @@ A self-contained NOC console for a MikroTik network: a **RouterOS 7** router and
 - **Live telemetry**: throughput, CPU, memory, temperature, every interface and switch port.
 - **A live traffic map**: who on your LAN is talking to whom on the Internet, at what rate, animated as it happens.
 - **Threat detection**: port scans, brute force, router login guessing, floods, worm-like spreading, blocklisted addresses, unusual uploads, new devices, link failures.
+- **Device identification**: what each device is (an iPhone, a Brother printer, a Wyze camera, an ESP32 smart plug), with the evidence, so a new device is recognisable the moment it joins.
 - **Interactive responses**: block an address, quarantine a host, drop its connections, disable a port. Each one is shown as the exact router change, applied only when you confirm, logged, and undoable.
 
-It's one Python program with no dependencies (standard library only) and a plain-JavaScript web console. There are no CDNs, no cloud and no accounts, and it never makes outbound calls except to your own router and switch.
+It's one Python program with no dependencies (standard library only) and a plain-JavaScript web console. There are no CDNs, no cloud and no accounts. It never makes outbound calls except to your own router and switch, and to two databases you can choose to download from Setup.
 
 ```
 python mcc.py --demo     # try it now: a simulated router, switch and network with scripted incidents
@@ -56,7 +57,7 @@ MCC itself still never writes a password. Use a dedicated, limited RouterOS user
 
 `--demo` starts a simulated RB5009 and CRS309 with a small LAN:
 - a NAS, a workstation, a TV, a gaming PC, cameras, a homelab with an SSH port forward;
-- a repeating script of incidents: SSH brute force, router login guessing, a port scan, a camera that starts spreading like a worm, a beacon to a blocklisted server, a new device, a link flap, a large upload, and an IRC connection.
+- a repeating script of incidents: SSH brute force, router login guessing, a port scan, a camera that starts spreading like a worm, a beacon to a blocklisted server, a new device (in turn: an ESP32 smart plug, a Galaxy phone, an iPhone with a private address, a Wyze camera), a link flap, a large upload, and an IRC connection.
 
 The simulated router behaves like the real one:
 - **Your responses take effect:** a blocked attacker stops, a quarantined host goes quiet, a disabled port drops.
@@ -146,7 +147,7 @@ Blocks and quarantines also drop the address's open connections. Without that, c
 | VPN leak | a firewall rule logged with the `VPN-LEAK` prefix (your VPN kill switch) catches a device; prefixes in Settings | drop connections / quarantine |
 | VPN leak (got through) | a device on the VPN page's *Must use the VPN* list leaves by another interface | drop connections / quarantine |
 | VPN tunnel down | a tunnel interface stops running, or WireGuard has no handshake for 5 min | — |
-| New device | a MAC never seen before (the first run is the baseline) | quarantine, or mark known |
+| New device | a MAC never seen before (the first run is the baseline); the alert says what the device appears to be, and sharpens that as its traffic arrives | quarantine, or mark known |
 | Link down | a router or switch port that was up loses link | — |
 | Router CPU / temperature | ≥ 90 % for 30 s / ≥ 75 °C | — |
 
@@ -191,7 +192,7 @@ On the globe:
 - **Controls:** drag to spin, scroll to zoom, double-click (or ⌂) to centre on home.
 
 Locations come from a **local** MaxMind-format (`.mmdb`) database. Your traffic's addresses are never sent anywhere.
-- **Download from Setup:** **Setup › Geolocation** can download the free **DB-IP Lite** database (CC BY 4.0, no account). That button is the only time MCC contacts anything but your router.
+- **Download from Setup:** **Setup › Geolocation** can download the free **DB-IP Lite** database (CC BY 4.0, no account). MCC contacts `download.db-ip.com` only when you click that button.
   - **Country Lite** (≈4 MB) places peers at the middle of their country.
   - **City Lite** (≈60 MB) places them at the city.
 
@@ -275,6 +276,36 @@ The **VPN** page shows everything going through your VPN tunnel(s), and nothing 
 - It comes first in every list: LAN hosts, Internet peers, top talkers, Devices. Its conversations come first too.
 - Pins are kept by MCC in `data/pins.json`, so every browser sees the same ones. A LAN device is remembered by its MAC as well, so its pin follows it when DHCP gives it a new address.
 
+## What's on your network: identifying devices
+
+Every device in **Devices** has an **Identified as** column: MCC's best guess at what it is, how sure it is (one to three bars), and what it runs. Hover the guess for the main reasons; open the device for all of them. The filter matches guesses too, so `camera` or `printer` finds them.
+
+A guess is built from every clue MCC can see. Each clue adds weight to a kind (phone, printer, camera, smart-home device and so on), a brand, an OS and a model, and the best-supported answer wins:
+
+| Clue | What it says | Example |
+|---|---|---|
+| **MAC vendor** | who made the network chip, from the IEEE registry | `00:1B:A9` is Brother: a printer. `3C:22:FB` is Apple: one of several things. |
+| **Private MAC** | a randomized address (the "locally administered" bit is set): the device is hiding its hardware address | phones, tablets and laptops do this per Wi-Fi network by default |
+| **Host name** | the name it sends with DHCP, or the name you gave it on the router | `Janes-iPhone`, `DESKTOP-4F1K2LQ` (Windows), `BRW0080927AFBCE` (Brother), `ESP_3A1F2C` (ESP32) |
+| **DHCP vendor class** | option 60, when your RouterOS version shows it on the lease | `MSFT 5.0` is Windows, `android-dhcp-14` Android 14, `udhcp` embedded Linux |
+| **Neighbor discovery** | switches, access points and IP phones announce their model over LLDP, CDP or MNDP (`/ip neighbor`) | `MikroTik CRS309-1G-8S+, SwOS 2.17`, `Ubiquiti U6-Lite` |
+| **Wi-Fi** | it's in the router's Wi-Fi or CAPsMAN registration table | |
+| **Names it looks up** | services only one kind of device uses | `captive.apple.com` (Apple), `connectivitycheck.gstatic.com` (Android), `msftconnecttest.com` (Windows), `*.lgtvsdp.com` (LG TV), Tuya, Ring, Sonos, Wyze, Hue, ecobee… |
+| **Services it offers** | what other devices connect to it for | printing on 9100 or 631, RTSP video on 554, Google Cast on 8009, SSH or a web server forwarded from the Internet |
+
+**New devices.** The *New device* alert names what the device appears to be: for example *New device: Galaxy-S24 (Samsung Galaxy phone)*, or *private (randomized) MAC · looks like a phone (low confidence)*. As the device's traffic arrives, the guess sharpens and the alert follows ("now identified as Apple iPhone"). Its card lists why.
+
+**The vendor registry.**
+- **Offline from the start:** MCC ships a snapshot of all three IEEE registries (MA-L, MA-M and MA-S, about 54,000 prefixes, 470 KB) and always uses the longest prefix that matches.
+- **Refreshing it:** the IEEE adds new prefixes every week. **Setup › Device identification › Update from the IEEE** downloads about 5 MB from `standards-oui.ieee.org`, only when you click. The refreshed copy goes to `data/oui/` and takes precedence over the snapshot. `tools/build_oui.py` rebuilds the shipped snapshot.
+
+**Looking up any MAC.** Paste a MAC into `Ctrl+K`, or use **Setup › Device identification**, to see its vendor and MCC's guess.
+
+**What it doesn't do.**
+- **No probing:** MCC never scans, pings or probes a device to identify it. Everything comes from the router or from traffic that was already flowing.
+- **Traffic clues are remembered:** they're kept per MAC in `data/fingerprints.json` for 30 days, so a device that only phones home now and then is still recognised.
+- **It's a guess:** a private MAC with no host name and no telling traffic stays *Private-address device* until it says more.
+
 ## Arranging the console
 
 Every panel on every page is resizable:
@@ -347,11 +378,14 @@ mcc/server.py        HTTP API, server-sent events, static console
 mcc/web/             the console (no frameworks); theme.js = Theme Studio, layout.js = resizable panels
 mcc/pins.py          pinned devices (follow a LAN device's MAC)
 mcc/names.py         remembered device / DNS names (survive restarts and DNS-cache expiry)
+mcc/identify.py      what a device is: clues from MAC, names, DHCP, neighbors and traffic -> best guess
+mcc/oui.py           IEEE MAC vendor registry (stdlib), opt-in refresh; mcc/oui.tsv.gz is the shipped snapshot
 mcc/geo.py           .mmdb reader (stdlib), locator, home location, opt-in DB-IP download
 mcc/geodata.py       country label points (Natural Earth) for country-level databases
 mcc/sim.py           simulated router, switch and network (demo + tests)
 data/                config.json, actions.jsonl, threats.jsonl, devices.json, setup_state.json, blocklist.txt,
-                     ignore.json + ignore.log.jsonl, pins.json, names.json, geo/*.mmdb
+                     ignore.json + ignore.log.jsonl, pins.json, names.json, fingerprints.json, geo/*.mmdb,
+                     oui/oui.tsv.gz (a refreshed vendor registry)
 ```
 
 ## Tests
@@ -366,6 +400,10 @@ SHOTS=out python tools/ui_check.py # ...and saves screenshots
 
 - **IPv6:** blocking and quarantine work for IPv6 addresses, but the traffic view and flow detection are IPv4-first.
 - **Geolocation is approximate:** IP geolocation places a server at its registered or data-centre location, not exactly where the content comes from. Anycast services (Cloudflare, Google DNS) show one location for many places. Country-level databases put every peer at the middle of its country.
+- **Identification is a best guess:**
+  - **Private MACs:** a device with a private (randomized) MAC has no vendor by design.
+  - **What MCC can't see:** it isn't on your LAN's wire, so it can't read mDNS, SSDP or the DHCP request fingerprint.
+  - **Traffic it never sees:** devices that talk only to each other on the same bridge are seen by the router only through ARP and DHCP.
 - **Names need the router:** device and host names come from the router's DHCP leases, ARP comments and DNS cache. After a restart MCC uses the names it remembers (`data/names.json`) until you reconnect the router in Setup, or set `MCC_ROUTER_PASSWORD` so it reconnects by itself. Devices it has never seen show as addresses until then.
 - **Flow lag:** flow records arrive in batches, so the live map's rates come from the connection table.
 - **Validation:** the SwOS field mapping is best effort (see above). Developed against RouterOS 7.x REST and SwOS 2.x behaviour, using the bundled simulator.

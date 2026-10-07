@@ -214,6 +214,8 @@ function threatCard(t, full) {
     <div class="row1"><span class="sev sv-${esc(t.severity)}">${esc(t.severity)}</span><span class="faint" style="font-size:12px">${esc(t.rule_name || rule.name || t.rule)}</span>
       <span class="grow"></span>${t.status !== "open" ? `<span class="pill ${STATUS_PILL[t.status] || ""}">${esc(t.status)}</span>` : ""}<span class="faint" style="font-size:12px">${fmt.ago(t.last_ts)}</span></div>
     <h3>${esc(t.title)}</h3><p>${esc(t.summary)}</p>
+    ${t.identity ? `<div class="ident tline" title="${esc(Ident.why(t.identity))}">${Ident.icon(t.identity.kind)}<span><b>${esc(t.identity.label)}</b>${Ident.sub(t.identity) ? ` <span class="faint">· ${esc(Ident.sub(t.identity))}</span>` : ""}</span>${Ident.conf(t.identity.confidence)}</div>` : ""}
+    ${full && t.identity ? `<div><h4 class="mini">Why MCC thinks so</h4>${Ident.clues(t.identity.clues)}</div>` : ""}
     <div class="meta"><span>×${t.count}</span><span>first ${fmt.ago(t.first_ts)}</span>${t.target && t.target !== t.subject ? `<span>target ${esc(t.target)}</span>` : ""}
       ${t.reopened ? `<span class="pill amber">came back after mitigation</span>` : ""}${(t.mitigated_by || []).length ? `<span>by ${t.mitigated_by.map(esc).join(", ")}</span>` : ""}</div>
     ${ignoredLine}
@@ -789,8 +791,8 @@ VIEWS.actions = {
 VIEWS.devices = {
   render(m) {
     this.q = "";
-    m.innerHTML = `${connectBanner()}<div class="toolbar"><input type="text" id="dq" placeholder="Filter by name, IP, MAC, port"><span class="grow"></span>
-      <span class="note">From DHCP leases, ARP and the bridge host table. New MACs raise a "New device" threat.</span></div>
+    m.innerHTML = `${connectBanner()}<div class="toolbar"><input type="text" id="dq" placeholder="Filter by name, IP, MAC, vendor, kind (phone, camera…)"><span class="grow"></span>
+      <span class="note">From DHCP leases, ARP and the bridge host table. <b>Identified as</b> is MCC's best guess (hover for why). New MACs raise a "New device" threat.</span></div>
       <div class="panel"><div class="body flush scroll" id="devs"><div class="empty">Loading…</div></div></div>`;
     $("#dq", m).oninput = (e) => { this.q = e.target.value.toLowerCase(); this.draw(); };
     this.load();
@@ -804,10 +806,12 @@ VIEWS.devices = {
     const el = $("#devs");
     if (!el || !this.devs) return;
     const q = this.q;
-    const list = this.devs.filter((d) => !q || [d.name, d.hostname, d.ip, d.mac, d.port, d.iface].some((v) => (v || "").toLowerCase().includes(q)));
-    el.innerHTML = list.length ? `<table class="t"><thead><tr><th></th><th>Device</th><th>MAC</th><th>Port</th><th>Lease</th><th class="r">↓</th><th class="r">↑</th><th></th></tr></thead><tbody>
+    const idText = (d) => { const i = d.identity || {}; return [i.label, i.kind_label, i.brand, i.os, i.model, i.vendor, (d.vendor || {}).vendor]; };
+    const list = this.devs.filter((d) => !q || [d.name, d.hostname, d.ip, d.mac, d.port, d.iface, ...idText(d)].some((v) => (v || "").toLowerCase().includes(q)));
+    el.innerHTML = list.length ? `<table class="t"><thead><tr><th></th><th>Device</th><th>Identified as</th><th>MAC</th><th>Port</th><th>Lease</th><th class="r">↓</th><th class="r">↑</th><th></th></tr></thead><tbody>
       ${list.map((d) => `<tr class="click ${d.pinned ? "pinned" : ""}" data-ip="${esc(d.ip)}"><td style="width:28px">${!d.known ? '<span class="pill yellow">new</span>' : d.threat ? `<span class="sev sv-${esc(d.threat)}"></span>` : ""}</td>
-        <td><div class="who-row">${whoCell(d.name || d.hostname, d.ip)}${d.ip ? Pins.button(d.ip) : ""}</div></td><td class="mono muted">${esc(d.mac)}</td><td>${esc(d.port || d.iface || "—")}</td>
+        <td><div class="who-row">${whoCell(d.name || d.hostname || (d.identity && d.identity.confidence !== "none" ? d.identity.label : ""), d.ip)}${d.ip ? Pins.button(d.ip) : ""}</div></td>
+        <td>${Ident.cell(d.identity)}</td><td class="mono muted">${esc(d.mac)}</td><td>${esc(d.port || d.iface || "—")}</td>
         <td class="muted">${d.dhcp ? esc(d.status || "") + (d.static ? " · static" : "") : "ARP only"}</td>
         <td class="r num in">${d.down ? fmt.bps(d.down) : ""}</td><td class="r num out">${d.up ? fmt.bps(d.up) : ""}</td>
         <td class="r" style="white-space:nowrap">${!d.known ? `<button class="btn sm" data-known="${esc(d.mac)}">Mark known</button> ` : ""}${d.quarantined
@@ -955,10 +959,13 @@ VIEWS.setup = {
       <section class="panel s6"><header><h2>Settings</h2></header><div class="body">${this.settingsForm(c)}</div></section>
       <section class="panel s12" data-pid="setup:geo"><header><h2>Geolocation</h2><span class="grow"></span><span class="hint">for the globe · lookups stay on this machine</span></header>
         <div class="body" id="geo-panel"><div class="note">Loading…</div></div></section>
+      <section class="panel s12" data-pid="setup:ident"><header><h2>Device identification</h2><span class="grow"></span><span class="hint">what each device is · lookups stay on this machine</span></header>
+        <div class="body" id="ident-panel"><div class="note">Loading…</div></div></section>
     </div>`;
     this.bind(m);
     this.drawCollectors();
     this.drawGeo();
+    this.drawIdent();
   },
   stateChip(s) {
     const cls = s === "ok" ? "green" : s === "error" ? "red" : s === "connecting" ? "amber" : "";
@@ -1105,7 +1112,7 @@ VIEWS.setup = {
             : g.source === "demo" ? '<div class="callout">Demo: simulated locations. Add a database to locate real addresses.</div>'
             : '<div class="callout warn"><b>No geolocation database.</b> The globe needs one to place Internet addresses.</div>'}
           ${g.error ? `<div class="callout bad" style="margin-top:8px">${esc(g.error)}</div>` : ""}
-          <p class="note" style="margin:12px 0 8px">Download the free <b>DB-IP Lite</b> database (CC BY 4.0, no account). This is the one time MCC contacts anything but your router: a single download from <span class="mono">download.db-ip.com</span>. Lookups afterwards are local. DB-IP updates it monthly; download again to refresh.</p>
+          <p class="note" style="margin:12px 0 8px">Download the free <b>DB-IP Lite</b> database (CC BY 4.0, no account). It's a single download from <span class="mono">download.db-ip.com</span>, made only when you click. Lookups afterwards are local. DB-IP updates it monthly; download again to refresh.</p>
           <div class="btnrow">
             <button class="btn" data-dl="country" ${running ? "disabled" : ""}>Country Lite <span class="faint">≈4 MB</span></button>
             <button class="btn primary" data-dl="city" ${running ? "disabled" : ""}>City Lite <span style="opacity:.75">≈60 MB</span></button>
@@ -1147,7 +1154,56 @@ VIEWS.setup = {
     clearTimeout(this.geoT);
     this.geoT = setTimeout(() => this.drawGeo(), 800);
   },
-  leave() { clearTimeout(this.geoT); },
+  async drawIdent() {
+    const el = $("#ident-panel");
+    if (!el) return;
+    let o;
+    try { o = await api.get("/api/oui"); } catch (err) { el.innerHTML = `<div class="callout bad">${esc(err.message)}</div>`; return; }
+    if (!$("#ident-panel")) return;
+    const dl = o.download || {};
+    const running = dl.state === "running";
+    const lookupVal = ($("#mac-q") || {}).value || "";
+    el.innerHTML = `
+      <div class="grid" style="gap:18px">
+        <div class="s6">
+          ${o.entries ? `<div class="callout good"><b>IEEE MAC vendor registry</b> · ${o.entries.toLocaleString()} prefixes (MA-L, MA-M, MA-S) · ${o.origin === "downloaded" ? "updated" : "shipped with MCC"} ${esc(o.built)}</div>`
+            : `<div class="callout warn"><b>No MAC vendor database.</b> ${esc(o.error)}</div>`}
+          <p class="note" style="margin:12px 0 8px">The first half of every MAC is assigned to its maker by the IEEE. MCC ships a copy of the registry, so lookups work offline. The IEEE adds new prefixes every week, so refresh it now and then: a single download of about 5 MB from <span class="mono">standards-oui.ieee.org</span>, made only when you click.</p>
+          <div class="btnrow"><button class="btn" id="oui-dl" ${running ? "disabled" : ""}>Update from the IEEE</button>
+            ${running ? `<span class="note">Downloading ${esc((dl.url || "").replace("https://", ""))} — ${fmt.bytes(dl.bytes || 0)}</span>` : ""}</div>
+          ${dl.state === "error" ? `<div class="callout bad" style="margin-top:10px">Update failed: ${esc(dl.error)}</div>` : ""}
+          ${dl.state === "done" ? `<div class="callout good" style="margin-top:10px">Updated: ${(dl.entries || 0).toLocaleString()} prefixes.</div>` : ""}
+          <h4 class="mini" style="margin-top:16px">How MCC tells what a device is</h4>
+          <ul class="clues">
+            <li><span class="src">MAC</span><span>Who made its network chip. Decisive for single-purpose makers (Brother, Sonos, Wyze), a hint for others (Apple, Samsung, Intel). A <b>private (randomized) MAC</b> means a phone, tablet or laptop hiding its hardware address.</span></li>
+            <li><span class="src">Host name</span><span>The name it sends with DHCP: <span class="mono">Janes-iPhone</span>, <span class="mono">DESKTOP-4F1K2LQ</span>, <span class="mono">BRW0080927AFBCE</span>, <span class="mono">ESP_3A1F2C</span>.</span></li>
+            <li><span class="src">DHCP</span><span>Its vendor class, when your RouterOS version reports it: <span class="mono">MSFT 5.0</span> is Windows, <span class="mono">android-dhcp-14</span> Android 14.</span></li>
+            <li><span class="src">Discovery</span><span>Switches, access points and IP phones announce their model over LLDP, CDP or MNDP (<span class="mono">/ip neighbor</span>).</span></li>
+            <li><span class="src">Traffic</span><span>The names it looks up (<span class="mono">captive.apple.com</span>, <span class="mono">connectivitycheck.gstatic.com</span>, <span class="mono">*.lgtvsdp.com</span>, Tuya, Ring, Sonos…) and the services it offers (printing, RTSP video, Cast). Remembered per device for 30 days.</span></li>
+          </ul>
+        </div>
+        <div class="s6">
+          <h4 class="mini">Look up a MAC</h4>
+          <form class="btnrow" id="f-mac"><input type="text" id="mac-q" value="${esc(lookupVal)}" placeholder="e.g. 3C:22:FB:12:34:56" style="max-width:260px" autocomplete="off"><button class="btn primary" type="submit">Look up</button></form>
+          <p class="note" style="margin-top:8px">Also from anywhere: <b>Ctrl+K</b>, then paste a MAC.</p>
+        </div>
+      </div>`;
+    $("#oui-dl", el).onclick = async () => {
+      try { await api.post("/api/oui/download", { confirm: true }); this.identPoll(); } catch (err) { toast("Update not started", err.message, { bad: true }); }
+    };
+    $("#f-mac", el).onsubmit = (e) => {
+      e.preventDefault();
+      const q = $("#mac-q").value.trim();
+      if (!Ident.isMac(q)) return toast("Not a MAC address", "Give all six bytes, e.g. 3C:22:FB:12:34:56", { bad: true });
+      Ident.lookup(q);
+    };
+    if (running) this.identPoll();
+  },
+  identPoll() {
+    clearTimeout(this.identT);
+    this.identT = setTimeout(() => this.drawIdent(), 800);
+  },
+  leave() { clearTimeout(this.geoT); clearTimeout(this.identT); },
   tick() { if (++this.n % 3 === 0) this.drawCollectors(); },
   n: 0,
 };
