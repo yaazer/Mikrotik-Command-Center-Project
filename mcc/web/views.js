@@ -474,6 +474,181 @@ VIEWS.traffic = {
 };
 
 /* ================= VPN ================= */
+/* ================= LAN: device to device ================= */
+// Traffic between devices inside your network: who serves what to whom (mcc/traffic.py _lan_view). What the
+// router can see of it depends on where it is switched (mcc/hub.py), and the page says so rather than look empty.
+const LAN_ROLE = { server: ["blue", "server"], client: ["", "client"], both: ["green", "both"] };
+VIEWS.lan = {
+  render(m) {
+    this.q = "";
+    m.innerHTML = `${connectBanner()}<div id="lan-vis"></div>
+      <div class="kpis" id="lan-kpis"></div>
+      <div class="grid">
+        <section class="panel s8" data-pid="lan:map"><header><h2>Device to device</h2><span class="grow"></span><span class="hint" id="lan-src"></span>
+          <div class="seg color-by" title="Colour the traffic by type or by direction"><button data-by="type">Type</button><button data-by="direction">Direction</button></div></header>
+          <div class="map-wrap" id="lan-map"><div class="map-legend type-legend"></div></div></section>
+        <section class="panel s4" data-pid="lan:services"><header><h2>Services on the LAN</h2><span class="grow"></span><span class="hint">what devices serve each other</span></header>
+          <div class="body flush scroll" style="max-height:470px" id="lan-services"></div></section>
+        <section class="panel s8" data-pid="lan:chart"><header><h2>LAN throughput</h2><span class="grow"></span><span class="legend"><span><i style="background:var(--in)"></i>to clients</span><span><i style="background:var(--out)"></i>to servers</span></span></header>
+          <div class="body"><div class="chart"><canvas id="lan-chart"></canvas></div></div></section>
+        <section class="panel s4" data-pid="lan:split"><header><h2>Where it flows</h2></header><div class="body" id="lan-split"></div></section>
+        <section class="panel s12" data-pid="lan:devices"><header><h2>Devices talking on the LAN</h2><span class="grow"></span><span class="hint">a server answers connections; a client opens them</span></header>
+          <div class="body flush scroll" style="max-height:440px" id="lan-devices"></div></section>
+        <section class="panel s12" data-pid="lan:pairs"><header><h2>Conversations</h2><span class="grow"></span><input type="text" id="lan-q" placeholder="Filter by device, IP or service" style="max-width:260px"></header>
+          <div class="body flush scroll" style="max-height:460px" id="lan-pairs"></div></section>
+        <section class="panel s12" data-pid="lan:ports"><header><h2>LAN ports: what MCC can see</h2><span class="grow"></span><span class="hint">traffic switched where the router can't see it still shows in a port's rate</span></header>
+          <div class="body flush scroll" style="max-height:520px" id="lan-ports"></div></section>
+      </div>`;
+    // servers on the left, clients on the right, the LAN between them
+    this.map = TrafficMap.create($("#lan-map", m), { peers: 14, hosts: 14, captions: ["SERVERS", "CLIENTS"], singleOut: false,
+      centerTip: (r, s) => `<b>LAN</b><span class="in">↓ to clients ${fmt.bps(r.down || 0)}</span> · <span class="out">↑ to servers ${fmt.bps(r.up || 0)}</span><br>
+        <span class="muted">${s ? s.traffic.conns : 0} connections between devices</span>`,
+      tipExtra: (n) => n.kind === "peer"
+        ? `serves ${(n.hosts || []).length} device${(n.hosts || []).length === 1 ? "" : "s"}${n.ports && n.ports.length ? " · ports " + n.ports.join(", ") : ""}`
+        : `uses ${n.peers || 0} server${n.peers === 1 ? "" : "s"} · ${n.conns || 0} conns` });
+    $("#lan-q", m).oninput = (e) => { this.q = e.target.value.toLowerCase(); this.tick(); };
+    $("#lan-vis", m).onclick = (e) => { if (e.target.closest("[data-go-setup]")) go("setup"); };
+    this.tick();
+  },
+  tick() {
+    const s = S.snap, l = s.lan;
+    if (!l) return;
+    const v = l.visibility || {};
+    $("#lan-vis").innerHTML = this.visHtml(v);
+    const total = l.to_clients_bps + l.to_servers_bps;
+    const [tv, tu] = fmt.bpsParts(total), [dv, du] = fmt.bpsParts(l.to_clients_bps), [uv, uu] = fmt.bpsParts(l.to_servers_bps);
+    const servers = l.devices.filter((d) => d.role !== "client").length, clients = l.devices.filter((d) => d.role !== "server").length;
+    const unseen = l.ports.reduce((a, p) => a + (p.seen_pct == null ? 0 : Math.max(0, p.rx_bps + p.tx_bps - p.seen_bps)), 0);
+    const [nv, nu] = fmt.bpsParts(unseen);
+    $("#lan-kpis").innerHTML = `
+      <div class="panel kpi"><div class="k">LAN traffic</div><div class="v">${tv}<small>${tu}</small></div><div class="sub">device to device</div></div>
+      <div class="panel kpi"><div class="k in">↓ To clients</div><div class="v">${dv}<small>${du}</small></div><div class="sub">served to devices</div></div>
+      <div class="panel kpi"><div class="k out">↑ To servers</div><div class="v">${uv}<small>${uu}</small></div><div class="sub">sent to servers</div></div>
+      <div class="panel kpi"><div class="k">Conversations</div><div class="v">${l.pair_count}</div><div class="sub">${l.conns} connections</div></div>
+      <div class="panel kpi"><div class="k">Devices</div><div class="v">${l.devices.length}</div><div class="sub">${servers} serving · ${clients} using</div></div>
+      <div class="panel kpi" title="LAN port traffic MCC can't put a conversation to: switched in hardware, or inside another switch or access point"><div class="k">Not attributed</div><div class="v">${nv}<small>${nu}</small></div><div class="sub">on LAN ports, unseen</div></div>`;
+    // the map: everything, or only the conversations of the device whose drawer is open
+    const sel = Select.ip;
+    const pairs = sel ? l.pairs.filter((p) => p.client === sel || p.server === sel) : null;
+    const side = pairs ? this.sides(pairs) : { servers: l.servers, clients: l.clients };
+    const down = pairs ? pairs.reduce((a, p) => a + p.down, 0) : l.to_clients_bps, up = pairs ? pairs.reduce((a, p) => a + p.up, 0) : l.to_servers_bps;
+    this.map.update({ router: { identity: "LAN" }, traffic: { hosts: side.clients, peers: side.servers, in_bps: down, out_bps: up,
+      conns: (pairs || l.pairs).reduce((a, p) => a + p.conns, 0), source: s.traffic.source } });
+    $("#lan-src").innerHTML = sel ? `only <b>${esc(nameOf(sel) || sel)}</b> · <a href="javascript:void 0" data-unselect>show all</a>`
+      : esc(l.pair_count ? `${l.pair_count} conversation${l.pair_count === 1 ? "" : "s"} between devices` : "no device-to-device traffic seen right now");
+    refreshTypeUI();
+    Live.set($("#lan-services"), this.servicesHtml(l.services));
+    Charts.line($("#lan-chart"), [{ data: (S.hist.lan || []).map((r) => [r[0], r[1]]), color: cssVar("--in"), fill: true, label: "↓" },
+      { data: (S.hist.lan || []).map((r) => [r[0], r[2]]), color: cssVar("--out"), fill: true, label: "↑" }], { window: 1800, yfmt: fmt.bps, mirror: true });
+    Live.set($("#lan-split"), this.splitHtml(l, v));
+    Live.set($("#lan-devices"), this.devicesHtml(l.devices), bindRows);
+    const q = this.q;
+    const rows = l.pairs.filter((p) => !q || [p.client, p.server, p.service, nameOf(p.client), nameOf(p.server), Types.label(p.cat)]
+      .some((x) => (x || "").toLowerCase().includes(q)));
+    Live.set($("#lan-pairs"), this.pairsHtml(rows, v), bindRows);
+    Live.set($("#lan-ports"), this.portsHtml(l.ports, l.switch),
+      (el) => $$(".lan-dev[data-ip]", el).forEach((d) => (d.onclick = () => openHost(d.dataset.ip))));
+  },
+  /* servers (left) and clients (right) of just these conversations */
+  sides(pairs) {
+    const servers = new Map(), clients = new Map();
+    const add = (map, ip, extra) => {
+      let x = map.get(ip);
+      if (!x) map.set(ip, x = Object.assign({ ip, name: nameOf(ip), up: 0, down: 0, conns: 0, cats: {}, hosts: [], ports: [], peers: 0 }, extra));
+      return x;
+    };
+    for (const p of pairs) {
+      for (const [x, other] of [[add(servers, p.server), p.client], [add(clients, p.client), p.server]]) {
+        x.up += p.up; x.down += p.down; x.conns += p.conns;
+        x.cats[p.cat] = (x.cats[p.cat] || 0) + p.up + p.down;
+        if (!x.hosts.includes(other)) x.hosts.push(other);
+      }
+      const sv = servers.get(p.server);
+      if (!sv.ports.includes(p.port)) sv.ports.push(p.port);
+    }
+    const done = (map) => [...map.values()].map((x) => Object.assign(x, { peers: x.hosts.length,
+      cat: Object.entries(x.cats).sort((a, b) => b[1] - a[1]).map((e) => e[0])[0] || "other" })).sort((a, b) => b.up + b.down - (a.up + a.down));
+    return { servers: done(servers), clients: done(clients) };
+  },
+  visHtml(v) {
+    if (!connected() || v.bridge_firewall == null) return "";
+    const nets = v.segments || [];
+    const netList = nets.map((n) => `<span class="mono">${esc(n.iface)}</span> ${esc(n.net)}`).join(", ");
+    const routed = nets.length > 1 ? `Traffic routed between your ${nets.length} networks (${netList}) is always visible.`
+      : nets.length ? `You have one network (${netList}): everything between devices stays inside it.` : "";
+    const ports = (v.offloaded || []).map((p) => `<span class="mono">${esc(p)}</span>`).join(", ");
+    if (!v.bridge_firewall) {
+      return `<div class="callout warn lan-vis"><b>Traffic between devices on the same network isn't visible yet.</b> ${routed}
+        Within a network, devices reach each other through the bridge without passing the router's firewall, so the router keeps no record of who talks to whom.
+        <div class="btnrow" style="margin-top:8px"><button class="btn sm" data-go-setup>Review in Setup</button><span class="note">approve <b>See traffic between devices on the same network</b>${v.offloaded && v.offloaded.length ? " (and, to see what the switch chip forwards, the hardware-offload item)" : ""}</span></div></div>`;
+    }
+    if ((v.offloaded || []).length) {
+      return `<div class="callout lan-vis"><b>Same-network traffic now goes through the firewall, except what the switch chip forwards itself between ${ports}.</b> ${routed}
+        That traffic only shows in the ports' rates below. Turning hardware offload off for those ports (Setup) makes it visible, at a CPU cost.
+        <div class="btnrow" style="margin-top:8px"><button class="btn sm" data-go-setup>Review in Setup</button></div></div>`;
+    }
+    return `<div class="callout good lan-vis"><b>Device-to-device traffic through the router is visible.</b> ${routed}
+      Traffic inside another switch or Wi-Fi access point never reaches the router: <b>LAN ports</b> below shows how much that is.</div>`;
+  },
+  servicesHtml(list) {
+    if (!list.length) return '<div class="empty">No service between devices seen right now.</div>';
+    const max = Math.max(1, ...list.map((v) => v.bps));
+    return `<table class="t"><tbody>${list.map((v) => `<tr><td><span class="tchip">${typeDot(v.cat)}<b>${esc(v.label)}</b></span>
+        <div class="faint" style="font-size:11.5px">${v.servers} server${v.servers === 1 ? "" : "s"} · ${v.clients} client${v.clients === 1 ? "" : "s"} · ${v.conns} conn${v.conns === 1 ? "" : "s"}</div></td>
+      <td class="r num">${fmt.bps(v.bps)}</td><td style="width:70px"><div class="share" style="width:64px"><i style="width:${((v.bps / max) * 100).toFixed(1)}%"></i></div></td></tr>`).join("")}</tbody></table>`;
+  },
+  splitHtml(l, v) {
+    const total = l.routed_bps + l.same_bps;
+    const pct = (x) => (total ? Math.round((x / total) * 100) : 0);
+    const nets = v.segments || [];
+    return `<div class="tbar big"><i style="width:${pct(l.same_bps)}%;background:var(--accent)"></i><i style="width:${pct(l.routed_bps)}%;background:var(--out)"></i></div>
+      <dl class="kv">
+        <dt><i class="tdot" style="background:var(--accent)"></i>Same network</dt><dd>${fmt.bps(l.same_bps)} · ${pct(l.same_bps)}%</dd>
+        <dt><i class="tdot" style="background:var(--out)"></i>Routed between</dt><dd>${fmt.bps(l.routed_bps)} · ${pct(l.routed_bps)}%</dd>
+      </dl>
+      <h4 class="mini" style="margin-top:14px">Your networks</h4>
+      ${nets.length ? `<ul class="clues">${nets.map((n) => `<li><span class="src">${esc(n.iface)}</span><span class="mono">${esc(n.net)}</span></li>`).join("")}</ul>` : '<div class="note">Waiting for the router\'s addresses.</div>'}
+      <div class="note" style="margin-top:10px">Same-network traffic is ${v.bridge_firewall ? "sent through the router's firewall" : "<b>not</b> sent through the router's firewall"} (bridge <span class="mono">use-ip-firewall=${v.bridge_firewall ? "yes" : "no"}</span>).</div>`;
+  },
+  devicesHtml(devs) {
+    if (!devs.length) return '<div class="empty"><b>No device-to-device traffic seen</b>Devices appear here when MCC sees them talk to each other.</div>';
+    const max = Math.max(1, ...devs.map((d) => Math.max(d.sent, d.received)));
+    return `<table class="t"><thead><tr><th>Device</th><th>Role</th><th>Serves</th><th>Uses</th><th class="r">Partners</th><th class="r">Received</th><th class="r">Sent</th><th></th></tr></thead><tbody>
+      ${devs.map((d) => { const [cls, label] = LAN_ROLE[d.role] || ["", d.role];
+        return `<tr class="click ${d.pinned ? "pinned" : ""}" data-ip="${esc(d.ip)}"><td><div class="who-row">${d.kind ? Ident.icon(d.kind) : typeDot(d.cat)}<span style="width:8px"></span>${whoCell(d.name || d.guess, d.ip + (d.name && d.guess ? " · " + d.guess : ""))}${Pins.button(d.ip)}</div>${d.threat ? ` <span class="sev sv-${esc(d.threat)}"></span>` : ""}</td>
+          <td><span class="pill ${cls}">${esc(label)}</span></td><td class="muted">${esc(d.serves.join(", ") || "—")}</td><td class="muted">${esc(d.uses.join(", ") || "—")}</td>
+          <td class="r num">${d.partners}</td><td class="r num in">${fmt.bps(d.received)}</td><td class="r num out">${fmt.bps(d.sent)}</td><td style="width:90px">${rateBars(d.received, d.sent, max)}</td></tr>`; }).join("")}
+      </tbody></table>`;
+  },
+  pairsHtml(rows, v) {
+    if (!rows.length) return `<div class="empty">${v.bridge_firewall === false ? "Only traffic routed between your networks is visible until the bridge sends same-network traffic through the firewall (Setup)." : "No conversations between devices right now."}</div>`;
+    const max = Math.max(...rows.map((p) => Math.max(p.down, p.up)), 1);
+    return `<table class="t"><thead><tr><th>Client</th><th>Server</th><th>Service</th><th>Type</th><th>Path</th><th class="r">↓ to client</th><th class="r">↑ to server</th><th></th></tr></thead><tbody>
+      ${rows.map((p) => `<tr class="click" data-ip="${esc(p.client)}"><td>${whoCell(nameOf(p.client), p.client)}</td><td>${whoCell(nameOf(p.server), p.server)}</td>
+        <td style="white-space:nowrap">${esc(p.service)}</td><td><span class="tchip" title="${esc(p.cat_why || "")}">${typeDot(p.cat)}${esc(Types.label(p.cat))}</span></td>
+        <td>${p.routed ? `<span class="pill" title="routed by the router between two of your networks">routed</span> <span class="mono faint" style="font-size:11.5px">${esc(p.segments.join(" → "))}</span>` : '<span class="faint">same network</span>'}</td>
+        <td class="r num in">${fmt.bps(p.down)}</td><td class="r num out">${fmt.bps(p.up)}</td><td style="width:90px">${rateBars(p.down, p.up, max)}</td></tr>`).join("")}
+      </tbody></table>`;
+  },
+  portsHtml(ports, sw) {
+    if (!ports.length && !sw.length) return '<div class="empty">No LAN ports found on the router yet.</div>';
+    const devs = (p) => p.devices.slice(0, 4).map((d) => `<span class="lan-dev" data-ip="${esc(d.ip)}" title="${esc([d.ip, d.mac, d.label].filter(Boolean).join(" · "))}">${d.kind ? Ident.icon(d.kind) : ""}${esc(d.name || d.label || d.ip)}</span>`).join("") +
+      (p.device_count > 4 ? `<span class="faint">+${p.device_count - 4}</span>` : "");
+    const seen = (p) => p.seen_pct == null ? '<span class="faint">quiet</span>'
+      : `<div class="share" title="${fmt.bps(p.seen_bps)} of ${fmt.bps(p.rx_bps + p.tx_bps)} is Internet traffic or a conversation MCC saw"><i style="width:${p.seen_pct}%"></i></div><span class="num ${p.seen_pct < 60 ? "" : "faint"}" style="font-size:12px">${p.seen_pct}%</span>`;
+    return `<table class="t"><thead><tr><th>Router port</th><th>Devices behind it</th><th>Forwarding</th><th class="r">↓ to devices</th><th class="r">↑ from devices</th><th>Seen as conversations</th></tr></thead><tbody>
+      ${ports.map((p) => `<tr><td><b>${esc(p.name)}</b>${p.comment ? `<div class="faint" style="font-size:11.5px">${esc(p.comment)}</div>` : ""}</td>
+        <td><div class="lan-devs">${devs(p) || '<span class="faint">—</span>'}</div></td>
+        <td>${p.hw == null ? '<span class="faint">—</span>' : p.hw ? '<span class="pill" title="the switch chip forwards between these ports itself: only counted, never seen">switch chip</span>' : '<span class="pill green" title="through the router\'s CPU and firewall">through CPU</span>'}</td>
+        <td class="r num in">${fmt.bps(p.tx_bps)}</td><td class="r num out">${fmt.bps(p.rx_bps)}</td><td style="white-space:nowrap">${seen(p)}</td></tr>`).join("")}
+      </tbody></table>
+      ${sw.length ? `<div class="note" style="padding:12px 14px 4px">Switch ports: the router never sees who talks to whom inside the switch, only these rates.</div>
+      <table class="t"><thead><tr><th>Switch port</th><th class="r">↓ rx</th><th class="r">↑ tx</th></tr></thead><tbody>
+        ${sw.map((p) => `<tr><td><b>${esc(p.name)}</b></td><td class="r num in">${p.rx_bps == null ? "—" : fmt.bps(p.rx_bps)}</td><td class="r num out">${p.tx_bps == null ? "—" : fmt.bps(p.tx_bps)}</td></tr>`).join("")}
+      </tbody></table>` : ""}`;
+  },
+};
+
 const VPN_STATUS = { up: ["green", "up"], stale: ["amber", "no handshake"], down: ["red", "down"], disabled: ["", "disabled"], missing: ["", "not found"] };
 VIEWS.vpn = {
   render(m) {
@@ -640,7 +815,8 @@ VIEWS.vpn = {
 function nameOf(ip) {
   const tr = S.snap.traffic;
   const h = tr.hosts.find((x) => x.ip === ip) || tr.peers.find((x) => x.ip === ip) ||
-    (tr.vpn || { hosts: [], peers: [] }).hosts.find((x) => x.ip === ip) || (tr.vpn || { peers: [] }).peers.find((x) => x.ip === ip);
+    (tr.vpn || { hosts: [], peers: [] }).hosts.find((x) => x.ip === ip) || (tr.vpn || { peers: [] }).peers.find((x) => x.ip === ip) ||
+    ((S.snap.lan || {}).devices || []).find((x) => x.ip === ip);
   return h ? h.name : "";
 }
 
@@ -1048,6 +1224,7 @@ VIEWS.setup = {
     el.innerHTML = '<div class="note">Reading the router…</div>';
     let plan;
     try { plan = await api.get(url + (lists ? "?lists=1" : "")); } catch (err) { el.innerHTML = `<div class="callout bad">${esc(err.message)}</div>`; return; }
+    if (!el.isConnected) return;  // the page changed while the router was being read
     const removal = plan.kind === "remove";
     const sl = { installed: "green", partial: "amber", missing: "red", unavailable: "", present: "amber", clean: "green", optional: "blue" };
     el.innerHTML = `${removal ? `<label class="check" style="margin-bottom:10px"><input type="checkbox" id="rm-lists" ${lists ? "checked" : ""}> Also empty MCC's block and quarantine lists</label>` :

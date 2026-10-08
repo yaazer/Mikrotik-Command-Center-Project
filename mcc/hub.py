@@ -27,7 +27,7 @@ from .routeros import CertificateChanged, RouterOS, RouterOSError, local_ip_towa
 from .setup_plan import SetupPlanner
 from .rosswitch import RouterOSSwitch, detect_os
 from .swos import SwOS, SwOSError
-from .traffic import TrafficModel
+from .traffic import TrafficModel, lan_flow_ends
 from .util import in_networks, is_local_scope, ip_obj, parse_duration, parse_networks, to_bool, to_float, to_int
 
 HIST = 900  # points kept per series (30 min at the default 2 s poll)
@@ -101,6 +101,11 @@ class Hub:
         self._if_prev: Dict[str, Tuple[float, int, int]] = {}
         self.iface_hist: Dict[str, Deque[Tuple[float, float, float]]] = defaultdict(lambda: deque(maxlen=HIST))
         self.health_hist: Deque[Tuple[float, float, float]] = deque(maxlen=HIST)
+        self.lan_hist: Deque[Tuple[float, float, float]] = deque(maxlen=HIST)  # (t, to clients, to servers)
+        # the bridge: does bridged traffic go through the IP firewall (use-ip-firewall), and which ports the switch
+        # chip forwards in hardware -- together they decide what device-to-device traffic the router can see
+        self.bridge_fw: Optional[bool] = None
+        self.bridge_ports: Dict[str, Dict[str, Any]] = {}
         self.switch_ports: List[Dict[str, Any]] = []
         self.switch_sys: Dict[str, Any] = {}
         self._sw_prev: Dict[int, Tuple[float, float, float]] = {}
@@ -137,6 +142,7 @@ class Hub:
 
         self.traffic = TrafficModel(self.lan_nets, lambda: self.router_addrs, self.name_of)
         self.traffic.path_of = self._path_of
+        self.traffic.segment_of = self._segment_of
         # Threat updates are coalesced and sent with the tick: during a scan or a busy torrent swarm a
         # threat can be updated hundreds of times a second, and each update carries its evidence.
         self._threat_dirty: Dict[str, Dict[str, Any]] = {}
@@ -365,6 +371,17 @@ class Hub:
                 if iface in vpn and o.version == net.version and o in net:
                     return iface
         return ""
+
+    def _segment_of(self, ip: str) -> str:
+        """The router interface whose network holds this address (bridge, vlan20-iot ...); "" if none."""
+        o = ip_obj(ip)
+        best, plen = "", -1
+        if o is None:
+            return best
+        for iface, net in self.router_nets:
+            if o.version == net.version and o in net and net.prefixlen > plen:
+                best, plen = iface, net.prefixlen
+        return best
 
     def vpn_status(self, now: Optional[float] = None) -> Dict[str, Any]:
         """Each tunnel: up / down / stale (WireGuard: no recent handshake) / disabled, with its peers."""
@@ -660,11 +677,35 @@ class Hub:
                     wan.add(m["interface"])
         except RouterOSError:
             pass
+        bridge_fw, bridge_ports = self._read_bridge(ros)
         with self.lock:
+            self.bridge_fw, self.bridge_ports = bridge_fw, bridge_ports
             self.router_info["identity"] = ident.get("name", self.router_info.get("identity", ""))
             self.router_addrs, self.router_nets, self.gateways, self._wan = addrs, nets, gws, wan
             self.addr_iface = owner
         self._refresh_entries()
+
+    @staticmethod
+    def _read_bridge(ros: RouterOS) -> Tuple[Optional[bool], Dict[str, Dict[str, Any]]]:
+        fw: Optional[bool] = None
+        ports: Dict[str, Dict[str, Any]] = {}
+        try:
+            bs = ros.get("/interface/bridge/settings") or {}
+            if isinstance(bs, list):
+                bs = bs[0] if bs else {}
+            if "use-ip-firewall" in bs:
+                fw = to_bool(bs["use-ip-firewall"])
+        except RouterOSError:
+            pass
+        try:
+            for r in ros.get_list("/interface/bridge/port"):
+                if r.get("interface") and not to_bool(r.get("disabled")) and not to_bool(r.get("inactive")):
+                    # hw-offload is what the switch chip actually does; hw is only what was asked for
+                    hw = r.get("hw-offload") if r.get("hw-offload") is not None else r.get("hw")
+                    ports[r["interface"]] = {"id": r.get(".id", ""), "bridge": r.get("bridge", ""), "hw": to_bool(hw)}
+        except RouterOSError:
+            pass
+        return fw, ports
 
     def _refresh_entries(self) -> None:
         entries = self.actions.entries()
@@ -870,6 +911,7 @@ class Hub:
                 self.detector.tick(t0)
                 snap = self.snapshot(t0)
                 self.detector.on_hosts(snap["traffic"]["hosts"], t0)
+                self.lan_hist.append((t0, snap["lan"]["to_clients_bps"], snap["lan"]["to_servers_bps"]))
                 with self.lock:
                     logs, self._log_pending = self._log_pending, []
                 with self._dirty_lock:
@@ -936,12 +978,69 @@ class Hub:
             "switch": {"ports": ports, "sys": self.switch_sys},
             "traffic": traffic,
             "vpn": self.vpn_status(now),
+            "lan": self._lan_view(traffic, ifaces, ports),
             "geo": self._geo_view(traffic),
             "counts": {"threats_open": len(open_t),
                        "threats_new": len([t for t in open_t if now - t.get("first_ts", 0) < 300]),
                        "actions_pending": len([a for a in self.actions.items.values() if a["status"] == "pending"]),
                        "blocked": len(self.blocked), "devices": len(self.devices), "log_seq": self.log_seq},
         }
+
+    def _lan_view(self, traffic: Dict[str, Any], ifaces: List[Dict[str, Any]],
+                  switch_ports: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Device-to-device traffic, what the router can see of it, and each LAN port's activity: how much of a
+        port's traffic MCC can put a conversation to. The rest was switched where the router can't see it."""
+        lan = traffic.pop("lan")
+        with self.lock:
+            devs = list(self.devices.values())
+            bports = dict(self.bridge_ports)
+            fw = self.bridge_fw
+            nets = list(self.router_nets)
+        wan, vpn = self.wan_ifaces(), self.vpn_ifaces()
+        port_of = {d["ip"]: d.get("port") or "" for d in devs if d.get("ip")}
+        behind: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for d in devs:
+            if d.get("port"):
+                behind[d["port"]].append({"ip": d.get("ip", ""), "name": d.get("name") or d.get("hostname") or "",
+                                          "mac": d.get("mac", ""),
+                                          "label": (d.get("identity") or {}).get("label", ""),
+                                          "kind": (d.get("identity") or {}).get("kind", "")})
+        seen: Dict[str, float] = defaultdict(float)
+        for h in traffic["hosts"]:  # Internet traffic crosses the device's port
+            if port_of.get(h["ip"]):
+                seen[port_of[h["ip"]]] += h["up"] + h["down"]
+        for c in lan["pairs"]:  # a conversation between two ports crosses both
+            a, b = port_of.get(c["client"], ""), port_of.get(c["server"], "")
+            if a != b:
+                for port in (a, b):
+                    if port:
+                        seen[port] += c["up"] + c["down"]
+        ports = []
+        for i in ifaces:
+            name = i["name"]
+            if name in wan or name in vpn or not (name in bports or name in behind):
+                continue
+            rate = i["rx_bps"] + i["tx_bps"]
+            ports.append({"name": name, "comment": i.get("comment", ""), "running": i["running"], "rx_bps": i["rx_bps"],
+                          "tx_bps": i["tx_bps"], "hw": (bports.get(name) or {}).get("hw"),
+                          "bridge": (bports.get(name) or {}).get("bridge", ""),
+                          "devices": sorted(behind.get(name, []), key=lambda d: d["ip"])[:16],
+                          "device_count": len(behind.get(name, [])), "seen_bps": min(seen.get(name, 0.0), rate),
+                          "seen_pct": round(100 * min(seen.get(name, 0.0), rate) / rate) if rate >= 50e3 else None})
+        ports.sort(key=lambda x: -(x["rx_bps"] + x["tx_bps"]))
+        ident = {d["ip"]: d.get("identity") or {} for d in devs if d.get("ip")}
+        for d in lan["devices"]:  # what each one is (mcc/identify.py)
+            i = ident.get(d["ip"], {})
+            d["kind"], d["guess"] = i.get("kind", ""), i.get("label", "") if i.get("confidence") not in (None, "none") else ""
+        segments = sorted({(iface, str(net)) for iface, net in nets
+                           if net.version == 4 and iface not in wan and iface not in vpn and net.prefixlen < 31})
+        lan["visibility"] = {"bridge_firewall": fw, "offloaded": sorted(n for n, b in bports.items() if b["hw"]),
+                             "via_cpu": sorted(n for n, b in bports.items() if not b["hw"]),
+                             "segments": [{"iface": a, "net": n} for a, n in segments]}
+        lan["ports"] = ports
+        lan["switch"] = [{"n": p["n"], "name": p.get("name") or str(p["n"]), "link": p.get("link"),
+                          "rx_bps": p.get("rx_bps"), "tx_bps": p.get("tx_bps")} for p in switch_ports if p.get("link")]
+        return lan
 
     def public_addrs(self) -> List[str]:
         return sorted(a for a in self.router_addrs if ip_obj(a) is not None and not is_local_scope(a))
@@ -974,9 +1073,10 @@ class Hub:
         with self.lock:
             hist = {n: [[round(t, 1), round(rx), round(tx)] for t, rx, tx in h] for n, h in self.iface_hist.items()}
             health = [[round(t, 1), round(c, 1), round(m, 1)] for t, c, m in self.health_hist]
+            lan = [[round(t, 1), round(d), round(u)] for t, d, u in self.lan_hist]
             sw = {str(n): [[round(t, 1), round(rx), round(tx)] for t, rx, tx in h] for n, h in self.switch_hist.items()}
             logs = list(self.logs)[-500:]
-        return {"snapshot": snap, "history": {"ifaces": hist, "health": health, "switch": sw},
+        return {"snapshot": snap, "history": {"ifaces": hist, "health": health, "switch": sw, "lan": lan},
                 "threats": self.detector.list(), "actions": self.actions.list(), "logs": logs,
                 "entries": self.entries, "config": self.cfg.public(), "rules": RULES,
                 "ignore": self.detector.suppressions_list(), "categories": CATEGORIES, "pins": self.pins_list()}
@@ -1016,8 +1116,11 @@ class Hub:
 
 def _flow_conn(g: Dict[str, Any]) -> Dict[str, Any]:
     """A flow record in the connection table's shape (for device fingerprints): the port is the responder's."""
+    if g["dir"] == "lan":
+        client, server, port, _ = lan_flow_ends(g)
+        return {"local": client, "remote": server, "dir": "lan", "proto": g.get("proto_name", ""), "port": port}
     initiator_side = g["src"] == g["local"]
-    if g["dir"] in ("out", "lan"):
+    if g["dir"] == "out":
         port = g["dport"] if initiator_side else g["sport"]
     else:
         port = g["sport"] if initiator_side else g["dport"]

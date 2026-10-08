@@ -35,7 +35,8 @@ from mcc.oui import MacVendors, build as oui_build, is_random, short_name  # noq
 from mcc.routeros import RouterOS, RouterOSError, cli_line  # noqa: E402
 from mcc.server import make_server  # noqa: E402
 from mcc.swos import SwOS, SwOSError, hexstr, parse_js  # noqa: E402
-from mcc.traffic import TrafficModel, parse_rate  # noqa: E402
+from mcc.classify import classify_lan  # noqa: E402
+from mcc.traffic import TrafficModel, lan_flow_ends, parse_rate  # noqa: E402
 from mcc.util import is_local_scope, parse_duration, split_hostport  # noqa: E402
 
 TESTS = []
@@ -973,8 +974,9 @@ def t_mitigation_marks_threats():
 def t_setup_plan_apply_remove():
     with Env() as e:
         plan = e.hub.setup.plan()
-        eq([i["id"] for i in plan["items"]], ["flows", "syslog", "logrules", "droprules"], "items")
-        ok(all(i["status"] == "missing" for i in plan["items"]), "fresh router: all missing")
+        eq([i["id"] for i in plan["items"]], ["flows", "syslog", "logrules", "droprules", "lanfw", "lanhw"], "items")
+        ok(all(i["status"] == "missing" for i in plan["items"][:4]), "fresh router: all missing")
+        eq([i["status"] for i in plan["items"][4:]], ["optional", "optional"], "the LAN items are optional (they cost CPU)")
         ok(not e.world.flows_on(), "planning changes nothing")
         try:
             e.hub.setup.apply("nope", ["flows"])
@@ -1298,6 +1300,107 @@ def t_devices_identified_live():
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+
+# ============================================================================================
+# LAN: device to device
+# ============================================================================================
+@test
+def t_lan_view_model():
+    """Conversations between LAN devices: client (opened it) -> server; routed between networks or not; the
+    router's own traffic left out; LAN flow records oriented by the service port whichever way they ran."""
+    eq(classify_lan("TCP", 445), ("cloud", "LAN · SMB file sharing"), "SMB")
+    eq(classify_lan("TCP", 8009)[0], "streaming", "Cast")
+    eq(classify_lan("TCP", 1883)[0], "iot", "MQTT")
+    eq(classify_lan("TCP", 22)[0], "remote", "falls back to the Internet port table")
+    eq(classify_lan("TCP", 40001), ("other", "LAN"), "unknown")
+    names = {"192.168.88.10": "nas", "192.168.88.21": "laptop"}
+    tm = TrafficModel(lambda: [ipaddress.ip_network("192.168.88.0/24"), ipaddress.ip_network("192.168.20.0/24")],
+                      lambda: {"192.168.88.1", "192.168.20.1"}, lambda ip: names.get(ip, ""))
+    tm.segment_of = lambda ip: "vlan20" if ip.startswith("192.168.20.") else "bridge"
+    tm.ingest_conns([
+        {".id": "*1", "src-address": "192.168.88.21:50000", "dst-address": "192.168.88.10:445",
+         "reply-src-address": "192.168.88.10:445", "reply-dst-address": "192.168.88.21:50000", "protocol": "tcp",
+         "orig-rate": "8000000", "repl-rate": "1000000"},
+        {".id": "*2", "src-address": "192.168.20.11:40000", "dst-address": "192.168.88.70:1883",
+         "reply-src-address": "192.168.88.70:1883", "reply-dst-address": "192.168.20.11:40000", "protocol": "tcp",
+         "orig-rate": "4000", "repl-rate": "3000"},
+        {".id": "*3", "src-address": "192.168.88.21:5353", "dst-address": "192.168.88.1:53",
+         "reply-src-address": "192.168.88.1:53", "reply-dst-address": "192.168.88.21:5353", "protocol": "udp",
+         "orig-rate": "1000", "repl-rate": "1000"},
+        {".id": "*4", "src-address": "192.168.88.21:50001", "dst-address": "142.250.72.46:443",
+         "reply-src-address": "142.250.72.46:443", "reply-dst-address": "198.51.100.2:50001", "protocol": "tcp",
+         "orig-rate": "1000", "repl-rate": "5000"},
+    ], 100.0)
+    lan = tm.snapshot(100.0)["lan"]
+    eq(len(lan["pairs"]), 2, "two device-to-device conversations (DNS to the router and the Internet left out)")
+    smb = next(p for p in lan["pairs"] if p["port"] == 445)
+    eq((smb["client"], smb["server"], smb["service"], smb["up"], smb["down"], smb["routed"]),
+       ("192.168.88.21", "192.168.88.10", "SMB 445", 8e6, 1e6, False), "laptop -> NAS, same network")
+    mqtt = next(p for p in lan["pairs"] if p["port"] == 1883)
+    eq((mqtt["routed"], mqtt["segments"]), (True, ["vlan20", "bridge"]), "IoT VLAN -> main network is routed")
+    eq((lan["to_servers_bps"], lan["routed_bps"]), (8e6 + 4000, 7000.0), "totals")
+    roles = {d["ip"]: d["role"] for d in lan["devices"]}
+    eq((roles["192.168.88.10"], roles["192.168.88.21"]), ("server", "client"), "roles")
+    nas = next(d for d in lan["devices"] if d["ip"] == "192.168.88.10")
+    eq((nas["sent"], nas["received"], nas["serves"]), (1e6, 8e6, ["SMB 445"]), "the server's side")
+    eq([v["label"] for v in lan["services"]], ["SMB 445", "MQTT 1883"], "services, busiest first")
+    # flow records: the reply direction (server -> client) must not look like a second conversation
+    f_req = {"src": "192.168.88.21", "dst": "192.168.88.10", "sport": 50000, "dport": 445}
+    f_rep = {"src": "192.168.88.10", "dst": "192.168.88.21", "sport": 445, "dport": 50000}
+    eq(lan_flow_ends(f_req), ("192.168.88.21", "192.168.88.10", 445, True), "request")
+    eq(lan_flow_ends(f_rep), ("192.168.88.21", "192.168.88.10", 445, False), "reply: same conversation, other way")
+
+
+@test
+def t_lan_visibility_live():
+    """Against the simulator (an RB5009 with switch-chip offload): routed traffic is seen at once; same-network
+    traffic only once the bridge sends it through the firewall AND the switch chip stops forwarding it itself;
+    never what stays inside the CRS309. Removal puts the router back."""
+    with Env() as e:
+        lan = lambda: (e.hub.refresh_soon("conns"), e.hub.snapshot()["lan"])[1]  # noqa: E731
+        ok(wait_for(lambda: any(p["routed"] and p["port"] == 1883 for p in lan()["pairs"]), 15),
+           "IoT VLAN -> Home Assistant (routed) visible from the start")
+        ok(not any(not p["routed"] for p in lan()["pairs"]), "nothing within one network yet")
+        vis = lan()["visibility"]
+        eq((vis["bridge_firewall"], vis["offloaded"]), (False, ["ether2", "ether3", "ether4", "ether5", "sfp-sfpplus1"]),
+           "MCC reads the bridge settings")
+        eq([s["iface"] for s in vis["segments"]], ["bridge", "vlan20-iot"], "and the networks")
+        port = next(p for p in lan()["ports"] if p["name"] == "sfp-sfpplus1")
+        ok(port["device_count"] >= 3 and port["hw"], "per-port: devices behind it, forwarded by the switch chip")
+        ok(wait_for(lambda: (lambda pt: pt["seen_pct"] is not None and pt["seen_pct"] < 80)(
+            next(p for p in lan()["ports"] if p["name"] == "sfp-sfpplus1")), 10),
+           "much of the NAS port's traffic can't be put to a conversation")
+        plan = e.hub.setup.plan()
+        lanfw = next(i for i in plan["items"] if i["id"] == "lanfw")
+        eq([c["cli"] for c in lanfw["changes"]], ["/interface bridge settings set use-ip-firewall=yes"], "the exact command")
+        ok("forward-chain" in lanfw["detail"] and "CPU" in lanfw["detail"], "and what it costs")
+        e.hub.setup.apply(plan["id"], ["lanfw"])
+        eq(e.world.single["/interface/bridge/settings"]["use-ip-firewall"], "true", "applied")
+        time.sleep(5)
+        ok(not any(not p["routed"] for p in lan()["pairs"]), "still nothing: the switch chip forwards it in hardware")
+        plan = e.hub.setup.plan()
+        eq(next(i for i in plan["items"] if i["id"] == "lanfw")["status"], "installed", "re-plan")
+        e.hub.setup.apply(plan["id"], ["lanhw"])
+        ok(wait_for(lambda: any(p["service"] == "Plex 32400" and not p["routed"] for p in lan()["pairs"]), 15),
+           "now same-network conversations show (TV -> NAS Plex)")
+        pairs = lan()["pairs"]
+        ok(any(p["client"] == "192.168.88.21" and p["server"] == "192.168.88.10" and p["port"] == 445 for p in pairs),
+           "laptop -> NAS SMB")
+        ok(not any(p["client"] == "192.168.88.20" and p["server"] == "192.168.88.10" for p in pairs),
+           "but never what stays inside the CRS309 (workstation -> NAS)")
+        ok(wait_for(lambda: e.hub.fingerprints.hints("00:11:32:10:00:10") and any(
+            k == "serve:445" for k, _ in e.hub.fingerprints.hints("00:11:32:10:00:10")), 10),
+           "LAN conversations feed device identification (the NAS serves SMB)")
+        rp = e.hub.setup.removal_plan()
+        clis = [c["cli"] for c in rp["items"][0]["changes"]]
+        ok("/interface bridge settings set use-ip-firewall=no" in clis and
+           "/interface bridge port set [find interface=ether2] hw=yes" in clis, "removal puts both back: {}".format(clis))
+        e.hub.setup.apply(rp["id"], ["remove"])
+        eq(e.world.single["/interface/bridge/settings"]["use-ip-firewall"], "false", "bridge firewall off again")
+        ok(all(e.world.hw_offloaded(n) for n in ("ether2", "ether3", "ether4", "ether5", "sfp-sfpplus1")), "offload back on")
+        full = e.hub.full_state()
+        ok(full["history"]["lan"], "LAN throughput history for the chart")
 
 
 # ============================================================================================

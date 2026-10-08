@@ -4,6 +4,7 @@ A self-contained NOC console for a MikroTik network: a **RouterOS 7** router and
 
 - **Live telemetry**: throughput, CPU, memory, temperature, every interface and switch port.
 - **A live traffic map**: who on your LAN is talking to whom on the Internet, at what rate, animated as it happens.
+- **Device-to-device traffic**: which devices inside your network talk to each other (backups to the NAS, casting, printing, IoT to Home Assistant), and an honest account of what the router can and can't see.
 - **Threat detection**: port scans, brute force, router login guessing, floods, worm-like spreading, blocklisted addresses, unusual uploads, new devices, link failures.
 - **Device identification**: what each device is (an iPhone, a Brother printer, a Wyze camera, an ESP32 smart plug), with the evidence, so a new device is recognisable the moment it joins.
 - **Interactive responses**: block an address, quarantine a host, drop its connections, disable a port. Each one is shown as the exact router change, applied only when you confirm, logged, and undoable.
@@ -57,6 +58,7 @@ MCC itself still never writes a password. Use a dedicated, limited RouterOS user
 
 `--demo` starts a simulated RB5009 and CRS309 with a small LAN:
 - a NAS, a workstation, a TV, a gaming PC, cameras, a homelab with an SSH port forward;
+- an IoT VLAN (a smart plug and a thermostat talking to Home Assistant), and devices using each other: backups to the NAS, Plex, casting, printing, a camera recorded by Home Assistant. The router's switch chip forwards between its ports in hardware, as an RB5009's does, so the LAN page shows that traffic only after you approve the two LAN items in Setup;
 - a repeating script of incidents: SSH brute force, router login guessing, a port scan, a camera that starts spreading like a worm, a beacon to a blocklisted server, a new device (in turn: an ESP32 smart plug, a Galaxy phone, an iPhone with a private address, a Wyze camera), a link flap, a large upload, and an IRC connection.
 
 The simulated router behaves like the real one:
@@ -92,7 +94,7 @@ Even with no router changes, MCC works from the REST API alone:
 - the router's in-memory log, for login failures;
 - interfaces, health and devices.
 
-**Setup › Review the router changes MCC needs** reads the router and shows the exact commands for four optional additions. Each is shown as a terminal command and as the REST call:
+**Setup › Review the router changes MCC needs** reads the router and shows the exact commands for four telemetry additions, and two more for seeing traffic between devices. Each is shown as a terminal command and as the REST call:
 
 | Item | What it adds | Why |
 |---|---|---|
@@ -100,6 +102,8 @@ Even with no router changes, MCC works from the REST API alone:
 | Syslog to MCC | a `remote` logging action + rules for `firewall`, `critical`, `interface` (UDP 5514) | Real-time scan, login and link events |
 | Log inbound attempts | two non-blocking `action=log` filter rules (`MCC-IN`, `MCC-FWD`), rate-limited | See every attempt from the Internet, whatever your later rules do |
 | Drop rules | raw `drop` for `mcc-blocked`, forward `drop` for `mcc-quarantine` | Makes MCC's lists work; both start empty |
+| See traffic between devices on the same network *(optional, unticked)* | `/interface bridge settings set use-ip-firewall=yes` | Device-to-device traffic within one network reaches connection tracking; see [the LAN page](#device-to-device-the-lan-page) for the cost |
+| Also see what the switch chip forwards in hardware *(optional, unticked)* | `/interface bridge port set [find interface=…] hw=no` for each hardware-offloaded port | The only way to see traffic between ports the switch chip forwards itself; costs CPU at high LAN rates |
 
 Choose the items you want and approve. MCC applies the plan you looked at, never a fresh one, and refuses a plan older than 10 minutes. Everything it adds carries an `mcc:` comment or the `mcc` name.
 
@@ -238,6 +242,39 @@ Every conversation is classified into one of these types:
 
 This is an informed guess from names and ports, not deep packet inspection. A CDN that serves several services shows as whatever its name says, and encrypted traffic to an unrecognised name is "web". Each type keeps the same colour in every theme.
 
+## Device to device: the LAN page
+
+The **LAN** page shows traffic between devices inside your network: who serves what to whom.
+
+- **The map:** servers on the left (they answer connections: a NAS, a printer, Home Assistant), clients on the right (they open them), the LAN between them. Particles flow toward the clients for what servers send them, and toward the servers for uploads.
+- **Services on the LAN:** SMB, NFS, Plex, Cast, AirPlay, RTSP camera streams, printing, MQTT, Home Assistant and so on, with how many servers and clients use each.
+- **Devices talking on the LAN:** each device's role (server, client or both), what it serves and uses, how many devices it talks to, and its rates.
+- **Conversations:** every client → server pair, its service and type, and its path: *same network*, or *routed* between two of your networks (for example `vlan20-iot → bridge`).
+- **Where it flows:** the share within one network versus routed between networks, and your networks.
+- **LAN ports: what MCC can see:** each router port, the devices behind it (from the bridge host table), whether the switch chip forwards it in hardware, and how much of its traffic MCC could put a conversation to. The rest is traffic MCC can't see; the **Not attributed** figure at the top adds it up.
+
+Open a device (click it on the map or in a list) and the map narrows to its conversations. Esc shows everything again.
+
+### What the router can see
+
+Where traffic is switched decides whether the router ever sees it:
+
+| Traffic | Visible? |
+|---|---|
+| **Routed between your networks** (VLANs, subnets) | Always: it passes the router's firewall and connection tracking. |
+| **Within one network, through the router's bridge** | Only after **See traffic between devices on the same network** (`use-ip-firewall=yes`). Otherwise the bridge forwards it without the firewall seeing it. |
+| **Within one network, between ports the switch chip forwards itself** (hardware offload, `hw=yes`) | Only after **Also see what the switch chip forwards in hardware** too. Until then RouterOS only counts it. |
+| **Inside another switch or Wi-Fi access point** | Never: it doesn't reach the router. The switch's own port rates show it, and the LAN ports table shows the share MCC can't attribute. |
+
+**What the two Setup items cost.** Both are unticked in the plan; it shows their exact commands and their cost.
+- **`use-ip-firewall=yes`:**
+  - **CPU:** bridged traffic loses the bridge fast path and FastTrack, and runs through the firewall.
+  - **Your filter rules:** your forward-chain rules then apply between devices on the same network too, and MCC's quarantine then cuts a device off from the LAN as well as the Internet.
+- **Hardware offload off:** every packet between those ports goes through the CPU. A multi-gigabit transfer, such as a NAS backup, can saturate it and slow the network.
+- **Undoing them:** **Plan removal of everything MCC added** puts back both settings MCC changed.
+
+Without either item, the page still shows routed traffic, every port's rate, and which devices are behind each port.
+
 ## VPN tunnels
 
 The **VPN** page shows everything going through your VPN tunnel(s), and nothing else.
@@ -369,7 +406,7 @@ mcc.py               entry point (--demo, --bind, --port, --speed, --data)
 mcc/routeros.py      RouterOS 7 REST client, certificate pinning, CLI rendering
 mcc/swos.py          read-only SwOS reader
 mcc/collectors.py    IPFIX / NetFlow v9 / v5 and syslog listeners + RouterOS log parsing
-mcc/traffic.py       traffic model (connection table + flows -> hosts, peers, conversations)
+mcc/traffic.py       traffic model (connection table + flows -> hosts, peers, conversations; LAN device to device)
 mcc/detect.py        threat rules, blocklist
 mcc/actions.py       propose / confirm / undo engine with safety rails and audit log
 mcc/setup_plan.py    telemetry setup and removal plans
@@ -400,6 +437,9 @@ SHOTS=out python tools/ui_check.py # ...and saves screenshots
 
 - **IPv6:** blocking and quarantine work for IPv6 addresses, but the traffic view and flow detection are IPv4-first.
 - **Geolocation is approximate:** IP geolocation places a server at its registered or data-centre location, not exactly where the content comes from. Anycast services (Cloudflare, Google DNS) show one location for many places. Country-level databases put every peer at the middle of its country.
+- **Device-to-device traffic:**
+  - **Where the router sees it:** only traffic that passes the router's firewall is seen as conversations (see [the LAN page](#device-to-device-the-lan-page)). Traffic inside another switch or access point shows only as port rates.
+  - **Not scanned for threats:** detection rules look at Internet traffic; LAN conversations aren't scanned for lateral movement yet.
 - **Identification is a best guess:**
   - **Private MACs:** a device with a private (randomized) MAC has no vendor by design.
   - **What MCC can't see:** it isn't on your LAN's wire, so it can't read mDNS, SSDP or the DHCP request fingerprint.

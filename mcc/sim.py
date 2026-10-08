@@ -63,6 +63,28 @@ HOSTS = [
      [("api.wyzecam.com", 443, "tcp", 0.05, 1.2, 1)]),
     ("192.168.88.60", "00:1B:A9:00:00:60", "printer", "ether5", 0,
      [("time.cloudflare.com", 123, "udp", 0.001, 0.001, 1)]),
+    # the IoT VLAN (vlan20-iot, 192.168.20.0/24): routed to the main network, so the router sees what crosses
+    ("192.168.20.11", "84:00:EC:3A:1F:2C", "shellyplug-s-3A1F2C", "ether5", 0,
+     [("shelly-103-eu.shelly.cloud", 443, "tcp", 0.002, 0.002, 1)]),
+    ("192.168.20.12", "44:61:32:20:00:12", "ecobee-thermostat", "ether5", 0,
+     [("api.ecobee.com", 443, "tcp", 0.004, 0.002, 1)]),
+]
+IOT_VLAN, IOT_NET = "vlan20-iot", "192.168.20."
+
+# Device-to-device traffic: (client, server, port, proto, to the client Mb/s, to the server Mb/s, conns).
+# What the router sees of it depends on where it is switched -- see World.lan_visible.
+LAN_FLOWS = [
+    ("192.168.88.21", "192.168.88.10", 445, "tcp", 2.0, 18.0, 1),     # the laptop backs up to the NAS over SMB
+    ("192.168.88.20", "192.168.88.10", 445, "tcp", 30.0, 4.0, 2),     # the workstation's files: inside the CRS309
+    ("192.168.88.70", "192.168.88.10", 2049, "tcp", 6.0, 3.0, 1),     # the homelab mounts the NAS: inside it too
+    ("192.168.88.30", "192.168.88.10", 32400, "tcp", 14.0, 0.2, 1),   # the TV plays a film from Plex on the NAS
+    ("192.168.88.22", "192.168.88.30", 8009, "tcp", 0.05, 0.2, 1),    # the phone casts to the TV
+    ("192.168.88.70", "192.168.88.50", 554, "tcp", 3.0, 0.05, 1),     # Home Assistant records the camera
+    ("192.168.88.21", "192.168.88.60", 631, "tcp", 0.01, 0.4, 1),     # the laptop prints
+    ("192.168.88.40", "192.168.88.10", 445, "tcp", 5.0, 0.5, 1),      # the gaming PC's library on the NAS
+    ("192.168.20.11", "192.168.88.70", 1883, "tcp", 0.004, 0.004, 1),  # IoT VLAN -> Home Assistant's MQTT broker
+    ("192.168.20.12", "192.168.88.70", 1883, "tcp", 0.004, 0.006, 1),
+    ("192.168.88.70", "192.168.20.12", 80, "tcp", 0.01, 0.002, 1),    # Home Assistant polls the thermostat
 ]
 
 SERVICES = {
@@ -74,7 +96,7 @@ SERVICES = {
     "time.cloudflare.com": "162.159.200.1", "irc.libera.chat": "203.0.113.200", "update-check.biz": "192.0.2.66",
     "www.msftconnecttest.com": "13.107.4.52", "captive.apple.com": "17.253.144.11",
     "courier.push.apple.com": "17.57.146.20", "connectivitycheck.gstatic.com": "142.250.72.35",
-    "m1.tuyaus.com": "52.40.130.12",
+    "m1.tuyaus.com": "52.40.130.12", "shelly-103-eu.shelly.cloud": "3.120.10.44", "api.ecobee.com": "52.20.33.17",
 }
 # DHCP vendor class (option 60) some clients send; RouterOS shows it on the lease
 CLASS_IDS = {"192.168.88.20": "MSFT 5.0", "192.168.88.40": "MSFT 5.0", "192.168.88.50": "udhcp 1.24.1",
@@ -244,6 +266,15 @@ class World:
                                     "mtu": 1500})
         self.add("/interface", {"name": "bridge", "type": "bridge", "running": True, "disabled": False,
                                 "rx-byte": 0, "tx-byte": 0, "mac-address": "48:A9:8A:00:00:10", "comment": "defconf"})
+        self.add("/interface", {"name": IOT_VLAN, "type": "vlan", "running": True, "disabled": False, "rx-byte": 0,
+                                "tx-byte": 0, "rx-packet": 0, "tx-packet": 0, "comment": "IoT", "mtu": 1500})
+        self.add("/ip/address", {"address": IOT_NET + "1/24", "network": IOT_NET + "0", "interface": IOT_VLAN})
+        # LAN ports on the bridge: the RB5009's switch chip forwards between them in hardware
+        for name in ROUTER_PORTS[1:]:
+            self.add("/interface/bridge/port", {"interface": name, "bridge": "bridge", "hw": True, "hw-offload": True,
+                                                "disabled": False, "inactive": False})
+        self.single["/interface/bridge/settings"] = {"use-ip-firewall": "false", "use-ip-firewall-for-vlan": "false",
+                                                     "allow-fast-path": "true"}
         self.add("/interface", {"name": VPN_IF, "type": "wg", "running": True, "disabled": False, "rx-byte": 0,
                                 "tx-byte": 0, "rx-packet": 0, "tx-packet": 0, "comment": "ProtonVPN CH#12", "mtu": 1420})
         self.add("/interface/wireguard", {"name": VPN_IF, "listen-port": 13231, "mtu": 1420, "running": True})
@@ -321,10 +352,34 @@ class World:
                                            "status": "bound", "dynamic": True, "last-seen": "5s",
                                            "active-address": ip, "active-mac-address": mac,
                                            **({"class-id": self.class_ids[ip]} if ip in self.class_ids else {})})
-        self.add("/ip/arp", {"address": ip, "mac-address": mac, "interface": "bridge", "dynamic": True,
-                             "complete": True, "status": "reachable"})
+        self.add("/ip/arp", {"address": ip, "mac-address": mac, "interface": IOT_VLAN if ip.startswith(IOT_NET) else "bridge",
+                             "dynamic": True, "complete": True, "status": "reachable"})
         self.add("/interface/bridge/host", {"mac-address": mac, "on-interface": rport, "interface": "bridge",
                                             "local": False, "dynamic": True})
+
+    # -- device-to-device traffic: what the router can see of it -------------------------------
+    def port_of(self, ip: str) -> str:
+        return next((h[3] for h in self.host_list() if h[0] == ip), "")
+
+    def hw_offloaded(self, port: str) -> bool:
+        return any(r.get("interface") == port and r.get("hw-offload") == "true"
+                   for r in self.tables["/interface/bridge/port"])
+
+    def lan_visible(self, c: Dict[str, Any]) -> bool:
+        """Like a real RouterOS bridge: traffic routed between networks always crosses the firewall; within one
+        network only when the bridge sends it there (use-ip-firewall) and the switch chip doesn't forward it
+        itself; never when it's switched before it reaches the router (behind one AP or switch)."""
+        if c["_kind"] != "lan":
+            return True
+        a, b = c["_src"], c["_dst"]
+        if a.rsplit(".", 1)[0] != b.rsplit(".", 1)[0]:
+            return True
+        pa, pb = self.port_of(a), self.port_of(b)
+        if pa == pb:
+            return False
+        if self.single["/interface/bridge/settings"].get("use-ip-firewall") != "true":
+            return False
+        return not (self.hw_offloaded(pa) and self.hw_offloaded(pb))
 
     # -- helpers -------------------------------------------------------------------------------
     def log(self, topics: str, msg: str) -> None:
@@ -384,12 +439,13 @@ class World:
         self.conn_seq += 1
         cid = "*{:X}".format(self.conn_seq)
         inbound = bool(nat_to)
-        vpn = not inbound and src in VPN_HOSTS and self.iface_up(VPN_IF)
+        lan = kind == "lan"  # device to device: no NAT, no tunnel
+        vpn = not inbound and not lan and src in VPN_HOSTS and self.iface_up(VPN_IF)
         c = {".id": cid, "protocol": proto, "src-address": "{}:{}".format(src, sport),
              "dst-address": "{}:{}".format(dst, dport),
              "reply-src-address": "{}:{}".format(nat_to or dst, dport),
-             "reply-dst-address": "{}:{}".format(src if inbound else VPN_IP if vpn else WAN_IP,
-                                                 sport if inbound else self.rng.randint(20000, 60000)),
+             "reply-dst-address": "{}:{}".format(src if inbound or lan else VPN_IP if vpn else WAN_IP,
+                                                 sport if inbound or lan else self.rng.randint(20000, 60000)),
              "orig-bytes": 0, "repl-bytes": 0, "orig-packets": 0, "repl-packets": 0,
              "tcp-state": state if proto == "tcp" else "", "timeout": "23h59m59s",
              "_up": up, "_down": down, "_born": time.time(), "_life": life, "_kind": kind, "_host": host,
@@ -404,7 +460,7 @@ class World:
     def _spawn_apps(self, now: float) -> None:
         per_host: Dict[Tuple[str, str], int] = defaultdict(int)
         for c in self.conns.values():
-            if c["_kind"] == "app":
+            if c["_kind"] in ("app", "lan"):
                 per_host[(c["_host"], c["_dst"] + ":" + str(c["_dport"]))] += 1
         for ip, mac, name, rport, sport, apps in self.host_list():
             if not self.iface_up(rport) or self.quarantined(ip):
@@ -418,6 +474,17 @@ class World:
                     per_host[key] += 1
                     self.new_conn(ip, self.rng.randint(40000, 65000), rip, port, proto,
                                   up * 1e6 / n, down * 1e6 / n, self.rng.uniform(25, 140), "app", ip)
+        hosts = {h[0]: h for h in self.host_list()}
+        for client, server, port, proto, to_client, to_server, n in LAN_FLOWS:
+            hc, hs = hosts.get(client), hosts.get(server)
+            if not hc or not hs or not self.iface_up(hc[3]) or not self.iface_up(hs[3]) or \
+                    self.quarantined(client) or self.quarantined(server):
+                continue
+            key = (client, server + ":" + str(port))
+            while per_host[key] < n:
+                per_host[key] += 1
+                self.new_conn(client, self.rng.randint(40000, 65000), server, port, proto, to_server * 1e6 / n,
+                              to_client * 1e6 / n, self.rng.uniform(40, 160), "lan", client)
         # the homelab seeds Linux ISOs: a BitTorrent swarm of unnamed peers on random high ports,
         # some it dials (from its listen port 51413) and some that dial in through a port forward
         if self.iface_up("sfp-sfpplus1") and not self.quarantined("192.168.88.70"):
@@ -628,6 +695,8 @@ class World:
         if now - self.last_flow_export >= 5.0:
             self.last_flow_export = now
             for c in self.conns.values():
+                if not self.lan_visible(c):
+                    continue
                 ob, rb = int(c["orig-bytes"]), int(c["repl-bytes"])
                 eo, er = c["_exported"]
                 proto = 6 if c["protocol"] == "tcp" else 17
@@ -694,6 +763,10 @@ class World:
                 if h and (not self.iface_up(h[3]) or self.quarantined(h[0])):
                     del self.conns[cid]
                     continue
+                hs = hosts.get(c["_dst"]) if c["_kind"] == "lan" else None
+                if hs and (not self.iface_up(hs[3]) or self.quarantined(hs[0])):
+                    del self.conns[cid]
+                    continue
                 if c["_in"] and self.blocked(c["_src"]) or (not c["_in"] and self.blocked(c["_dst"])):
                     del self.conns[cid]
                     continue
@@ -709,6 +782,9 @@ class World:
                 c["orig-packets"] = int(c["orig-packets"]) + max(1, int(o_bps * dt / 9600))
                 c["repl-packets"] = int(c["repl-packets"]) + max(1, int(r_bps * dt / 9600))
                 c["orig-rate"], c["repl-rate"] = int(o_bps), int(r_bps)
+                if c["_kind"] == "lan":
+                    self._lan_counters(c, up, down, hosts, port_rx, port_tx, sw_rx, sw_tx)
+                    continue
                 wan_rx += down
                 wan_tx += up
                 if c.get("_vpn"):
@@ -765,6 +841,28 @@ class World:
                                                         if not e.get("_dead")]
             self._export(now)
 
+    @staticmethod
+    def _lan_counters(c: Dict[str, Any], up: float, down: float, hosts: Dict[str, Any], port_rx: Dict[str, float],
+                      port_tx: Dict[str, float], sw_rx: List[float], sw_tx: List[float]) -> None:
+        """Device-to-device bytes on the ports they cross. up = client -> server, down = server -> client."""
+        hc, hs = hosts.get(c["_src"]), hosts.get(c["_dst"])
+        if not hc or not hs:
+            return
+        routed = c["_src"].rsplit(".", 1)[0] != c["_dst"].rsplit(".", 1)[0]
+        if hc[3] != hs[3] or routed:  # it crosses the router (bridge or routing)
+            port_rx[hc[3]] += up
+            port_tx[hc[3]] += down
+            port_rx[hs[3]] += down
+            port_tx[hs[3]] += up
+        inside = [(h, sent, got) for h, sent, got in ((hc, up, down), (hs, down, up)) if h[4]]
+        for h, sent, got in inside:  # behind the CRS309
+            sw_rx[h[4]] += sent
+            sw_tx[h[4]] += got
+        if len(inside) == 1:  # one end outside the switch: through its uplink to the router
+            _h, sent, got = inside[0]
+            sw_tx[1] += sent
+            sw_rx[1] += got
+
     def run(self) -> None:
         last = time.time()
         while not self._stop.is_set():
@@ -798,7 +896,8 @@ class World:
 # ----------------------------------------------------------------------------------------------
 # Fake RouterOS REST
 # ----------------------------------------------------------------------------------------------
-SINGLETONS = {"/system/resource", "/system/identity", "/ip/traffic-flow", "/system/health"}
+SINGLETONS = {"/system/resource", "/system/identity", "/ip/traffic-flow", "/system/health",
+              "/interface/bridge/settings"}
 
 
 def make_router(world: World, user: str = "admin", password: str = "demo", bind: str = "127.0.0.1",
@@ -869,7 +968,7 @@ def make_router(world: World, user: str = "admin", password: str = "demo", bind:
 
     def table(path: str) -> List[Dict[str, Any]]:
         if path == "/ip/firewall/connection":
-            return list(world.conns.values())
+            return [c for c in world.conns.values() if world.lan_visible(c)]
         if path == "/log":
             return world.logs
         if path not in world.tables:
@@ -912,6 +1011,8 @@ def make_router(world: World, user: str = "admin", password: str = "demo", bind:
             if method == "PATCH":
                 for k, v in body.items():
                     row[k] = {"yes": "true", "no": "false"}.get(str(v), str(v))
+                if menu == "/interface/bridge/port" and "hw" in body:
+                    row["hw-offload"] = row["hw"]  # this switch chip offloads whenever asked to
                 if menu == "/interface" and "disabled" in body:
                     disabled = row["disabled"] == "true"
                     row["running"] = "false" if disabled else "true"

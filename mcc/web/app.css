@@ -608,3 +608,13 @@ table.t tr.leakrow td:first-child { box-shadow: inset 2px 0 0 var(--crit); }
 .clues li.faint .src { opacity: .7; }
 h4.mini { margin: 0 0 8px; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); font-weight: 600; }
 .tcard .clues { margin: 4px 0 2px; }
+
+/* ---------- LAN: device to device ---------- */
+.lan-vis { margin-bottom: 14px; }
+.lan-devs { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: center; }
+.lan-dev { display: inline-flex; align-items: center; gap: 5px; padding: 1px 8px 1px 6px; border: 1px solid var(--line-soft); border-radius: 999px;
+           font-size: 12px; cursor: pointer; white-space: nowrap; }
+.lan-dev:hover { border-color: var(--accent); }
+.lan-dev .kicon { width: 14px; height: 14px; }
+.who-row > .kicon { margin-right: 0; }
+

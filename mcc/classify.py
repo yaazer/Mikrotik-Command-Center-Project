@@ -98,6 +98,21 @@ PORTS: List[Tuple[str, Optional[str], Iterable[int]]] = [
     ("social", TCP, [6667, 6697, 5223]),
     ("web", None, [80, 443, 8080, 8443]),
 ]
+# Device-to-device traffic inside the network: what the service port says it is.
+# port -> (category, what it is). Anything else falls back to the Internet port table above.
+LAN_PORTS: Dict[int, Tuple[str, str]] = {
+    445: ("cloud", "SMB file sharing"), 139: ("cloud", "NetBIOS file sharing"), 548: ("cloud", "AFP file sharing"),
+    2049: ("cloud", "NFS"), 111: ("cloud", "NFS portmapper"), 873: ("cloud", "rsync backup"),
+    3260: ("cloud", "iSCSI storage"), 5000: ("cloud", "NAS admin (DSM)"), 5001: ("cloud", "NAS admin (DSM)"),
+    8009: ("streaming", "Google Cast"), 8008: ("streaming", "Google Cast"), 7000: ("streaming", "AirPlay"),
+    7100: ("streaming", "AirPlay"), 554: ("streaming", "RTSP camera stream"), 32400: ("streaming", "Plex"),
+    8096: ("streaming", "Jellyfin"), 8200: ("streaming", "DLNA media"), 1400: ("streaming", "Sonos"),
+    1883: ("iot", "MQTT"), 8883: ("iot", "MQTT over TLS"), 8123: ("iot", "Home Assistant"),
+    6053: ("iot", "ESPHome"), 5683: ("iot", "CoAP"), 631: ("other", "IPP printing"),
+    9100: ("other", "raw printing (JetDirect)"), 515: ("other", "LPD printing"),
+    3389: ("remote", "Remote Desktop"), 5900: ("remote", "VNC"), 22: ("remote", "SSH"),
+    53: ("infra", "DNS"), 67: ("infra", "DHCP"), 123: ("infra", "NTP"), 161: ("infra", "SNMP"),
+}
 _PORT_MAP: Dict[Tuple[Optional[str], int], str] = {}
 for _cat, _proto, _ports in PORTS:
     for _p in _ports:
@@ -144,13 +159,27 @@ def classify(proto: str, port: int, name: str = "") -> Tuple[str, str]:
     return "other", ""
 
 
+def classify_lan(proto: str, port: int) -> Tuple[str, str]:
+    """A conversation between two devices on your network -> (category id, why)."""
+    proto = (proto or "").upper()
+    hit = LAN_PORTS.get(port)
+    if hit:
+        return hit[0], "LAN · {}".format(hit[1])
+    if proto in ("ICMP", "ICMPV6"):
+        return "infra", "LAN · ICMP"
+    cat = by_port(proto, port)
+    if cat:
+        return cat, "LAN · {} port {}".format(proto.lower(), port)
+    return "other", "LAN"
+
+
 def apply(pairs: Iterable[Dict[str, Any]], name_of) -> None:
     """Label each pair in place with cat / cat_why, including the P2P pattern across a host's pairs."""
     pairs = list(pairs)
     unnamed_high: Dict[str, set] = {}
     for p in pairs:
         if p.get("dir") == "lan":
-            p["cat"], p["cat_why"] = "other", "LAN"
+            p["cat"], p["cat_why"] = classify_lan(p["proto"], int(p.get("port") or 0))
             continue
         name = name_of(p["remote"])
         p["cat"], p["cat_why"] = classify(p["proto"], int(p.get("port") or 0), name)
