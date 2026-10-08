@@ -26,6 +26,10 @@ SERVICES = {
     5353: "mDNS", 5900: "VNC", 8080: "HTTP-alt", 8291: "Winbox", 8443: "HTTPS-alt", 8728: "RouterOS API",
     8729: "RouterOS API-SSL", 9001: "Tor", 19302: "Google STUN", 51820: "WireGuard", 6667: "IRC",
     32400: "Plex", 27015: "Steam",
+    # services devices offer each other on the LAN
+    139: "NetBIOS", 548: "AFP", 554: "RTSP", 631: "IPP", 873: "rsync", 1400: "Sonos", 2049: "NFS",
+    3260: "iSCSI", 5000: "DSM", 5001: "DSM", 6053: "ESPHome", 7000: "AirPlay", 8008: "Cast", 8009: "Cast",
+    8096: "Jellyfin", 8123: "Home Assistant", 9100: "JetDirect", 515: "LPD", 62078: "iOS sync",
 }
 
 _RATE = re.compile(r"^\s*([\d.]+)\s*([kKMGT]?)(?:bps|b/s)?\s*$")
@@ -69,6 +73,9 @@ class TrafficModel:
         # which router interface a connection left (or arrived) by: path_of(direction, src, dst, reply_dst)
         # -> interface name, or "" when the connection table doesn't say (set by the hub)
         self.path_of: Callable[[str, str, str, str], str] = lambda d, src, dst, rdst: ""
+        # the router interface (network) a LAN address belongs to: tells a conversation routed between two of
+        # your networks from one inside a single network (set by the hub)
+        self.segment_of: Callable[[str], str] = lambda ip: ""
 
     # -- classification ----------------------------------------------------------------------
     def side(self, ip: str) -> str:
@@ -191,12 +198,14 @@ class TrafficModel:
         for _ts, f in self.flows:
             local, remote = f["local"], f["remote"]
             proto = f["proto_name"]
+            if f["dir"] == "lan":  # either end may be first in a flow record: the service answers on the lower port
+                local, remote, port, up = lan_flow_ends(f)
             # the service port is the responder's
-            if f["src"] == local:
-                port = f["dport"] if f["dir"] in ("out", "lan") else f["sport"]
+            elif f["src"] == local:
+                port = f["dport"] if f["dir"] == "out" else f["sport"]
                 up = True
             else:
-                port = f["sport"] if f["dir"] in ("out", "lan") else f["dport"]
+                port = f["sport"] if f["dir"] == "out" else f["dport"]
                 up = False
             key = (local, remote, proto, port)
             p = pairs.get(key)
@@ -298,6 +307,7 @@ class TrafficModel:
         type_list = sorted(({**t, "hosts": len(t["hosts"]), "peers": len(t["peers"]), "bps": t["up"] + t["down"]}
                             for t in types.values()), key=lambda t: -t["bps"])
         vpn_view = self._vpn_view(pairs.values(), vpn or set(), set(vpn_required), blocked, threats, pinned)
+        lan_view = self._lan_view(pairs.values(), threats, pinned)
         return {
             "source": src,
             "conns": self.conn_count if src == "conntrack" else sum(p["conns"] for p in pairs.values()),
@@ -311,6 +321,7 @@ class TrafficModel:
             "services": sorted(services.values(), key=lambda s: -s["bps"])[:20],
             "types": type_list,
             "vpn": vpn_view,
+            "lan": lan_view,
         }
 
     def _vpn_view(self, pairs: Iterable[Dict[str, Any]], vpn: Set[str], required: Set[str], blocked: Set[str],
@@ -391,6 +402,98 @@ class TrafficModel:
                 "hosts": host_list[:60], "peers": peer_list[:60], "pairs": [pair_out(p) for p in through[:120]],
                 "outside": [pair_out(p) for p in outside[:60]]}
 
+    def _lan_view(self, pairs: Iterable[Dict[str, Any]], threats: Dict[str, str],
+                  pinned: Dict[str, bool]) -> Dict[str, Any]:
+        """Device-to-device traffic inside the network: who serves what to whom. local = the client (it opened
+        the connection), remote = the server; up = client -> server, down = server -> client. Traffic to or from
+        the router itself (DNS, Winbox...) isn't device to device and is left out."""
+        router = self.router_addrs()
+        servers: Dict[str, Dict[str, Any]] = {}
+        clients: Dict[str, Dict[str, Any]] = {}
+        devices: Dict[str, Dict[str, Any]] = {}
+        services: Dict[str, Dict[str, Any]] = {}
+        convs = []
+        tot = {"to_servers": 0.0, "to_clients": 0.0, "conns": 0, "routed": 0.0, "same": 0.0}
+
+        def dev(ip: str) -> Dict[str, Any]:
+            return devices.setdefault(ip, {"ip": ip, "name": self.name_of(ip), "sent": 0.0, "received": 0.0, "conns": 0,
+                                           "partners": set(), "serves": set(), "uses": set(), "_cats": [],
+                                           "segment": self.segment_of(ip)})
+
+        for p in pairs:
+            if p["dir"] != "lan" or p["local"] in router or p["remote"] in router:
+                continue
+            client, server, bps = p["local"], p["remote"], p["up"] + p["down"]
+            seg_c, seg_s = self.segment_of(client), self.segment_of(server)
+            routed = bool(seg_c and seg_s and seg_c != seg_s)
+            svc = service_label(p["proto"], p["port"])
+            cat = (p.get("cat", "other"), bps)
+            c = clients.setdefault(client, {"ip": client, "name": self.name_of(client), "up": 0.0, "down": 0.0,
+                                            "conns": 0, "servers": set(), "_cats": []})
+            c["up"] += p["up"]
+            c["down"] += p["down"]
+            c["conns"] += p["conns"]
+            c["servers"].add(server)
+            c["_cats"].append(cat)
+            r = servers.setdefault(server, {"ip": server, "name": self.name_of(server), "up": 0.0, "down": 0.0,
+                                            "conns": 0, "hosts": set(), "ports": set(), "services": set(), "_cats": []})
+            r["up"] += p["up"]
+            r["down"] += p["down"]
+            r["conns"] += p["conns"]
+            r["hosts"].add(client)
+            r["ports"].add(p["port"])
+            r["services"].add(svc)
+            r["_cats"].append(cat)
+            dc, ds = dev(client), dev(server)
+            dc["sent"] += p["up"]
+            dc["received"] += p["down"]
+            ds["sent"] += p["down"]
+            ds["received"] += p["up"]
+            for d, other in ((dc, server), (ds, client)):
+                d["conns"] += p["conns"]
+                d["partners"].add(other)
+                d["_cats"].append(cat)
+            dc["uses"].add(svc)
+            ds["serves"].add(svc)
+            sv = services.setdefault(svc, {"label": svc, "port": p["port"], "proto": p["proto"], "bps": 0.0, "conns": 0,
+                                           "servers": set(), "clients": set(), "cat": p.get("cat", "other")})
+            sv["bps"] += bps
+            sv["conns"] += p["conns"]
+            sv["servers"].add(server)
+            sv["clients"].add(client)
+            tot["to_servers"] += p["up"]
+            tot["to_clients"] += p["down"]
+            tot["conns"] += p["conns"]
+            tot["routed" if routed else "same"] += bps
+            convs.append({"client": client, "server": server, "proto": p["proto"], "port": p["port"], "service": svc,
+                          "up": p["up"], "down": p["down"], "conns": p["conns"], "cat": p.get("cat", "other"),
+                          "cat_why": p.get("cat_why", ""), "routed": routed, "segments": [seg_c, seg_s]})
+
+        def cats(x: Dict[str, Any]) -> Dict[str, Any]:
+            c, dom = classify.rollup(x.pop("_cats", []))
+            return {"cats": c, "cat": dom}
+
+        rate = lambda x: x["up"] + x["down"]  # noqa: E731
+        order = lambda x: (x["ip"] not in pinned, -rate(x))  # noqa: E731
+        mark = lambda ip: {"threat": threats.get(ip, ""), "pinned": ip in pinned}  # noqa: E731
+        server_list = sorted(({**r, "hosts": sorted(r["hosts"])[:12], "ports": sorted(r["ports"])[:8],
+                               "services": sorted(r["services"])[:6], **mark(ip), **cats(r)}
+                              for ip, r in servers.items()), key=order)
+        client_list = sorted(({**c, "peers": len(c["servers"]), "servers": sorted(c["servers"])[:12], **mark(ip),
+                               **cats(c)} for ip, c in clients.items()), key=order)
+        device_list = sorted(({**d, "partners": len(d["partners"]), "serves": sorted(d["serves"])[:6],
+                               "uses": sorted(d["uses"])[:6],
+                               "role": "both" if d["serves"] and d["uses"] else "server" if d["serves"] else "client",
+                               **mark(ip), **cats(d)} for ip, d in devices.items()),
+                             key=lambda d: (d["ip"] not in pinned, -(d["sent"] + d["received"])))
+        service_list = sorted(({**v, "servers": len(v["servers"]), "clients": len(v["clients"])}
+                               for v in services.values()), key=lambda v: -v["bps"])
+        convs.sort(key=lambda c: (not (c["client"] in pinned or c["server"] in pinned), -(c["up"] + c["down"])))
+        return {"to_servers_bps": tot["to_servers"], "to_clients_bps": tot["to_clients"], "conns": tot["conns"],
+                "routed_bps": tot["routed"], "same_bps": tot["same"], "pair_count": len(convs),
+                "servers": server_list[:40], "clients": client_list[:40], "devices": device_list[:80],
+                "services": service_list[:20], "pairs": convs[:150]}
+
     def host_detail(self, ip: str, now: Optional[float] = None) -> Dict[str, Any]:
         now = now or time.time()
         src = self.source(now)
@@ -403,3 +506,11 @@ class TrafficModel:
                        "local_name": self.name_of(p["local"])} for p in rows[:200]],
             "history": [[round(t, 1), round(d), round(u)] for t, d, u in self.host_hist.get(ip, [])],
         }
+
+
+def lan_flow_ends(f: Dict[str, Any]) -> Tuple[str, str, int, bool]:
+    """A flow record between two LAN devices -> (client, server, service port, did the client send it). Flow
+    records come in both directions and don't say who connected; the service answers on the lower port."""
+    if f["sport"] < f["dport"]:
+        return f["dst"], f["src"], f["sport"], False
+    return f["src"], f["dst"], f["dport"], True

@@ -141,6 +141,7 @@ function connectStream() {
       const mem = snap.router.mem_total ? snap.router.mem_used * 100 / snap.router.mem_total : 0;
       pushHist(S.hist.health, [t, snap.router.cpu, mem]);
     }
+    if (snap.lan) pushHist(S.hist.lan = S.hist.lan || [], [t, snap.lan.to_clients_bps, snap.lan.to_servers_bps]);
     for (const p of (snap.switch && snap.switch.ports) || []) {
       if (p.rx_bps != null) pushHist(S.hist.switch[p.n] = S.hist.switch[p.n] || [], [t, p.rx_bps, p.tx_bps || 0]);
     }
@@ -854,8 +855,9 @@ const cmdk = {
   search(q) {
     q = q.trim().toLowerCase();
     const out = [];
-    const pages = ["overview", "traffic", "vpn", "threats", "actions", "devices", "interfaces", "logs", "setup"];
-    pages.forEach((p) => out.push({ kind: "page", label: p[0].toUpperCase() + p.slice(1), run: () => go(p) }));
+    const pages = ["overview", "traffic", "lan", "vpn", "threats", "actions", "devices", "interfaces", "logs", "setup"];
+    const titles = { lan: "LAN: device to device", vpn: "VPN" };
+    pages.forEach((p) => out.push({ kind: "page", label: titles[p] || p[0].toUpperCase() + p.slice(1), key: p, run: () => go(p) }));
     out.push({ kind: "layout", label: "Reset this page's layout", run: () => Layout.resetPage() });
     out.push({ kind: "look & feel", label: "Open Theme Studio", key: "theme", run: () => Theme.open() });
     Theme.THEMES.forEach((t) => out.push({ kind: "theme", label: "Theme: " + t.label, key: "theme " + t.label.toLowerCase(),

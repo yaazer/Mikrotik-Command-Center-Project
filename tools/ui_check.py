@@ -104,6 +104,7 @@ def sc_pages(d: Demo, c: Check) -> None:
           "threat feed is never blank (cards or 'All quiet')")
         shot(b, "overview")
         for page, probe in (("traffic", "document.querySelectorAll('#pairs tr[data-ip]').length > 3"),
+                            ("lan", "document.querySelectorAll('#lan-ports tr').length > 3"),
                             ("threats", "document.querySelector('#tlist') !== null"),
                             ("actions", "document.querySelector('#history') !== null"),
                             ("devices", "document.querySelectorAll('#devs tr[data-ip]').length >= 9"),
@@ -121,7 +122,7 @@ def sc_setup(d: Demo, c: Check) -> None:
         b.nav(d.url + "#/setup")
         c(b.until("!!document.querySelector('#plan-load')", 10), "setup offers the plan")
         click(b, "#plan-load")
-        c(b.until("document.querySelectorAll('.plan-item').length === 4", 10), "plan lists 4 items")
+        c(b.until("document.querySelectorAll('.plan-item').length >= 5", 10), "plan lists the telemetry items and the LAN options")
         c(b.eval("document.querySelector('#plan').innerText.includes('/ip traffic-flow target add')"),
           "plan shows the exact terminal command")
         c(b.eval("document.querySelectorAll('[data-item]:checked').length === 4"), "missing items pre-selected")
@@ -133,7 +134,8 @@ def sc_setup(d: Demo, c: Check) -> None:
         c(d.world.flows_on() and d.world.log_rules(), "router now exports flows and logs attempts")
         c(b.until("document.querySelector('.chip[title*=\"records/s\"]') !== null", 25), "Flows chip goes live")
         click(b, "#plan-again")
-        c(b.until("document.querySelectorAll('.plan-item .pill.green').length === 4", 10), "re-review shows all installed")
+        c(b.until("['flows','syslog','logrules','droprules'].every(i => { const e = document.querySelector('[data-item=' + i + ']'); return !e || "
+          "e.closest('.plan-item').querySelector('.pill.green'); })", 10), "re-review shows all installed")
         # removal is planned and approved the same way
         b.nav(d.url + "#/overview")
         b.nav(d.url + "#/setup")
@@ -715,10 +717,53 @@ def sc_identify(d: Demo, c: Check) -> None:
         c(not b.errors, "no console errors: {}".format(b.errors[:3]))
 
 
+def sc_lan(d: Demo, c: Check) -> None:
+    """The LAN page: routed traffic at once; same-network traffic once the router is set to show it."""
+    with Browser(1600, 1000) as b:
+        b.nav(d.url + "#/lan")
+        c(b.until("S.snap.lan && S.snap.lan.pairs.some(p => p.service === 'MQTT 1883' && p.routed)", 20),
+          "traffic routed between networks (IoT VLAN -> Home Assistant) shows at once")
+        c(b.until("!!document.querySelector('#lan-vis .callout.warn')", 5), "and the page says same-network traffic isn't visible yet")
+        c(b.until("VIEWS.lan.map.stats().nodes.some(n => n.kind === 'peer' && n.ip === '192.168.88.70')", 10),
+          "the map shows Home Assistant serving the IoT devices")
+        c(b.until("document.querySelectorAll('#lan-ports tr').length >= 6 && /switch chip/.test(document.querySelector('#lan-ports').innerText)", 8),
+          "LAN ports say the switch chip forwards between them")
+        shot(b, "lan-routed")
+        # approve only the two LAN items (leave the telemetry items for the setup scenario)
+        b.nav(d.url + "#/setup")
+        b.until("!!document.querySelector('#plan-load')", 10)
+        click(b, "#plan-load")
+        c(b.until("!!document.querySelector('[data-item=lanfw]') && !!document.querySelector('[data-item=lanhw]')", 10),
+          "Setup offers both LAN items")
+        c(b.eval("!document.querySelector('[data-item=lanfw]').checked && !document.querySelector('[data-item=lanhw]').checked"),
+          "unticked: they cost router CPU")
+        b.eval("document.querySelectorAll('[data-item]').forEach(i => { i.checked = i.dataset.item === 'lanfw' || i.dataset.item === 'lanhw'; })")
+        click(b, "#plan-apply")
+        c(b.until("document.querySelector('#plan-again') !== null && !document.querySelector('#plan').innerText.includes('✗')", 15),
+          "applied")
+        c(d.world.single["/interface/bridge/settings"]["use-ip-firewall"] == "true" and not d.world.hw_offloaded("ether2"),
+          "the router now sends bridged traffic through the firewall, in software")
+        b.nav(d.url + "#/lan")
+        c(b.until("S.snap.lan.pairs.some(p => p.service === 'Plex 32400' && !p.routed)", 20), "same-network conversations appear (TV -> NAS Plex)")
+        c(b.until("[...document.querySelectorAll('#lan-pairs tr')].some(r => /SMB 445/.test(r.innerText))", 8), "listed as conversations")
+        c(b.until("!!document.querySelector('#lan-vis .callout.good')", 5), "the page says it can see them")
+        c(not b.eval("S.snap.lan.pairs.some(p => p.client === '192.168.88.20' && p.server === '192.168.88.10')"),
+          "but never what stays inside the switch (workstation -> NAS)")
+        c(b.until("[...document.querySelectorAll('#lan-devices tr[data-ip]')].some(r => r.dataset.ip === '192.168.88.10' && /server/.test(r.innerText))", 8),
+          "the NAS is listed as a server")
+        shot(b, "lan-visible")
+        click(b, "#lan-devices tr[data-ip]")
+        c(b.until("document.querySelector('#drawer.open') && /only/.test(document.querySelector('#lan-src').innerText)", 8),
+          "opening a device narrows the map to its conversations")
+        b.eval("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
+        c(b.until("!/only/.test(document.querySelector('#lan-src').innerText)", 5), "Esc shows everything again")
+        c(not b.errors, "no console errors: {}".format(b.errors[:3]))
+
+
 SCENARIOS = {"pages": sc_pages, "identify": sc_identify, "setup": sc_setup, "respond": sc_respond, "ignore": sc_ignore, "layout": sc_layout, "globe-fade": sc_globe_fade, "theme": sc_theme, "update": sc_update, "types": sc_types, "drawer": sc_drawer, "phone": sc_phone,
              "light": sc_light, "offscreen": sc_offscreen,
              "single-out": sc_single_out, "globe-fit": sc_globe_fit,
-             "vpn": sc_vpn}
+             "vpn": sc_vpn, "lan": sc_lan}
 
 
 def main(argv) -> int:

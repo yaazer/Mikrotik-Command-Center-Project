@@ -2,7 +2,9 @@
    Particles flow along each link; their density follows the live rate. Download is drawn in the
    "in" colour, upload in the "out" colour. Threat subjects pulse red; blocked peers are greyed and
    their link dashed. Hover for details; click a device to single it out (just it and its traffic
-   paths, with its details in the drawer). Pinned devices are always shown, at the top. */
+   paths, with its details in the drawer). Pinned devices are always shown, at the top.
+   Options: captions (left, right), singleOut (false: the page filters what it feeds the map itself),
+   centerTip(router, snap) and tipExtra(node) for other uses (the VPN and LAN pages). */
 "use strict";
 
 /* Shared by the flow map and the globe: say why nothing is moving, rather than look frozen. */
@@ -27,7 +29,7 @@ const TrafficMap = (() => {
   const SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1, info: 0, "": -1 };
 
   function create(wrap, opts) {
-    opts = Object.assign({ peers: 14, hosts: 12 }, opts || {});
+    opts = Object.assign({ peers: 14, hosts: 12, captions: ["INTERNET", "LAN"], singleOut: true }, opts || {});
     const cv = document.createElement("canvas");
     wrap.appendChild(cv);
     const banner = document.createElement("div");
@@ -82,7 +84,7 @@ const TrafficMap = (() => {
       };
       const fit = Math.max(4, Math.floor((H - 90) / 30) + 1);  // two-line labels need ~30px each
       let peers, hosts, shown = null;
-      if (Select.ip) {
+      if (Select.ip && opts.singleOut) {
         // singled out: only this device, on its own side, and everything it talks to on the other
         const ip = Select.ip, h = Select.data && Select.data.ip === ip ? Select.data : null;
         const lan = h ? h.lan : tr.hosts.some((x) => x.ip === ip);
@@ -100,8 +102,8 @@ const TrafficMap = (() => {
       } else {
         peers = pick(tr.peers, Math.min(opts.peers, fit)); hosts = pick(tr.hosts, Math.min(opts.hosts, fit));
       }
-      banner.innerHTML = Select.banner(shown);
-      banner.classList.toggle("hidden", !Select.ip);
+      banner.innerHTML = opts.singleOut ? Select.banner(shown) : "";
+      banner.classList.toggle("hidden", !Select.ip || !opts.singleOut);
       const add = (kind, x) => {
         const id = kind + ":" + x.ip;
         seen.add(id);
@@ -228,9 +230,9 @@ const TrafficMap = (() => {
       ctx.font = "600 10.5px " + colors.mono;
       ctx.fillStyle = colors.faint;
       ctx.textAlign = "left";
-      ctx.fillText("INTERNET", 14, 20);
+      ctx.fillText(opts.captions[0], 14, 20);
       ctx.textAlign = "right";
-      ctx.fillText("LAN", (VW || W) - 14, 20);
+      ctx.fillText(opts.captions[1], (VW || W) - 14, 20);
       // faint dot grid
       ctx.fillStyle = colors.soft;
       for (let x = 20; x < W; x += 28) for (let y = 34; y < H; y += 28) ctx.fillRect(x, y, 1, 1);
@@ -366,16 +368,17 @@ const TrafficMap = (() => {
       cv.style.cursor = hover && hover !== router ? "pointer" : "default";
       if (!hover) return tip.hide();
       if (hover === router) {
+        if (opts.centerTip) return tip.show(opts.centerTip(router, snap), e.clientX, e.clientY);
         return tip.show(`<b>${esc(router.label)}</b>Internet ↓ ${fmt.bps(router.down)} · ↑ ${fmt.bps(router.up)}<br><span class="muted">${snap ? snap.traffic.conns : 0} connections · source: ${snap ? snap.traffic.source : "—"}</span>`, e.clientX, e.clientY);
       }
       const n = hover;
-      const extra = n.kind === "peer"
+      const extra = opts.tipExtra ? opts.tipExtra(n) : n.kind === "peer"
         ? `talking to ${(n.hosts || []).length} LAN host${(n.hosts || []).length === 1 ? "" : "s"}${n.ports && n.ports.length ? " · ports " + n.ports.join(", ") : ""}`
         : `${n.peers || 0} Internet peer${n.peers === 1 ? "" : "s"} · ${n.conns || 0} conns`;
       tip.show(`<b>${esc(n.label)}</b>${n.name ? `<span class="mono muted">${esc(n.ip)}</span><br>` : ""}<span class="in">↓ ${fmt.bps(n.down)}</span> · <span class="out">↑ ${fmt.bps(n.up)}</span><br><span class="muted">${esc(extra)}</span>` +
         Types.mixHtml(n.cats) +
         (n.threat ? `<br><span style="color:var(--crit)">⚠ ${esc(n.threat)} threat</span>` : "") + (n.blocked ? '<br><span class="muted">blocked by MCC</span>' : "") +
-        (n.pinned ? '<br><span class="muted">pinned</span>' : "") + `<br><span class="faint">${n.sel ? "singled out" : "click to single it out"}</span>`, e.clientX, e.clientY);
+        (n.pinned ? '<br><span class="muted">pinned</span>' : "") + `<br><span class="faint">${!opts.singleOut ? "click for details" : n.sel ? "singled out" : "click to single it out"}</span>`, e.clientX, e.clientY);
     });
     cv.addEventListener("mouseleave", () => { hover = null; tip.hide(); });
     cv.addEventListener("click", () => {
