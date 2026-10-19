@@ -6,9 +6,11 @@ const SEV_ORDER = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
 const STATUS_PILL = { open: "red", acknowledged: "amber", mitigated: "green", quiet: "", resolved: "", ignored: "blue" };
 const IGNORE_FOR = { "24h": "24 hours", "7d": "7 days", "30d": "30 days", "0": "Forever" };
 
-function switchKindLabel() {
-  const k = S.snap && S.snap.status.switch.kind;
-  return k === "routeros" ? "RouterOS" : k === "swos" ? "SwOS" : "switch";
+function swKind(sw) { return sw && sw.kind === "routeros" ? "RouterOS" : sw && sw.kind === "swos" ? "SwOS" : "switch"; }
+/* "CRS309-1G-8S+ · SwOS 2.17" */
+function swSub(sw) {
+  const y = (sw && sw.sys) || {};
+  return [y.model, y.version && (y.os === "routeros" || /RouterOS/.test(y.version) ? y.version : "SwOS " + y.version)].filter(Boolean).join(" · ");
 }
 
 function connected() { return S.snap && S.snap.status.router.state === "ok"; }
@@ -154,23 +156,31 @@ const Live = (() => {
   return { set };
 })();
 
-function portsHtml(ports) {
-  if (!ports || !ports.length) {
-    const sw = S.snap.status.switch;
-    const title = sw.state === "error" ? "Switch unreachable" : sw.state === "ok" ? "Switch connected — waiting for port data" : "No switch connected";
-    return `<div class="empty"><b>${title}</b>${sw.error ? esc(sw.error) : sw.state === "ok" ? 'If this doesn\'t fill in, open <a href="#/setup">Setup › Switch probe</a>.' : 'Add your switch in <a href="#/setup">Setup</a> (RouterOS or SwOS, read-only).'}</div>`;
+/* one switch's ports; data-port is "<switch id>:<port n>" */
+function portsHtml(sw) {
+  const ports = (sw && sw.ports) || [];
+  if (!ports.length) {
+    const title = sw.state === "error" ? "Switch unreachable" : sw.state === "ok" ? "Connected — waiting for port data" : "Not connected";
+    return `<div class="empty"><b>${title}</b>${sw.error ? esc(sw.error) : sw.state === "ok" ? 'If this doesn\'t fill in, open <a href="#/setup">Setup › Switches › Probe</a>.' : 'Enter its password in <a href="#/setup">Setup › Switches</a>.'}</div>`;
   }
   const cap = (sp) => ({ "10G": 1e10, "1G": 1e9, "2.5G": 2.5e9, "5G": 5e9, "100M": 1e8, "10M": 1e7, "25G": 2.5e10 }[sp] || 1e9);
-  const threats = [...S.threats.values()].filter((t) => t.rule === "link_down" && t.status === "open" && t.role === "switch").map((t) => t.target);
+  const down = new Set([...S.threats.values()].filter((t) => t.rule === "link_down" && t.status === "open").map((t) => t.key));
   return `<div class="ports">${ports.map((p) => {
     const util = p.rx_bps != null ? Math.min(100, ((p.rx_bps + (p.tx_bps || 0)) / cap(p.speed)) * 100) : 0;
     const cls = p.enabled === false ? "disabled" : p.link ? "up" : "down";
-    return `<div class="port ${cls} ${threats.includes(p.name) ? "alert" : ""}" data-port="${p.n}" title="${esc(p.name)} — ${p.link ? "link up" : "no link"}${p.speed ? " · " + esc(p.speed) : ""}">
+    return `<div class="port ${cls} ${down.has(`switch:${sw.id}:${p.name}`) ? "alert" : ""}" data-port="${esc(sw.id)}:${p.n}" title="${esc(p.name)} — ${p.link ? "link up" : "no link"}${p.speed ? " · " + esc(p.speed) : ""}">
       <div class="pn"><span>${esc(p.name)}</span><span class="led"></span></div>
       <div class="sp">${p.link ? esc(p.speed || "up") : "—"}</div>
       <div class="rates"><span class="in">↓${p.tx_bps != null ? fmt.bps(p.tx_bps) : "—"}</span><br><span class="out">↑${p.rx_bps != null ? fmt.bps(p.rx_bps) : "—"}</span></div>
       <div class="util"><i style="width:${util.toFixed(1)}%"></i></div></div>`;
   }).join("")}</div>`;
+}
+
+/* every switch: its name and what it runs, then its ports */
+function switchesHtml(list) {
+  if (!list || !list.length) return '<div class="empty"><b>No switch added</b>Add your switches in <a href="#/setup">Setup › Switches</a> (RouterOS or SwOS, read-only).</div>';
+  return list.map((sw) => `<div class="sw-block"><div class="sw-head"><b>${esc(sw.label)}</b><span class="faint">${esc(swSub(sw) || sw.host)}</span><span class="grow"></span>
+    ${sw.state === "ok" ? "" : `<span class="pill ${sw.state === "error" ? "red" : ""}">${sw.state === "error" ? "unreachable" : "not connected"}</span>`}</div>${portsHtml(sw)}</div>`).join("");
 }
 
 function wanSeries() {
@@ -318,7 +328,7 @@ VIEWS.overview = {
         <section class="panel s4"><header><h2>Threat feed</h2><span class="grow"></span><a class="hint" href="#/threats">all threats →</a></header><div class="feed" id="feed" style="height:470px"></div></section>
         <section class="panel s7"><header><h2>Internet throughput</h2><span class="grow"></span><span class="legend"><span><i style="background:var(--in)"></i>download</span><span><i style="background:var(--out)"></i>upload</span></span></header>
           <div class="body"><div class="chart"><canvas id="wan-chart"></canvas></div></div></section>
-        <section class="panel s5"><header><h2>Switch</h2><span class="grow"></span><span class="hint" id="sw-id"></span></header><div class="body" id="ports"></div></section>
+        <section class="panel s5"><header><h2>Switches</h2><span class="grow"></span><a class="hint" id="sw-id" href="#/topology"></a></header><div class="body scroll" style="max-height:380px" id="ports"></div></section>
         <section class="panel s4"><header><h2>Top LAN talkers</h2><span class="grow"></span><a class="hint" href="#/traffic">traffic →</a></header><div class="body flush scroll" style="max-height:340px" id="talkers"></div></section>
         <section class="panel s4"><header><h2>Top destinations</h2></header><div class="body flush scroll" style="max-height:340px" id="dests"></div></section>
         <section class="panel s4" data-pid="overview:types"><header><h2>Traffic types</h2><span class="grow"></span><a class="hint" href="#/traffic">by conversation →</a></header>
@@ -358,10 +368,9 @@ VIEWS.overview = {
     if (this.kind === "map") $("#map-src").textContent = { conntrack: "live · connection table", flows: "flow records (IPFIX)", none: "no data yet" }[tr.source];
     Charts.line($("#wan-chart"), [{ data: rx, color: cssVar("--in"), fill: true, label: "↓" }, { data: tx, color: cssVar("--out"), fill: true, label: "↑" }],
       { window: 1800, yfmt: fmt.bps, mirror: true });
-    Live.set($("#ports"), portsHtml(s.switch.ports),
+    Live.set($("#ports"), switchesHtml(s.switches),
       (el) => $$("[data-port]", el).forEach((p) => (p.onclick = () => go("interfaces", { port: p.dataset.port }))));
-    const sys = s.switch.sys || {};
-    $("#sw-id").textContent = [sys.identity, sys.model, sys.version && (sys.os === "routeros" ? sys.version : "SwOS " + sys.version)].filter(Boolean).join(" · ");
+    $("#sw-id").textContent = s.switches.length ? `${s.switches.length} switch${s.switches.length === 1 ? "" : "es"} · topology →` : "";
     Live.set($("#talkers"), hostsTable(tr.hosts, "host", 10), bindRows);
     Live.set($("#dests"), hostsTable(tr.peers, "peer", 10), bindRows);
     Live.set($("#types"), typesHtml(tr.types));
@@ -474,6 +483,313 @@ VIEWS.traffic = {
 };
 
 /* ================= VPN ================= */
+/* ================= Topology ================= */
+// The network's shape (mcc/topology.py): Internet -> router -> switches and access points -> devices. Infrastructure
+// is laid out as a tree, top down; each node's devices are stacked under it so a busy switch stays narrow.
+// Links: thickness = live rate, red = down, dashed = MCC's best guess. Drag to pan, scroll to zoom.
+const TOPO_ICON = {
+  internet: '<path d="M7 18a4.5 4.5 0 0 1-.6-8.96A6 6 0 0 1 18 9a4 4 0 0 1-.5 9z"/>',
+  router: '<rect x="3" y="13" width="18" height="6" rx="1.5"/><path d="M7 16h.01M10 16h.01"/><path d="M12 13V5M8.5 8.5L12 5l3.5 3.5"/>',
+  switch: '<rect x="2.5" y="8" width="19" height="8" rx="1.5"/><path d="M6 12h1M9.5 12h1M13 12h1M16.5 12h1"/>',
+  ap: '<circle cx="12" cy="15" r="1.6"/><path d="M8.5 11.5a5 5 0 0 1 7 0M6 9a8.5 8.5 0 0 1 12 0"/><path d="M12 16.6V21"/>',
+  unknown: '<rect x="3" y="8" width="18" height="8" rx="1.5" stroke-dasharray="3 2"/><path d="M10.2 10.8a1.9 1.9 0 1 1 2.4 1.8v.7M12.6 14.6h.01"/>',
+};
+const TOPO = { BOX_W: 184, BOX_H: 58, GAP: 28, LEVEL: 118, DEV_H: 30, DEV_W: 190, STACK: 14 };
+VIEWS.topology = {
+  render(m) {
+    this.sel = this.sel || "router";
+    this.devs = this.devs || "show";
+    this.more = this.more || new Set();
+    this.key = "";
+    this.vb = null;
+    m.innerHTML = `${connectBanner()}<div class="grid">
+      <section class="panel s8" data-pid="topo:map"><header><h2>Network topology</h2><span class="grow"></span><span class="hint" id="topo-src"></span>
+        <div class="seg" id="topo-devs" title="Show the devices, or only the router, switches and access points">
+          <button data-d="show" class="${this.devs === "show" ? "on" : ""}">Devices</button><button data-d="hide" class="${this.devs === "hide" ? "on" : ""}">Infrastructure only</button></div>
+        <button class="icon-btn" id="topo-fit" title="Fit the map to the panel" aria-label="Fit to view">${ICON.target}</button></header>
+        <div class="topo-wrap" id="topo"><svg id="topo-svg" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Network topology"></svg>
+          <div class="topo-legend"><span><i class="lg-solid"></i>seen</span><span><i class="lg-dash"></i>best guess</span><span><i class="lg-down"></i>link down</span><span class="faint">line thickness = live rate</span></div></div></section>
+      <section class="panel s4" data-pid="topo:detail"><header><h2 id="topo-dt">Details</h2></header><div class="body scroll" style="max-height:640px" id="topo-detail"><div class="note">Click the router, a switch or an access point.</div></div></section>
+      <section class="panel s8" data-pid="topo:links"><header><h2>Links</h2><span class="grow"></span><span class="hint">router, switches and access points, and what plugs into them</span></header>
+        <div class="body flush scroll" style="max-height:460px" id="topo-links"></div></section>
+      <section class="panel s4" data-pid="topo:how"><header><h2>How MCC knows</h2></header><div class="body" id="topo-how"></div></section>
+    </div>`;
+    $("#topo-devs", m).onclick = (e) => {
+      const b = e.target.closest("[data-d]");
+      if (!b) return;
+      this.devs = b.dataset.d;
+      $$("#topo-devs button").forEach((x) => x.classList.toggle("on", x === b));
+      this.key = "";
+      this.vb = null;
+      this.draw();
+    };
+    $("#topo-fit", m).onclick = () => { this.vb = null; this.applyView(); };
+    this.bindPanZoom($("#topo-svg", m));
+    this.load();
+    this.timer = setInterval(() => this.load(), 2000);
+  },
+  leave() { clearInterval(this.timer); },
+  async load() {
+    let d;
+    try { d = await api.get("/api/topology"); } catch (e) { return; }
+    if (!$("#topo-svg")) return;
+    this.data = d;
+    this.draw();
+  },
+  shown() {
+    const d = this.data;
+    const nodes = d.nodes.filter((n) => this.devs === "show" || n.type !== "device");
+    return { nodes, by: new Map(nodes.map((n) => [n.id, n])), links: new Map(d.links.map((l) => [l.to, l])) };
+  },
+  draw() {
+    if (!this.data) return;
+    const { nodes, by, links } = this.shown();
+    const key = nodes.map((n) => n.id + ">" + n.parent + "@" + n.port).join("|") + "#" + [...this.more].join(",");
+    if (key !== this.key) {  // the shape changed: lay it out again
+      this.key = key;
+      this.layout(nodes, by);
+      this.build(nodes, by, links);
+      if (!this.vb) this.applyView();
+    }
+    this.update(nodes, links);
+    const sw = this.data.nodes.filter((n) => n.type === "switch" && n.managed).length;
+    const devs = this.data.nodes.filter((n) => n.type === "device").length;
+    $("#topo-src").textContent = `${sw} switch${sw === 1 ? "" : "es"} · ${devs} device${devs === 1 ? "" : "s"}`;
+    this.drawDetail();
+    Live.set($("#topo-links"), this.linksHtml(), (el) => $$("tr[data-node]", el).forEach((tr) => (tr.onclick = () => this.pick(tr.dataset.node))));
+    Live.set($("#topo-how"), this.howHtml());
+  },
+  /* positions: infrastructure as a tree, each node's devices stacked in a column beside its other children */
+  layout(nodes, by) {
+    const kids = new Map();
+    nodes.forEach((n) => { if (n.parent && by.has(n.parent)) { if (!kids.has(n.parent)) kids.set(n.parent, []); kids.get(n.parent).push(n); } });
+    const infra = (id) => (kids.get(id) || []).filter((n) => n.type !== "device");
+    const devs = (id) => (kids.get(id) || []).filter((n) => n.type === "device");
+    const widths = new Map();
+    const width = (n) => {
+      const cols = infra(n.id).map(width);
+      if (devs(n.id).length) cols.push(TOPO.DEV_W);
+      const w = Math.max(TOPO.BOX_W, cols.reduce((a, b) => a + b, 0) + TOPO.GAP * Math.max(0, cols.length - 1));
+      widths.set(n.id, w);
+      return w;
+    };
+    this.pos = new Map();
+    this.stacks = [];
+    const place = (n, x0, y) => {
+      const w = widths.get(n.id);
+      this.pos.set(n.id, { x: x0 + w / 2, y });
+      const cols = infra(n.id).map((c) => ({ c, w: widths.get(c.id) }));
+      const ds = devs(n.id);
+      if (ds.length) cols.push({ stack: ds, w: TOPO.DEV_W });
+      const tw = cols.reduce((a, c) => a + c.w, 0) + TOPO.GAP * Math.max(0, cols.length - 1);
+      let cx = x0 + (w - tw) / 2;
+      for (const col of cols) {
+        if (col.c) place(col.c, cx, y + TOPO.LEVEL);
+        else {
+          const open = this.more.has(n.id);
+          const list = open ? col.stack : col.stack.slice(0, TOPO.STACK);
+          list.forEach((dv, i) => this.pos.set(dv.id, { x: cx, y: y + TOPO.LEVEL + i * TOPO.DEV_H, dev: true }));
+          this.stacks.push({ parent: n.id, x: cx, y: y + TOPO.LEVEL, n: list.length, hidden: col.stack.length - list.length });
+        }
+        cx += col.w + TOPO.GAP;
+      }
+    };
+    const root = by.get("internet");
+    if (root) { width(root); place(root, 0, 0); }
+    let maxX = 0, maxY = 0;
+    for (const p of this.pos.values()) { maxX = Math.max(maxX, p.x + (p.dev ? TOPO.DEV_W : TOPO.BOX_W / 2)); maxY = Math.max(maxY, p.y + TOPO.BOX_H); }
+    this.stacks.forEach((s) => (maxY = Math.max(maxY, s.y + (s.n + (s.hidden ? 1 : 0)) * TOPO.DEV_H + 10)));
+    this.bounds = { w: maxX, h: maxY };
+  },
+  /* the SVG, built once per shape; rates and states are updated in place every refresh */
+  build(nodes, by, links) {
+    const svg = $("#topo-svg");
+    const P = this.pos;
+    const parts = [];
+    // infrastructure links: a curve from the parent's bottom to the child's top
+    for (const n of nodes) {
+      const l = links.get(n.id), a = P.get(n.parent), b = P.get(n.id);
+      if (!l || !a || !b || n.type === "device") continue;
+      const x1 = a.x, y1 = a.y + TOPO.BOX_H, x2 = b.x, y2 = b.y;
+      const d = `M${x1},${y1} C${x1},${y1 + 46} ${x2},${y2 - 46} ${x2},${y2}`;
+      parts.push(`<g class="tlink" data-to="${esc(n.id)}"><path class="tl-base" d="${d}"/><path class="tl-flow" d="${d}"/>
+        ${l.port || l.local_port ? `<text class="tl-port" x="${x2 - TOPO.BOX_W / 2 + 4}" y="${y2 - 7}">${esc([l.port, l.local_port].filter(Boolean).join(" → "))}</text>` : ""}
+        <text class="tl-rate" x="${x2 - TOPO.BOX_W / 2 + 4}" y="${y2 - 20}"></text></g>`);
+    }
+    // device stacks: a bus down the left of the column, a tick to each device
+    for (const s of this.stacks) {
+      const a = P.get(s.parent);
+      if (!a) continue;
+      const bx = s.x + 10, top = s.y - 14, last = s.y + (s.n - 1) * TOPO.DEV_H + 13;
+      parts.push(`<path class="tl-bus" d="M${a.x},${a.y + TOPO.BOX_H} C${a.x},${a.y + TOPO.BOX_H + 30} ${bx},${top - 24} ${bx},${top} L${bx},${last}"/>`);
+      if (s.hidden) parts.push(`<text class="tl-more" data-more="${esc(s.parent)}" x="${s.x + 24}" y="${s.y + s.n * TOPO.DEV_H + 16}">+${s.hidden} more — show all</text>`);
+    }
+    for (const n of nodes) {
+      const p = P.get(n.id);
+      if (!p) continue;
+      if (n.type === "device") {
+        const y = p.y + 13;
+        parts.push(`<g class="tdev" data-id="${esc(n.id)}" data-ip="${esc(n.ip || "")}"><path class="tl-tick" d="M${p.x + 10},${y} H${p.x + 22}"/>
+          <circle cx="${p.x + 28}" cy="${y}" r="5"/><g transform="translate(${p.x + 38},${y - 8}) scale(0.68)" class="tdev-ic">${(Ident.ICONS[n.kind] || Ident.ICONS.unknown)}</g>
+          <text class="td-label" x="${p.x + 58}" y="${y - 1}">${esc(n.label.length > 22 ? n.label.slice(0, 21) + "…" : n.label)}</text>
+          <text class="td-sub" x="${p.x + 58}" y="${y + 11}"></text><title>${esc([n.label, n.ip, n.mac, n.guess].filter(Boolean).join(" · "))}</title></g>`);
+        continue;
+      }
+      const x = p.x - TOPO.BOX_W / 2, y = p.y;
+      parts.push(`<g class="tnode t-${esc(n.type)} ${n.managed ? "managed" : ""} ${n.inferred ? "inferred" : ""}" data-id="${esc(n.id)}" transform="translate(${x},${y})">
+        <rect width="${TOPO.BOX_W}" height="${TOPO.BOX_H}" rx="10"/>
+        <g class="tn-ic" transform="translate(12,${TOPO.BOX_H / 2 - 13}) scale(1.08)">${TOPO_ICON[n.type] || TOPO_ICON.unknown}</g>
+        <text class="tn-label" x="46" y="24">${esc(n.label.length > 19 ? n.label.slice(0, 18) + "…" : n.label)}</text>
+        <text class="tn-sub" x="46" y="41">${esc((n.sub || n.ip || "").slice(0, 26))}</text>
+        ${n.managed ? `<circle class="tn-state" cx="${TOPO.BOX_W - 12}" cy="12" r="4.5"/>` : ""}
+        <title>${esc([n.label, n.sub, n.ip, n.mac, n.how && "placed by: " + n.how, n.error].filter(Boolean).join("\n"))}</title></g>`);
+    }
+    svg.innerHTML = parts.join("");
+    $$(".tnode", svg).forEach((g) => (g.onclick = (e) => { if (!this.dragged) this.pick(g.dataset.id); }));
+    $$(".tdev", svg).forEach((g) => (g.onclick = () => { if (!this.dragged && g.dataset.ip) openHost(g.dataset.ip); }));
+    $$("[data-more]", svg).forEach((t) => (t.onclick = () => { this.more.add(t.dataset.more); this.key = ""; this.draw(); }));
+  },
+  update(nodes, links) {
+    const svg = $("#topo-svg");
+    const motion = window.Theme ? Theme.motion() : "full";
+    const cap = (sp) => ({ "10G": 1e10, "1G": 1e9, "2.5G": 2.5e9, "5G": 5e9, "100M": 1e8, "10M": 1e7, "25G": 2.5e10, "40G": 4e10 }[sp] || 0);
+    $$(".tlink", svg).forEach((g) => {
+      const l = links.get(g.dataset.to);
+      if (!l) return;
+      const bps = (l.down_bps || 0) + (l.up_bps || 0);
+      const util = cap(l.speed) ? bps / cap(l.speed) : 0;
+      g.classList.toggle("down", l.up === false);
+      g.classList.toggle("guess", !!l.inferred);
+      g.classList.toggle("hot", util >= 0.8);
+      g.classList.toggle("warm", util >= 0.5 && util < 0.8);
+      g.style.setProperty("--w", (1.6 + Math.min(5, Math.log10(1 + bps / 1e5))).toFixed(2));
+      // the flow's speed follows the rate; nothing moves when motion is off or the link is idle
+      g.style.setProperty("--dur", bps > 1e3 && motion !== "off" ? (3.2 - Math.min(2.6, Math.log10(1 + bps / 1e4) * 0.55)).toFixed(2) + "s" : "0s");
+      g.classList.toggle("still", !(bps > 1e3 && motion !== "off"));
+      const t = $(".tl-rate", g);
+      t.textContent = l.up === false ? "link down" : [l.speed, l.down_bps != null ? `↓${fmt.bps(l.down_bps)} ↑${fmt.bps(l.up_bps || 0)}` : ""].filter(Boolean).join("  ");
+    });
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    $$(".tdev", svg).forEach((g) => {
+      const n = byId.get(g.dataset.id), l = links.get(g.dataset.id);
+      if (!n || !l) return;
+      g.classList.toggle("down", l.up === false);
+      g.classList.toggle("guess", !!l.inferred);
+      const rate = l.down_bps != null ? `↓${fmt.bps(l.down_bps)} ↑${fmt.bps(l.up_bps || 0)}` : "";
+      $(".td-sub", g).textContent = [l.port, l.up === false ? "link down" : rate].filter(Boolean).join(" · ");
+    });
+    $$(".tnode", svg).forEach((g) => {
+      const n = byId.get(g.dataset.id);
+      if (!n) return;
+      g.classList.toggle("sel", n.id === this.sel);
+      g.classList.toggle("st-ok", n.state === "ok");
+      g.classList.toggle("st-error", n.state === "error");
+      g.classList.toggle("st-off", !!n.managed && n.state === "off");
+    });
+  },
+  /* pan and zoom by the SVG's viewBox */
+  applyView() {
+    const svg = $("#topo-svg"), wrap = $("#topo");
+    if (!svg || !this.bounds) return;
+    if (!this.vb) {
+      const pad = 30, W = wrap.clientWidth || 800, H = wrap.clientHeight || 600;
+      const w = this.bounds.w + pad * 2, h = this.bounds.h + pad * 2;
+      const s = Math.max(w / W, h / H, 0.6);  // fit, but don't blow a small network up past ~1.7x
+      this.vb = { x: -pad - (W * s - w) / 2, y: -pad, w: W * s, h: H * s };
+    }
+    svg.setAttribute("viewBox", `${this.vb.x} ${this.vb.y} ${this.vb.w} ${this.vb.h}`);
+  },
+  bindPanZoom(svg) {
+    let drag = null;
+    svg.addEventListener("wheel", (e) => {
+      if (!this.vb) return;
+      e.preventDefault();
+      const r = svg.getBoundingClientRect();
+      const k = e.deltaY > 0 ? 1.12 : 1 / 1.12;
+      const mx = this.vb.x + ((e.clientX - r.left) / r.width) * this.vb.w, my = this.vb.y + ((e.clientY - r.top) / r.height) * this.vb.h;
+      this.vb = { x: mx - (mx - this.vb.x) * k, y: my - (my - this.vb.y) * k, w: this.vb.w * k, h: this.vb.h * k };
+      this.applyView();
+    }, { passive: false });
+    svg.addEventListener("pointerdown", (e) => {
+      this.dragged = false;
+      if (!this.vb || e.button !== 0) return;
+      drag = { x: e.clientX, y: e.clientY, vb: Object.assign({}, this.vb), id: e.pointerId };
+    });
+    svg.addEventListener("pointermove", (e) => {
+      if (!drag) return;
+      if (!this.dragged && Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 4) svg.setPointerCapture(drag.id);
+      const r = svg.getBoundingClientRect();
+      const dx = (e.clientX - drag.x) * (drag.vb.w / r.width), dy = (e.clientY - drag.y) * (drag.vb.h / r.height);
+      if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 4) this.dragged = true;
+      this.vb = Object.assign({}, drag.vb, { x: drag.vb.x - dx, y: drag.vb.y - dy });
+      this.applyView();
+    });
+    const end = () => { drag = null; setTimeout(() => (this.dragged = false), 0); };
+    svg.addEventListener("pointerup", end);
+    svg.addEventListener("pointercancel", end);
+    svg.addEventListener("dblclick", () => { this.vb = null; this.applyView(); });
+  },
+  pick(id) {
+    const n = this.data && this.data.nodes.find((x) => x.id === id);
+    if (!n) return;
+    if (n.type === "device") { if (n.ip) openHost(n.ip); return; }
+    this.sel = id;
+    this.update(this.shown().nodes, this.shown().links);
+    this.drawDetail();
+  },
+  drawDetail() {
+    const d = this.data, el = $("#topo-detail");
+    if (!d || !el) return;
+    const n = d.nodes.find((x) => x.id === this.sel) || d.nodes.find((x) => x.id === "router");
+    if (!n) return;
+    const by = new Map(d.nodes.map((x) => [x.id, x]));
+    const up = d.links.find((l) => l.to === n.id);
+    const kids = d.links.filter((l) => l.from === n.id).map((l) => ({ l, n: by.get(l.to) })).filter((x) => x.n);
+    $("#topo-dt").textContent = n.label;
+    const sw = n.switch_id ? (S.snap.switches || []).find((s) => s.id === n.switch_id) : null;
+    const where = up && by.get(up.from) ? `${esc(by.get(up.from).label)}${up.port ? ` <span class="mono">${esc(up.port)}</span>` : ""}${up.local_port ? ` → its <span class="mono">${esc(up.local_port)}</span>` : ""}` : "";
+    const rows = kids.map(({ l, n: c }) => `<tr class="click" data-node="${esc(c.id)}"><td class="mono">${esc(l.port || "—")}</td><td>${c.type === "device" && c.kind ? Ident.icon(c.kind) : ""} ${esc(c.label)}</td>
+      <td class="r num in">${l.down_bps != null ? fmt.bps(l.down_bps) : ""}</td><td class="r num out">${l.up_bps != null ? fmt.bps(l.up_bps) : ""}</td></tr>`).join("");
+    el.innerHTML = `<div class="note" style="margin-bottom:8px">${esc(n.sub || "")}</div>
+      <dl class="kv">
+        ${n.type === "switch" ? `<dt>Managed</dt><dd>${n.managed ? (n.state === "ok" ? "read by MCC" : n.state === "error" ? "unreachable" : "not connected") : "no — seen by neighbor discovery"}</dd>` : ""}
+        ${n.ip ? `<dt>Address</dt><dd>${esc(n.ip)}</dd>` : ""}${n.mac ? `<dt>MAC</dt><dd>${esc(n.mac)}</dd>` : ""}
+        ${where ? `<dt>Plugs into</dt><dd style="font-family:var(--sans)">${where}</dd>` : ""}
+        ${up && up.speed ? `<dt>Link</dt><dd>${esc(up.speed)}</dd>` : ""}
+        ${n.how ? `<dt>Placed by</dt><dd style="font-family:var(--sans)">${esc(n.how)}${n.inferred ? " (a guess)" : ""}</dd>` : ""}
+      </dl>
+      ${n.error ? `<div class="callout bad" style="margin-top:10px">${esc(n.error)}</div>` : ""}
+      ${n.type === "switch" && n.managed ? `<div class="btnrow" style="margin-top:10px"><a class="btn sm" href="#/setup">Uplink and settings in Setup</a></div>` : ""}
+      ${sw && sw.ports && sw.ports.length ? `<h4 class="mini" style="margin-top:14px">Ports</h4>${portsHtml(sw)}` : ""}
+      ${kids.length ? `<h4 class="mini" style="margin-top:14px">Plugged into it · ${kids.length}</h4><table class="t"><tbody>${rows}</tbody></table>` : ""}`;
+    $$("tr[data-node]", el).forEach((tr) => (tr.onclick = () => this.pick(tr.dataset.node)));
+    $$("[data-port]", el).forEach((p) => (p.onclick = () => go("interfaces", { port: p.dataset.port })));
+  },
+  linksHtml() {
+    const d = this.data;
+    const by = new Map(d.nodes.map((x) => [x.id, x]));
+    const infra = d.links.filter((l) => by.get(l.to) && by.get(l.to).type !== "device" && l.to !== "router");
+    const devs = d.links.filter((l) => by.get(l.to) && by.get(l.to).type === "device");
+    const row = (l) => { const a = by.get(l.from), b = by.get(l.to);
+      return `<tr class="click" data-node="${esc(b.type === "device" ? b.parent : b.id)}"><td><b>${esc(a.label)}</b> <span class="mono faint">${esc(l.port || "")}</span></td>
+        <td>${b.type === "device" && b.kind ? Ident.icon(b.kind) : ""} <b>${esc(b.label)}</b> <span class="mono faint">${esc(l.local_port || "")}</span></td>
+        <td>${esc(l.speed || "")}</td><td>${l.up === false ? '<span class="pill red">down</span>' : l.up ? '<span class="pill green">up</span>' : '<span class="faint">—</span>'}</td>
+        <td class="r num in">${l.down_bps != null ? fmt.bps(l.down_bps) : ""}</td><td class="r num out">${l.up_bps != null ? fmt.bps(l.up_bps) : ""}</td>
+        <td>${l.inferred ? '<span class="pill" title="MCC\'s best guess">guess</span> ' : ""}<span class="faint" style="font-size:12px">${esc(l.how || "")}</span></td></tr>`; };
+    return `<table class="t"><thead><tr><th>From</th><th>To</th><th>Speed</th><th>State</th><th class="r">↓</th><th class="r">↑</th><th>How MCC knows</th></tr></thead>
+      <tbody>${infra.map(row).join("")}${devs.map(row).join("")}</tbody></table>`;
+  },
+  howHtml() {
+    const notes = (this.data.notes || []).map((t) => `<div class="callout warn" style="margin-bottom:8px">${esc(t)}</div>`).join("");
+    return `${notes}<ul class="clues">
+      <li><span class="src">Neighbors</span><span>The router's LLDP / CDP / MNDP table says which router port a switch or access point is on, and the switch's own port facing it.</span></li>
+      <li><span class="src">MAC tables</span><span>Each switch MCC reads says which of its ports every device (and every other switch) is behind. A switch seen on another's port hangs off it.</span></li>
+      <li><span class="src">Bridge</span><span>The router's bridge host table: which router port each device is behind.</span></li>
+      <li><span class="src">Guesses</span><span>Several devices on one router port with nothing known between them hang off a <b>switch or access point</b> placeholder.</span></li>
+      <li><span class="src">Setup</span><span>Where MCC gets it wrong, set a switch's uplink in <a href="#/setup">Setup › Switches</a>; that always wins.</span></li></ul>`;
+  },
+};
+
 /* ================= LAN: device to device ================= */
 // Traffic between devices inside your network: who serves what to whom (mcc/traffic.py _lan_view). What the
 // router can see of it depends on where it is switched (mcc/hub.py), and the page says so rather than look empty.
@@ -546,7 +862,7 @@ VIEWS.lan = {
     const rows = l.pairs.filter((p) => !q || [p.client, p.server, p.service, nameOf(p.client), nameOf(p.server), Types.label(p.cat)]
       .some((x) => (x || "").toLowerCase().includes(q)));
     Live.set($("#lan-pairs"), this.pairsHtml(rows, v), bindRows);
-    Live.set($("#lan-ports"), this.portsHtml(l.ports, l.switch),
+    Live.set($("#lan-ports"), this.portsHtml(l.ports, l.switches || []),
       (el) => $$(".lan-dev[data-ip]", el).forEach((d) => (d.onclick = () => openHost(d.dataset.ip))));
   },
   /* servers (left) and clients (right) of just these conversations */
@@ -630,8 +946,8 @@ VIEWS.lan = {
         <td class="r num in">${fmt.bps(p.down)}</td><td class="r num out">${fmt.bps(p.up)}</td><td style="width:90px">${rateBars(p.down, p.up, max)}</td></tr>`).join("")}
       </tbody></table>`;
   },
-  portsHtml(ports, sw) {
-    if (!ports.length && !sw.length) return '<div class="empty">No LAN ports found on the router yet.</div>';
+  portsHtml(ports, switches) {
+    if (!ports.length && !switches.some((x) => x.ports.length)) return '<div class="empty">No LAN ports found on the router yet.</div>';
     const devs = (p) => p.devices.slice(0, 4).map((d) => `<span class="lan-dev" data-ip="${esc(d.ip)}" title="${esc([d.ip, d.mac, d.label].filter(Boolean).join(" · "))}">${d.kind ? Ident.icon(d.kind) : ""}${esc(d.name || d.label || d.ip)}</span>`).join("") +
       (p.device_count > 4 ? `<span class="faint">+${p.device_count - 4}</span>` : "");
     const seen = (p) => p.seen_pct == null ? '<span class="faint">quiet</span>'
@@ -642,10 +958,10 @@ VIEWS.lan = {
         <td>${p.hw == null ? '<span class="faint">—</span>' : p.hw ? '<span class="pill" title="the switch chip forwards between these ports itself: only counted, never seen">switch chip</span>' : '<span class="pill green" title="through the router\'s CPU and firewall">through CPU</span>'}</td>
         <td class="r num in">${fmt.bps(p.tx_bps)}</td><td class="r num out">${fmt.bps(p.rx_bps)}</td><td style="white-space:nowrap">${seen(p)}</td></tr>`).join("")}
       </tbody></table>
-      ${sw.length ? `<div class="note" style="padding:12px 14px 4px">Switch ports: the router never sees who talks to whom inside the switch, only these rates.</div>
+      ${switches.filter((x) => x.ports.length).map((x) => `<div class="note" style="padding:12px 14px 4px"><b>${esc(x.label)}</b>: the router never sees who talks to whom inside a switch, only these rates.</div>
       <table class="t"><thead><tr><th>Switch port</th><th class="r">↓ rx</th><th class="r">↑ tx</th></tr></thead><tbody>
-        ${sw.map((p) => `<tr><td><b>${esc(p.name)}</b></td><td class="r num in">${p.rx_bps == null ? "—" : fmt.bps(p.rx_bps)}</td><td class="r num out">${p.tx_bps == null ? "—" : fmt.bps(p.tx_bps)}</td></tr>`).join("")}
-      </tbody></table>` : ""}`;
+        ${x.ports.map((p) => `<tr><td><b>${esc(p.name)}</b></td><td class="r num in">${p.rx_bps == null ? "—" : fmt.bps(p.rx_bps)}</td><td class="r num out">${p.tx_bps == null ? "—" : fmt.bps(p.tx_bps)}</td></tr>`).join("")}
+      </tbody></table>`).join("")}`;
   },
 };
 
@@ -1010,7 +1326,7 @@ VIEWS.interfaces = {
       <section class="panel s12"><header><h2 id="ch-title">Select an interface</h2><span class="grow"></span><span class="legend"><span><i style="background:var(--in)"></i>in</span><span><i style="background:var(--out)"></i>out</span></span></header>
         <div class="body"><div class="chart"><canvas id="if-chart"></canvas></div></div></section>
       <section class="panel s7"><header><h2>Router interfaces</h2></header><div class="body flush scroll" id="ifs"></div></section>
-      <section class="panel s5"><header><h2>Switch ports</h2><span class="grow"></span><span class="hint">${switchKindLabel()} · read-only</span></header><div class="body" id="ports"></div>
+      <section class="panel s5"><header><h2>Switch ports</h2><span class="grow"></span><span class="hint">read-only</span></header><div class="body" id="ports"></div>
         <div class="body note" style="padding-top:0">MCC watches the switch but doesn't change it. To act on a switch port, disable the router port facing it, or quarantine the hosts behind it.</div></section>
     </div>`;
     this.tick();
@@ -1033,7 +1349,7 @@ VIEWS.interfaces = {
     $$("tr[data-if]", el).forEach((tr) => (tr.onclick = () => { this.sel = "if:" + tr.dataset.if; this.chart(); }));
     $$("[data-dis]", el).forEach((b) => (b.onclick = (e) => { e.stopPropagation(); respond("disable_interface", { name: b.dataset.dis }, "from Interfaces"); }));
     $$("[data-en]", el).forEach((b) => (b.onclick = (e) => { e.stopPropagation(); respond("enable_interface", { name: b.dataset.en }, "from Interfaces"); }));
-    $("#ports").innerHTML = portsHtml(s.switch.ports);
+    $("#ports").innerHTML = switchesHtml(s.switches);
     $$("[data-port]", $("#ports")).forEach((p) => (p.onclick = () => { this.sel = "sw:" + p.dataset.port; this.chart(); }));
     if (!this.sel && s.wan.names.length) this.sel = "if:" + s.wan.names[0];
     this.chart();
@@ -1043,9 +1359,11 @@ VIEWS.interfaces = {
     let data = [], title = "Select an interface";
     if (kind === "if") { data = S.hist.ifaces[name] || []; title = "Router · " + name; }
     if (kind === "sw") {
-      data = (S.hist.switch[name] || []).map((r) => [r[0], r[1], r[2]]);
-      const p = (S.snap.switch.ports || []).find((x) => String(x.n) === name);
-      title = "Switch · " + (p ? p.name : "port " + name);
+      const [sid, n] = name.split(":");
+      data = ((S.hist.switch[sid] || {})[n] || []).map((r) => [r[0], r[1], r[2]]);
+      const sw = (S.snap.switches || []).find((x) => x.id === sid);
+      const p = sw && (sw.ports || []).find((x) => String(x.n) === n);
+      title = (sw ? sw.label : "Switch") + " · " + (p ? p.name : "port " + n);
     }
     $("#ch-title").textContent = title;
     Charts.line($("#if-chart"), [{ data: data.map((r) => [r[0], r[1]]), color: cssVar("--in"), fill: true, label: "in" },
@@ -1091,7 +1409,7 @@ VIEWS.logs = {
 /* ================= Setup ================= */
 VIEWS.setup = {
   render(m) {
-    const c = S.config || {}, r = c.router || {}, sw = c.switch || {};
+    const c = S.config || {}, r = c.router || {};
     const st = S.snap.status;
     m.innerHTML = `<div class="grid">
       <section class="panel s6"><header><h2>Router</h2><span class="grow"></span>${this.stateChip(st.router.state)}</header><div class="body">
@@ -1112,20 +1430,7 @@ VIEWS.setup = {
 /ip service set www-ssl disabled=no          # needs a certificate; or use www (HTTP) on a trusted LAN only</pre>
           It can read everything and change firewall/interface settings — what MCC needs to act — but can't log in interactively, reboot or manage users. Restricting it to this PC's address limits damage if the password leaks.</details>
       </div></section>
-      <section class="panel s6"><header><h2>Switch${st.switch.kind ? " (" + switchKindLabel() + ")" : ""}</h2><span class="grow"></span>${this.stateChip(st.switch.state === "off" ? "disconnected" : st.switch.state)}</header><div class="body">
-        <form class="form" id="f-switch" autocomplete="off">
-          <label for="s-host">Address</label><input type="text" id="s-host" value="${esc(sw.host || "")}" placeholder="192.168.88.2" required>
-          <label for="s-kind">Runs</label><select id="s-kind">${[["auto", "Auto-detect"], ["routeros", "RouterOS (REST API)"], ["swos", "SwOS"]]
-            .map(([k, l]) => `<option value="${k}" ${(sw.kind || "auto") === k ? "selected" : ""}>${l}</option>`).join("")}</select>
-          <label for="s-scheme">Protocol</label><select id="s-scheme"><option value="http" ${sw.scheme !== "https" ? "selected" : ""}>HTTP</option><option value="https" ${sw.scheme === "https" ? "selected" : ""}>HTTPS (RouterOS www-ssl)</option></select>
-          <label for="s-user">User</label><input type="text" id="s-user" value="${esc(sw.user || "admin")}">
-          <label for="s-pass">Password</label><input type="password" id="s-pass" placeholder="kept in memory only">
-          <span></span><div class="btnrow"><button class="btn primary" type="submit">Connect</button>${st.switch.state === "ok" ? '<button class="btn" type="button" id="s-off">Disconnect</button>' : ""}<button class="btn ghost" type="button" id="s-probe">Switch probe</button></div>
-        </form>
-        ${st.switch.error ? `<div class="callout bad" style="margin-top:12px">${esc(st.switch.error)}</div>` : ""}
-        <div class="note" style="margin-top:12px">CRS switches can run RouterOS or SwOS; Auto-detect works out which. On RouterOS MCC uses the REST API (enable the <span class="mono">www</span> or <span class="mono">www-ssl</span> service; a read-only user is enough). SwOS has no API, so MCC reads the status files its web page uses. Either way MCC only reads. If a column shows "—", open <b>Switch probe</b> to see the raw data.</div>
-        <pre class="evidence hidden" id="probe"></pre>
-      </div></section>
+      <section class="panel s6" data-pid="setup:switches"><header><h2>Switches</h2><span class="grow"></span><span class="hint">read-only · as many as you have</span></header><div class="body" id="sw-panel">${this.switchesPanel()}</div></section>
 
       <section class="panel s12"><header><h2>Telemetry from the router</h2><span class="grow"></span><span class="hint">nothing changes until you approve</span></header><div class="body" id="plan">
         ${connected() ? '<div class="btnrow"><button class="btn primary" id="plan-load">Review the router changes MCC needs</button><button class="btn ghost" id="plan-remove">Plan removal of everything MCC added…</button></div>' : '<div class="note">Connect the router first.</div>'}
@@ -1142,6 +1447,92 @@ VIEWS.setup = {
     this.drawCollectors();
     this.drawGeo();
     this.drawIdent();
+  },
+  /* your switches, and a form to add one or to connect / edit one of them */
+  switchesPanel() {
+    const cfg = (S.config.switches || []), live = new Map((S.snap.switches || []).map((x) => [x.id, x]));
+    const f = this.swForm || null;  // {mode: "add" | "connect" | "edit", id}
+    const list = cfg.length ? `<div class="sw-list">${cfg.map((c) => {
+      const x = live.get(c.id) || {}, st = x.state || "off";
+      return `<div class="sw-item ${f && f.id === c.id ? "on" : ""}"><div class="sw-row"><b>${esc(x.label || c.name || c.host)}</b><span class="mono faint">${esc(c.id)}</span>
+          ${this.stateChip(st === "off" ? "disconnected" : st)}<span class="grow"></span>
+          ${st === "off" ? `<button class="btn sm primary" data-sw-connect="${esc(c.id)}">Connect…</button>` : `<button class="btn sm" data-sw-off="${esc(c.id)}">Disconnect</button>`}
+          <button class="btn sm ghost" data-sw-edit="${esc(c.id)}">Edit</button>${st !== "off" ? `<button class="btn sm ghost" data-sw-probe="${esc(c.id)}">Probe</button>` : ""}</div>
+        <div class="note">${esc(c.host)} · ${esc(swKind(x) === "switch" ? (c.kind === "auto" ? "auto-detect" : c.kind) : swKind(x))}${swSub(x) ? " · " + esc(swSub(x)) : ""}${(c.uplink || {}).parent ? ` · uplink set: ${esc(c.uplink.parent === "router" ? "router" : c.uplink.parent)} ${esc(c.uplink.port || "")}` : ""}</div>
+        ${x.error ? `<div class="callout bad" style="margin-top:6px">${esc(x.error)}</div>` : ""}</div>`; }).join("")}</div>` : '<div class="note">No switch yet. Add each switch MCC should read.</div>';
+    return `${list}
+      <div class="btnrow" style="margin-top:12px">${f ? "" : '<button class="btn" id="sw-add">Add a switch…</button>'}</div>
+      ${f ? this.switchForm(f, cfg.find((c) => c.id === f.id) || {}) : ""}
+      <pre class="evidence hidden" id="probe"></pre>
+      <div class="note" style="margin-top:12px">CRS switches can run RouterOS or SwOS; Auto-detect works out which. On RouterOS MCC uses the REST API (enable the <span class="mono">www</span> or <span class="mono">www-ssl</span> service; a read-only user is enough). SwOS has no API, so MCC reads the status files its web page uses. Either way MCC only reads. If a column shows "—", open <b>Probe</b> to see the raw data.</div>`;
+  },
+  switchForm(f, c) {
+    const others = (S.config.switches || []).filter((x) => x.id !== c.id);
+    const up = c.uplink || {};
+    const conn = f.mode !== "edit";
+    return `<form class="form sw-form" id="f-switch" autocomplete="off"><div class="full"><h4 class="mini" style="margin:0">${f.mode === "add" ? "Add a switch" : f.mode === "connect" ? "Connect " + esc(c.name || c.host) : "Edit " + esc(c.name || c.host)}</h4></div>
+      ${conn ? `<label for="s-host">Address</label><input type="text" id="s-host" value="${esc(c.host || "")}" placeholder="192.168.88.2" required>
+      <label for="s-kind">Runs</label><select id="s-kind">${[["auto", "Auto-detect"], ["routeros", "RouterOS (REST API)"], ["swos", "SwOS"]]
+        .map(([k, l]) => `<option value="${k}" ${(c.kind || "auto") === k ? "selected" : ""}>${l}</option>`).join("")}</select>
+      <label for="s-scheme">Protocol</label><select id="s-scheme"><option value="http" ${c.scheme !== "https" ? "selected" : ""}>HTTP</option><option value="https" ${c.scheme === "https" ? "selected" : ""}>HTTPS (RouterOS www-ssl)</option></select>
+      <label for="s-user">User</label><input type="text" id="s-user" value="${esc(c.user || "admin")}">
+      <label for="s-pass">Password</label><input type="password" id="s-pass" placeholder="kept in memory only">` : ""}
+      <label for="s-name">Name</label><input type="text" id="s-name" value="${esc(c.name || "")}" placeholder="blank = the switch's own identity">
+      ${f.mode === "edit" ? `<label for="s-parent">Plugs into</label><div class="btnrow"><select id="s-parent" style="width:auto"><option value="">work it out</option><option value="router" ${up.parent === "router" ? "selected" : ""}>the router</option>
+          ${others.map((o) => `<option value="${esc(o.id)}" ${up.parent === o.id ? "selected" : ""}>${esc(o.name || o.host)} (${esc(o.id)})</option>`).join("")}</select>
+          <input type="text" id="s-pport" value="${esc(up.port || "")}" placeholder="its port, e.g. sfp5" style="width:150px"></div>
+        <label for="s-lport">Through this switch's port</label><input type="text" id="s-lport" value="${esc(up.local_port || "")}" placeholder="e.g. SFP1 (blank = work it out)" style="max-width:220px">
+        <span></span><div class="note">For the topology map. Leave "work it out" unless MCC places this switch wrongly: it finds it from neighbor discovery and the other switches' MAC tables.</div>` : ""}
+      <span></span><div class="btnrow"><button class="btn primary" type="submit">${conn ? "Connect" : "Save"}</button><button class="btn ghost" type="button" id="sw-cancel">Cancel</button>
+        ${f.mode === "edit" ? `<span class="grow"></span><button class="btn danger sm" type="button" id="sw-remove">Remove switch</button>` : ""}</div></form>`;
+  },
+  bindSwitches(el) {
+    if (!el) return;
+    const redraw = () => { el.innerHTML = this.switchesPanel(); this.bindSwitches(el); };
+    const add = $("#sw-add", el);
+    if (add) add.onclick = () => { this.swForm = { mode: "add" }; redraw(); };
+    $$("[data-sw-connect]", el).forEach((b) => (b.onclick = () => { this.swForm = { mode: "connect", id: b.dataset.swConnect }; redraw(); }));
+    $$("[data-sw-edit]", el).forEach((b) => (b.onclick = () => { this.swForm = { mode: "edit", id: b.dataset.swEdit }; redraw(); }));
+    $$("[data-sw-off]", el).forEach((b) => (b.onclick = async () => {
+      try { await api.post("/api/disconnect", { what: "switch", id: b.dataset.swOff }); } catch (err) { toast("Not disconnected", err.message, { bad: true }); }
+      setTimeout(redraw, 300);
+    }));
+    $$("[data-sw-probe]", el).forEach((b) => (b.onclick = async () => {
+      const pre = $("#probe", el);
+      try { pre.textContent = JSON.stringify(await api.get("/api/switch/probe?id=" + encodeURIComponent(b.dataset.swProbe)), null, 1); } catch (err) { pre.textContent = err.message; }
+      pre.classList.remove("hidden");
+    }));
+    const cancel = $("#sw-cancel", el);
+    if (cancel) cancel.onclick = () => { this.swForm = null; redraw(); };
+    const rm = $("#sw-remove", el);
+    if (rm) rm.onclick = async () => {
+      const id = this.swForm.id;
+      if (!confirm(`Remove ${id}? MCC stops reading it and forgets its address. The switch itself isn't changed.`)) return;
+      try { S.config = (await api.post(`/api/switches/${encodeURIComponent(id)}/remove`, { confirm: true })).config; this.swForm = null; toast("Switch removed", id, { good: true }); redraw(); }
+      catch (err) { toast("Not removed", err.message, { bad: true }); }
+    };
+    const form = $("#f-switch", el);
+    if (!form) return;
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const f = this.swForm, btn = $("button[type=submit]", form);
+      btn.disabled = true;
+      try {
+        if (f.mode === "edit") {
+          const parent = $("#s-parent").value;
+          S.config = (await api.post(`/api/switches/${encodeURIComponent(f.id)}`, { name: $("#s-name").value,
+            uplink: { parent, port: parent ? $("#s-pport").value.trim() : "", local_port: parent ? $("#s-lport").value.trim() : "" } })).config;
+          toast("Switch saved", "", { good: true });
+        } else {
+          const res = await api.post("/api/connect/switch", { switch: { id: f.mode === "connect" ? f.id : "", host: $("#s-host").value, user: $("#s-user").value,
+            password: $("#s-pass").value, kind: $("#s-kind").value, scheme: $("#s-scheme").value, name: $("#s-name").value } });
+          toast(`${res.label} connected`, `${res.kind === "routeros" ? "RouterOS" : "SwOS"} · ${res.sys.model || ""} · ${res.ports} ports`, { good: true });
+          S.config = (await api.get("/api/state")).config;
+        }
+        this.swForm = null;
+        setTimeout(redraw, 300);
+      } catch (err) { btn.disabled = false; toast(f.mode === "edit" ? "Not saved" : "Couldn't reach the switch", err.message, { bad: true, ms: 12000 }); }
+    };
   },
   stateChip(s) {
     const cls = s === "ok" ? "green" : s === "error" ? "red" : s === "connecting" ? "amber" : "";
@@ -1183,24 +1574,7 @@ VIEWS.setup = {
     };
     const off = $("#r-off", m);
     if (off) off.onclick = async () => { await api.post("/api/disconnect", { what: "router" }); setTimeout(() => this.render($("#main")), 300); };
-    $("#f-switch", m).onsubmit = async (e) => {
-      e.preventDefault();
-      try {
-        const res = await api.post("/api/connect/switch", { switch: { host: $("#s-host").value, user: $("#s-user").value, password: $("#s-pass").value,
-          kind: $("#s-kind").value, scheme: $("#s-scheme").value } });
-        $("#s-pass").value = "";
-        toast("Switch connected", `${res.kind === "routeros" ? "RouterOS" : "SwOS"} · ${res.sys.model || ""} · ${res.ports} ports`, { good: true });
-        S.config = (await api.get("/api/state")).config;
-        setTimeout(() => this.render($("#main")), 300);
-      } catch (err) { toast("Couldn't reach the switch", err.message, { bad: true, ms: 12000 }); }
-    };
-    const soff = $("#s-off", m);
-    if (soff) soff.onclick = async () => { await api.post("/api/disconnect", { what: "switch" }); setTimeout(() => this.render($("#main")), 300); };
-    $("#s-probe", m).onclick = async () => {
-      const pre = $("#probe");
-      try { pre.textContent = JSON.stringify(await api.get("/api/switch/probe"), null, 1); } catch (err) { pre.textContent = err.message; }
-      pre.classList.remove("hidden");
-    };
+    this.bindSwitches($("#sw-panel", m));
     const pl = $("#plan-load", m);
     if (pl) pl.onclick = () => this.loadPlan("/api/setup/plan");
     const pr = $("#plan-remove", m);
@@ -1381,6 +1755,11 @@ VIEWS.setup = {
     this.identT = setTimeout(() => this.drawIdent(), 800);
   },
   leave() { clearTimeout(this.geoT); clearTimeout(this.identT); },
-  tick() { if (++this.n % 3 === 0) this.drawCollectors(); },
+  tick() {
+    if (++this.n % 3 !== 0) return;
+    this.drawCollectors();
+    const el = $("#sw-panel");  // switch states, unless a switch form is open
+    if (el && !this.swForm) Live.set(el, this.switchesPanel(), (e) => this.bindSwitches(e));
+  },
   n: 0,
 };

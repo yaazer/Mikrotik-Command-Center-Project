@@ -35,7 +35,7 @@ class Demo:
         (self.dir / "blocklist.txt").write_text("192.0.2.66\n", encoding="utf-8")
         self.world = sim.World(speed=4).start()
         self.router = sim.serve(sim.make_router(self.world))
-        self.switch = sim.serve(sim.make_swos(self.world))
+        self.switches = {sid: sim.serve(sim.make_swos(self.world, sid=sid)) for sid in sim.SWITCHES}
         cfg = Config(self.dir)
         cfg.update({"collectors": {"bind": "127.0.0.1", "flow_port": 0, "syslog_port": 0},
                     "blocklist_file": str(self.dir / "blocklist.txt"), "lan_networks": ["192.168.88.0/24"],
@@ -46,7 +46,9 @@ class Demo:
         self.httpd, _ = make_server(self.hub, "127.0.0.1", 0)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         self.hub.connect_router("127.0.0.1", "admin", "demo", scheme="http", port=self.router.server_address[1])
-        self.hub.connect_switch("127.0.0.1:{}".format(self.switch.server_address[1]), "admin", "")
+        for sid, srv in self.switches.items():
+            self.hub.connect_switch("127.0.0.1:{}".format(srv.server_address[1]), "admin", "", sid=sid,
+                                    name=sim.SWITCHES[sid]["identity"])
         self.url = "http://127.0.0.1:{}/".format(self.httpd.server_address[1])
         return self
 
@@ -99,12 +101,14 @@ def sc_pages(d: Demo, c: Check) -> None:
           "live traffic canvas and top talkers render")
         c(b.eval("document.querySelector('#router-id').innerText.includes('core-router')"), "header names the router")
         c(b.eval("[...document.querySelectorAll('.chip')].map(x=>x.innerText).join()").count(",") == 3, "4 status chips")
-        c(b.until("document.querySelectorAll('#ports .port').length === 9", 10), "switch shows 9 ports")
+        c(b.until("document.querySelectorAll('#ports .sw-block').length === 2 && document.querySelectorAll('#ports .port').length === 19", 10),
+          "both switches and their ports (9 + 10)")
         c(b.until("document.querySelector('#feed') && document.querySelector('#feed').children.length > 0", 5),
           "threat feed is never blank (cards or 'All quiet')")
         shot(b, "overview")
         for page, probe in (("traffic", "document.querySelectorAll('#pairs tr[data-ip]').length > 3"),
                             ("lan", "document.querySelectorAll('#lan-ports tr').length > 3"),
+                            ("topology", "document.querySelectorAll('#topo-svg .tnode').length >= 5"),
                             ("threats", "document.querySelector('#tlist') !== null"),
                             ("actions", "document.querySelector('#history') !== null"),
                             ("devices", "document.querySelectorAll('#devs tr[data-ip]').length >= 9"),
@@ -760,10 +764,55 @@ def sc_lan(d: Demo, c: Check) -> None:
         c(not b.errors, "no console errors: {}".format(b.errors[:3]))
 
 
+def sc_topology(d: Demo, c: Check) -> None:
+    """Topology: router, both switches (the office one behind the core one), devices on their ports, link state;
+    and a switch's uplink set by hand in Setup."""
+    with Browser(1600, 1000) as b:
+        b.nav(d.url + "#/topology")
+        node = "(VIEWS.topology.data || {nodes: []}).nodes.find(n => n.id === %r)"
+        c(b.until("(%s || {}).parent === 'router'" % (node % "sw:crs309"), 25), "the core switch hangs off the router")
+        c(b.until("(%s || {}).parent === 'sw:crs309' && (%s || {}).port === 'sfp5'" % (node % "sw:css610", node % "sw:css610"), 40),
+          "the office switch is found behind the core switch's sfp5 (from its MAC table)")
+        c(b.until("(%s || {}).parent === 'sw:css610'" % (node % "dev:F4:8E:38:10:00:80"), 20), "the office PC is on the office switch")
+        c(b.eval("(%s || {}).parent === 'nb:F0:9F:C2:30:00:03'" % (node % "dev:3C:22:FB:00:00:21")),
+          "the laptop hangs off the Wi-Fi access point (LLDP) on ether2")
+        c(b.until("document.querySelectorAll('#topo-svg .tnode').length >= 6 && document.querySelectorAll('#topo-svg .tdev').length >= 10", 8),
+          "the map draws the infrastructure and the devices")
+        c(b.eval("!!document.querySelector('#topo-svg .tnode.t-unknown')"), "devices sharing ether5 hang off a 'switch or access point' guess")
+        shot(b, "topology")
+        b.eval("document.querySelector('#topo-svg .tnode[data-id=\"sw:crs309\"]').dispatchEvent(new MouseEvent('click', {bubbles: true}))")
+        c(b.until("document.querySelector('#topo-dt').textContent === 'core-switch' && document.querySelectorAll('#topo-detail .port').length === 9", 5),
+          "clicking a switch shows its details and ports")
+        click(b, "#topo-devs [data-d=hide]")
+        c(b.until("document.querySelectorAll('#topo-svg .tdev').length === 0 && document.querySelectorAll('#topo-svg .tnode').length >= 6", 5),
+          "infrastructure only")
+        click(b, "#topo-devs [data-d=show]")
+        d.world.sw_link[5] = False  # the office switch's uplink fails
+        c(b.until("!!document.querySelector('#topo-svg .tlink.down[data-to=\"sw:css610\"]')", 25), "a failed link turns red")
+        c(b.until("!!document.querySelector('#topo-svg .tnode.st-error[data-id=\"sw:css610\"]')", 25), "and the switch behind it is unreachable")
+        shot(b, "topology-link-down")
+        d.world.sw_link[5] = True
+        # set the office switch's uplink by hand, then back to "work it out"
+        b.nav(d.url + "#/setup")
+        see(b, "#sw-panel")
+        c(b.until("document.querySelectorAll('#sw-panel .sw-item').length === 2", 10), "Setup lists both switches")
+        click(b, "[data-sw-edit=css610]")
+        b.until("!!document.querySelector('#s-parent')", 5)
+        b.eval("(() => { const s = document.querySelector('#s-parent'); s.value = 'router'; document.querySelector('#s-pport').value = 'ether4'; })()")
+        click(b, "#f-switch button[type=submit]")
+        c(b.until("((S.config.switches || []).find(x => x.id === 'css610') || {uplink: {}}).uplink.parent === 'router'", 5), "uplink saved")
+        b.nav(d.url + "#/topology")
+        c(b.until("(%s || {}).parent === 'router' && (%s || {}).how === 'set in Setup'" % (node % "sw:css610", node % "sw:css610"), 10),
+          "the map follows what was set in Setup")
+        d.hub.update_switch("css610", uplink={"parent": ""})
+        c(b.until("(%s || {}).parent === 'sw:crs309'" % (node % "sw:css610"), 10), "and works it out again when cleared")
+        c(not b.errors, "no console errors: {}".format(b.errors[:3]))
+
+
 SCENARIOS = {"pages": sc_pages, "identify": sc_identify, "setup": sc_setup, "respond": sc_respond, "ignore": sc_ignore, "layout": sc_layout, "globe-fade": sc_globe_fade, "theme": sc_theme, "update": sc_update, "types": sc_types, "drawer": sc_drawer, "phone": sc_phone,
              "light": sc_light, "offscreen": sc_offscreen,
              "single-out": sc_single_out, "globe-fit": sc_globe_fit,
-             "vpn": sc_vpn, "lan": sc_lan}
+             "vpn": sc_vpn, "lan": sc_lan, "topology": sc_topology}
 
 
 def main(argv) -> int:

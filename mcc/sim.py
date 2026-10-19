@@ -63,6 +63,11 @@ HOSTS = [
      [("api.wyzecam.com", 443, "tcp", 0.05, 1.2, 1)]),
     ("192.168.88.60", "00:1B:A9:00:00:60", "printer", "ether5", 0,
      [("time.cloudflare.com", 123, "udp", 0.001, 0.001, 1)]),
+    # the office, behind the CSS610 (switch port given as (switch, port index))
+    ("192.168.88.80", "F4:8E:38:10:00:80", "office-pc", "sfp-sfpplus1", ("css610", 0),
+     [("github.com", 443, "tcp", 0.8, 0.1, 1), ("www.msftconnecttest.com", 80, "tcp", 0.001, 0.001, 1)]),
+    ("192.168.88.81", "24:9A:D8:10:00:81", "yealink-t54w", "sfp-sfpplus1", ("css610", 1),
+     [("zoom.us", 8801, "udp", 0.09, 0.09, 1)]),
     # the IoT VLAN (vlan20-iot, 192.168.20.0/24): routed to the main network, so the router sees what crosses
     ("192.168.20.11", "84:00:EC:3A:1F:2C", "shellyplug-s-3A1F2C", "ether5", 0,
      [("shelly-103-eu.shelly.cloud", 443, "tcp", 0.002, 0.002, 1)]),
@@ -76,6 +81,7 @@ IOT_VLAN, IOT_NET = "vlan20-iot", "192.168.20."
 LAN_FLOWS = [
     ("192.168.88.21", "192.168.88.10", 445, "tcp", 2.0, 18.0, 1),     # the laptop backs up to the NAS over SMB
     ("192.168.88.20", "192.168.88.10", 445, "tcp", 30.0, 4.0, 2),     # the workstation's files: inside the CRS309
+    ("192.168.88.80", "192.168.88.10", 445, "tcp", 6.0, 1.0, 1),      # the office PC's: CSS610 -> CRS309 -> NAS
     ("192.168.88.70", "192.168.88.10", 2049, "tcp", 6.0, 3.0, 1),     # the homelab mounts the NAS: inside it too
     ("192.168.88.30", "192.168.88.10", 32400, "tcp", 14.0, 0.2, 1),   # the TV plays a film from Plex on the NAS
     ("192.168.88.22", "192.168.88.30", 8009, "tcp", 0.05, 0.2, 1),    # the phone casts to the TV
@@ -104,8 +110,12 @@ CLASS_IDS = {"192.168.88.20": "MSFT 5.0", "192.168.88.40": "MSFT 5.0", "192.168.
 # Devices that announce themselves (MNDP / LLDP): (ip, mac, router port, /ip/neighbor fields)
 NEIGHBORS = [
     ("192.168.88.2", "DC:2C:6E:30:09:01", "sfp-sfpplus1",
-     {"identity": "crs309", "platform": "MikroTik", "board": "CRS309-1G-8S+", "version": "2.17",
-      "discovered-by": "mndp,lldp", "system-caps": "bridge", "system-caps-enabled": "bridge"}),
+     {"identity": "core-switch", "platform": "MikroTik", "board": "CRS309-1G-8S+", "version": "2.17",
+      "discovered-by": "mndp,lldp", "interface-name": "sfp1", "system-caps": "bridge", "system-caps-enabled": "bridge"}),
+    # MNDP is a broadcast, so the router also hears the office switch behind the CRS309 (LLDP stops at the first hop)
+    ("192.168.88.4", "DC:2C:6E:61:06:10", "sfp-sfpplus1",
+     {"identity": "office-switch", "platform": "MikroTik", "board": "CSS610-8G-2S+", "version": "2.17",
+      "discovered-by": "mndp", "interface-name": "SFP1"}),
     ("192.168.88.3", "F0:9F:C2:30:00:03", "ether2",
      {"identity": "U6-Lite-Hall", "platform": "", "system-description": "Ubiquiti U6-Lite, 6.6.65",
       "discovered-by": "lldp", "system-caps": "bridge,wlan-ap", "system-caps-enabled": "bridge,wlan-ap"}),
@@ -163,6 +173,18 @@ def demo_geo(ip: str) -> Optional[Dict[str, Any]]:
 
 ROUTER_PORTS = ["ether1", "ether2", "ether3", "ether4", "ether5", "sfp-sfpplus1"]
 SWITCH_PORTS = ["ether1", "sfp1", "sfp2", "sfp3", "sfp4", "sfp5", "sfp6", "sfp7", "sfp8"]
+# Two SwOS switches: the CRS309 on the router's sfp-sfpplus1, and an office CSS610 hanging off the CRS309's sfp5.
+# uplink = the port (0-based) toward the router; parent = (switch, its port) the uplink plugs into.
+SWITCHES: Dict[str, Dict[str, Any]] = {
+    "crs309": {"model": "CRS309-1G-8S+", "identity": "core-switch", "mac": "DC:2C:6E:30:09:01", "ip": "192.168.88.2",
+               "ports": SWITCH_PORTS, "uplink": 1, "parent": None, "router_port": "sfp-sfpplus1",
+               "links": [True, True, True, True, True, True, False, False, False]},
+    "css610": {"model": "CSS610-8G-2S+", "identity": "office-switch", "mac": "DC:2C:6E:61:06:10", "ip": "192.168.88.4",
+               "ports": ["Port1", "Port2", "Port3", "Port4", "Port5", "Port6", "Port7", "Port8", "SFP1", "SFP2"],
+               "uplink": 8, "parent": ("crs309", 5), "router_port": "sfp-sfpplus1",
+               "links": [True, True, False, False, False, False, False, False, True, False]},
+}
+ROUTER_MACS = ("48:A9:8A:00:00:10", "48:A9:8A:00:00:06")  # the bridge, and sfp-sfpplus1
 
 # (offset s, event, duration s) within each cycle
 SCRIPT = [(6, "ssh_brute", 50), (20, "login_fail", 45), (40, "scan", 40), (75, "worm", 40), (100, "c2", 60),
@@ -227,9 +249,10 @@ class World:
         self.flow_seq = 0
         self.flow_pkts = 0
         self.last_flow_export = 0.0
-        self.sw_rx = [0.0] * len(SWITCH_PORTS)
-        self.sw_tx = [0.0] * len(SWITCH_PORTS)
-        self.sw_link = [True, True, True, True, True, True, False, False, False]
+        # per switch: byte counters and link state, per port
+        self.sw = {sid: {"rx": [0.0] * len(d["ports"]), "tx": [0.0] * len(d["ports"]), "link": list(d["links"])}
+                   for sid, d in SWITCHES.items()}
+        self.sw_rx, self.sw_tx, self.sw_link = self.sw["crs309"]["rx"], self.sw["crs309"]["tx"], self.sw["crs309"]["link"]
         self.attackers: Dict[str, str] = {}
         self.extra_hosts: List[Tuple[str, str, str, str, int, list]] = []
         self.class_ids: Dict[str, str] = dict(CLASS_IDS)
@@ -357,6 +380,51 @@ class World:
         self.add("/interface/bridge/host", {"mac-address": mac, "on-interface": rport, "interface": "bridge",
                                             "local": False, "dynamic": True})
 
+    # -- the switches: where a device hangs, and whether it can be reached --------------------
+    @staticmethod
+    def hops(h: Tuple[Any, ...]) -> List[Tuple[str, int, int]]:
+        """A device's way to the router through the switches: [(switch, its port, the switch's uplink port)]."""
+        sp = h[4]
+        if not sp:
+            return []
+        sid, idx = sp if isinstance(sp, tuple) else ("crs309", sp)
+        out = []
+        while sid:
+            d = SWITCHES[sid]
+            out.append((sid, idx, d["uplink"]))
+            sid, idx = d["parent"] if d["parent"] else (None, 0)
+        return out
+
+    def switch_reachable(self, sid: str) -> bool:
+        d = SWITCHES[sid]
+        if not self.sw[sid]["link"][d["uplink"]] or not self.iface_up(d["router_port"]):
+            return False
+        if d["parent"]:
+            psid, pidx = d["parent"]
+            return self.sw[psid]["link"][pidx] and self.switch_reachable(psid)
+        return True
+
+    def host_up(self, h: Tuple[Any, ...]) -> bool:
+        if not self.iface_up(h[3]):
+            return False
+        return all(self.sw[sid]["link"][p] and self.sw[sid]["link"][u] for sid, p, u in self.hops(h))
+
+    def mac_table(self, sid: str) -> List[Tuple[str, int]]:
+        """What a switch has learnt: (MAC, port index). The router and anything upstream on its uplink; the devices
+        and switches below it on their ports."""
+        d = SWITCHES[sid]
+        out = [(m, d["uplink"]) for m in ROUTER_MACS]
+        if d["parent"]:
+            out.append((SWITCHES[d["parent"][0]]["mac"], d["uplink"]))
+        for csid, c in SWITCHES.items():
+            if c["parent"] and c["parent"][0] == sid and self.switch_reachable(csid):
+                out.append((c["mac"], c["parent"][1]))
+        for h in self.host_list():
+            for hsid, port, _u in self.hops(h):
+                if hsid == sid and self.host_up(h):
+                    out.append((h[1], port))
+        return out
+
     # -- device-to-device traffic: what the router can see of it -------------------------------
     def port_of(self, ip: str) -> str:
         return next((h[3] for h in self.host_list() if h[0] == ip), "")
@@ -462,8 +530,9 @@ class World:
         for c in self.conns.values():
             if c["_kind"] in ("app", "lan"):
                 per_host[(c["_host"], c["_dst"] + ":" + str(c["_dport"]))] += 1
-        for ip, mac, name, rport, sport, apps in self.host_list():
-            if not self.iface_up(rport) or self.quarantined(ip):
+        for h in self.host_list():
+            ip, mac, name, rport, sport, apps = h
+            if not self.host_up(h) or self.quarantined(ip):
                 continue
             if ip == "192.168.88.22" and not self.iface_up(VPN_IF):
                 continue  # kill switch
@@ -477,7 +546,7 @@ class World:
         hosts = {h[0]: h for h in self.host_list()}
         for client, server, port, proto, to_client, to_server, n in LAN_FLOWS:
             hc, hs = hosts.get(client), hosts.get(server)
-            if not hc or not hs or not self.iface_up(hc[3]) or not self.iface_up(hs[3]) or \
+            if not hc or not hs or not self.host_up(hc) or not self.host_up(hs) or \
                     self.quarantined(client) or self.quarantined(server):
                 continue
             key = (client, server + ":" + str(port))
@@ -750,8 +819,8 @@ class World:
             wave = 0.75 + 0.25 * math.sin(now / 40.0)
             port_rx: Dict[str, float] = defaultdict(float)
             port_tx: Dict[str, float] = defaultdict(float)
-            sw_rx = [0.0] * len(SWITCH_PORTS)
-            sw_tx = [0.0] * len(SWITCH_PORTS)
+            sw_rx = {sid: [0.0] * len(d["ports"]) for sid, d in SWITCHES.items()}
+            sw_tx = {sid: [0.0] * len(d["ports"]) for sid, d in SWITCHES.items()}
             wan_rx = wan_tx = 0.0
             hosts = {h[0]: h for h in self.host_list()}
             for cid in list(self.conns):
@@ -760,11 +829,11 @@ class World:
                     del self.conns[cid]
                     continue
                 h = hosts.get(c["_host"])
-                if h and (not self.iface_up(h[3]) or self.quarantined(h[0])):
+                if h and (not self.host_up(h) or self.quarantined(h[0])):
                     del self.conns[cid]
                     continue
                 hs = hosts.get(c["_dst"]) if c["_kind"] == "lan" else None
-                if hs and (not self.iface_up(hs[3]) or self.quarantined(hs[0])):
+                if hs and (not self.host_up(hs) or self.quarantined(hs[0])):
                     del self.conns[cid]
                     continue
                 if c["_in"] and self.blocked(c["_src"]) or (not c["_in"] and self.blocked(c["_dst"])):
@@ -793,11 +862,11 @@ class World:
                 if h:
                     port_tx[h[3]] += down
                     port_rx[h[3]] += up
-                    if h[4]:
-                        sw_tx[h[4]] += down
-                        sw_rx[h[4]] += up
-                        sw_tx[1] += up
-                        sw_rx[1] += down
+                    for sid, port, uplink in self.hops(h):  # down its switch port, up each uplink
+                        sw_tx[sid][port] += down
+                        sw_rx[sid][port] += up
+                        sw_tx[sid][uplink] += up
+                        sw_rx[sid][uplink] += down
             port_rx["ether1"] += wan_rx
             port_tx["ether1"] += wan_tx
             port_rx["bridge"] = sum(v for k, v in port_rx.items() if k not in ("ether1", VPN_IF))
@@ -820,14 +889,13 @@ class World:
                 r["tx-byte"] = str(int(r["tx-byte"]) + int(tx * dt / 8))
                 r["rx-packet"] = str(int(r.get("rx-packet", "0")) + int(rx * dt / 9600))
                 r["tx-packet"] = str(int(r.get("tx-packet", "0")) + int(tx * dt / 9600))
-            sw_rx[0] += 5e3
-            sw_tx[0] += 8e3
-            sw_rx[5] += 3e5 if self.sw_link[5] else 0
-            sw_tx[5] += 6e5 if self.sw_link[5] else 0
-            for i in range(len(SWITCH_PORTS)):
-                if self.sw_link[i]:
-                    self.sw_rx[i] += sw_rx[i] * dt / 8
-                    self.sw_tx[i] += sw_tx[i] * dt / 8
+            sw_rx["crs309"][0] += 5e3  # management port chatter
+            sw_tx["crs309"][0] += 8e3
+            for sid, st in self.sw.items():
+                for i in range(len(st["link"])):
+                    if st["link"][i]:
+                        st["rx"][i] += sw_rx[sid][i] * dt / 8
+                        st["tx"][i] += sw_tx[sid][i] * dt / 8
             load = (wan_rx + wan_tx) / 1e9 * 30 + len(self.conns) / 200.0
             self.cpu = max(1.0, min(100.0, self.cpu * 0.7 + (4 + load + self.rng.uniform(0, 4)) * 0.3))
             for e in self.tables["/ip/firewall/address-list"]:
@@ -841,9 +909,9 @@ class World:
                                                         if not e.get("_dead")]
             self._export(now)
 
-    @staticmethod
-    def _lan_counters(c: Dict[str, Any], up: float, down: float, hosts: Dict[str, Any], port_rx: Dict[str, float],
-                      port_tx: Dict[str, float], sw_rx: List[float], sw_tx: List[float]) -> None:
+    def _lan_counters(self, c: Dict[str, Any], up: float, down: float, hosts: Dict[str, Any],
+                      port_rx: Dict[str, float], port_tx: Dict[str, float], sw_rx: Dict[str, List[float]],
+                      sw_tx: Dict[str, List[float]]) -> None:
         """Device-to-device bytes on the ports they cross. up = client -> server, down = server -> client."""
         hc, hs = hosts.get(c["_src"]), hosts.get(c["_dst"])
         if not hc or not hs:
@@ -854,14 +922,17 @@ class World:
             port_tx[hc[3]] += down
             port_rx[hs[3]] += down
             port_tx[hs[3]] += up
-        inside = [(h, sent, got) for h, sent, got in ((hc, up, down), (hs, down, up)) if h[4]]
-        for h, sent, got in inside:  # behind the CRS309
-            sw_rx[h[4]] += sent
-            sw_tx[h[4]] += got
-        if len(inside) == 1:  # one end outside the switch: through its uplink to the router
-            _h, sent, got = inside[0]
-            sw_tx[1] += sent
-            sw_rx[1] += got
+        # each end climbs its switches until they meet in one; there it crosses from one port to the other
+        ha, hb = self.hops(hc), self.hops(hs)
+        meet = next((sid for sid, _p, _u in ha if any(sid == b for b, _q, _v in hb)), None)
+        for path, sent, got in ((ha, up, down), (hb, down, up)):
+            for sid, port, uplink in path:
+                sw_rx[sid][port] += sent
+                sw_tx[sid][port] += got
+                if sid == meet:
+                    break
+                sw_tx[sid][uplink] += sent
+                sw_rx[sid][uplink] += got
 
     def run(self) -> None:
         last = time.time()
@@ -1065,8 +1136,10 @@ def _hex(s: str) -> str:
 
 
 def make_swos(world: World, user: str = "admin", password: str = "", bind: str = "127.0.0.1",
-              port: int = 0) -> ThreadingHTTPServer:
-    realm = "CRS309-1G-8S+"
+              port: int = 0, sid: str = "crs309") -> ThreadingHTTPServer:
+    sw = SWITCHES[sid]
+    names = sw["ports"]
+    realm = sw["model"]
     nonces: set = set()
 
     def md5(s: str) -> str:
@@ -1103,22 +1176,30 @@ def make_swos(world: World, user: str = "admin", password: str = "", bind: str =
                 return
             name = self.path.lstrip("/")
             with world.lock:
+                if not world.switch_reachable(sid):  # its uplink is down: nothing answers
+                    self.close_connection = True
+                    return
+                st = world.sw[sid]
                 if name == "link.b":
-                    en = (1 << len(SWITCH_PORTS)) - 1
-                    lnk = sum(1 << i for i, up in enumerate(world.sw_link) if up)
-                    spd = ",".join("0x{:02x}".format(2 if i == 0 else 3) for i in range(len(SWITCH_PORTS)))
-                    nm = ",".join("'{}'".format(_hex(n)) for n in SWITCH_PORTS)
+                    en = (1 << len(names)) - 1
+                    lnk = sum(1 << i for i, up in enumerate(st["link"]) if up)
+                    spd = ",".join("0x{:02x}".format(2 if n.lower().startswith(("ether", "port")) else 3) for n in names)
+                    nm = ",".join("'{}'".format(_hex(n)) for n in names)
                     body = "{{en:0x{:x},lnk:0x{:x},dpx:0x{:x},spd:[{}],nm:[{}],prt:0x{:x}}}".format(
-                        en, lnk, en, spd, nm, len(SWITCH_PORTS))
+                        en, lnk, en, spd, nm, len(names))
                 elif name == "stats.b":
                     def arr(vals: List[float], hi: bool) -> str:
                         return ",".join("0x{:x}".format((int(v) >> 32) if hi else (int(v) & 0xFFFFFFFF)) for v in vals)
                     body = "{{rb:[{}],rbh:[{}],tb:[{}],tbh:[{}],rfcs:[{}]}}".format(
-                        arr(world.sw_rx, False), arr(world.sw_rx, True), arr(world.sw_tx, False),
-                        arr(world.sw_tx, True), ",".join("0x0" for _ in SWITCH_PORTS))
+                        arr(st["rx"], False), arr(st["rx"], True), arr(st["tx"], False),
+                        arr(st["tx"], True), ",".join("0x0" for _ in names))
                 elif name == "sys.b":
-                    body = "{{id:'{}',brd:'{}',ver:'{}',upt:0x{:x}}}".format(
-                        _hex("core-switch"), _hex("CRS309-1G-8S+"), _hex("2.17"), int(time.time() - world.boot) * 100)
+                    body = "{{id:'{}',brd:'{}',ver:'{}',mac:'{}',upt:0x{:x}}}".format(
+                        _hex(sw["identity"]), _hex(sw["model"]), _hex("2.17"), sw["mac"].replace(":", "").lower(),
+                        int(time.time() - world.boot) * 100)
+                elif name == "!dhost.b":  # the learnt MAC table
+                    body = "[{}]".format(",".join("{{adr:'{}',prt:0x{:x},vid:0x1}}".format(
+                        mac.replace(":", "").lower(), port) for mac, port in world.mac_table(sid)))
                 else:
                     self.send_response(404)
                     self.send_header("Content-Length", "0")

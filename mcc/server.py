@@ -282,9 +282,14 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840, token: Opti
         if path == "/api/setup/removal":
             return hub.setup.removal_plan(include_lists=q.get("lists") == "1")
         if path == "/api/switch/probe":
-            if hub.swos is None:
-                raise ApiError(409, "no switch connected")
-            return hub.swos.probe()
+            try:
+                return hub.switch_probe(q.get("id", ""))
+            except KeyError:
+                raise ApiError(409, "that switch isn't connected")
+        if path == "/api/switches":
+            return {"switches": hub.switches_view()}
+        if path == "/api/topology":
+            return hub.topology_view()
         if path == "/api/ignore":
             return {"rules": hub.detector.suppressions_list()}
         if path == "/api/pins":
@@ -315,14 +320,36 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840, token: Opti
             s = b.get("switch") or {}
             if not s.get("host"):
                 raise ApiError(400, "switch address required")
+            sid = str(s.get("id") or "")
+            if sid and not hub.switch_cfg(sid):
+                raise ApiError(404, "no such switch")
             return hub.connect_switch(str(s["host"]), str(s.get("user") or "admin"), str(s.get("password") or ""),
-                                      str(s.get("scheme") or "http"), str(s.get("kind") or "auto"))
+                                      str(s.get("scheme") or "http"), str(s.get("kind") or "auto"), sid,
+                                      None if s.get("name") is None else str(s["name"]))
         if path == "/api/disconnect":
             if b.get("what") == "switch":
-                hub.disconnect_switch()
+                try:
+                    hub.disconnect_switch(str(b.get("id") or ""))
+                except KeyError:
+                    raise ApiError(404, "no such switch")
             else:
                 hub.disconnect_router()
             return {"ok": True}
+        if len(parts) in (3, 4) and parts[:2] == ["api", "switches"]:
+            sid = parts[2]
+            if not hub.switch_cfg(sid):
+                raise ApiError(404, "no such switch")
+            if len(parts) == 4 and parts[3] == "remove":
+                if b.get("confirm") is not True:
+                    raise ApiError(400, "confirm must be true")
+                hub.remove_switch(sid)
+                return {"ok": True, "config": hub.cfg.public()}
+            if len(parts) == 3:
+                try:
+                    hub.update_switch(sid, name=b.get("name"), uplink=b.get("uplink"), fields=b.get("fields"))
+                except ValueError as e:
+                    raise ApiError(400, str(e))
+                return {"ok": True, "config": hub.cfg.public()}
         if path == "/api/setup/apply":
             if b.get("approve") is not True:
                 raise ApiError(400, "approve must be true")
@@ -491,6 +518,4 @@ def clean_settings(b: Dict[str, Any]) -> Dict[str, Any]:
                 if not (-90 <= lat <= 90 and -180 <= lon <= 180):
                     raise ApiError(400, "home latitude/longitude out of range")
                 out["geo"]["home"] = {"lat": lat, "lon": lon, "label": str(h.get("label") or "Home")[:60]}
-    if "switch_fields" in b:
-        out["switch"] = {"fields": {str(k): v for k, v in (b["switch_fields"] or {}).items()}}
     return out

@@ -75,7 +75,8 @@ class Env:
         (self.dir / "blocklist.txt").write_text(blocklist, encoding="utf-8")
         self.world = sim.World(seed=3, speed=speed, script=script).start()
         self.router = sim.serve(sim.make_router(self.world))
-        self.switch = sim.serve(sim.make_swos(self.world))
+        self.switch = sim.serve(sim.make_swos(self.world))  # the CRS309
+        self.switch2 = sim.serve(sim.make_swos(self.world, sid="css610"))  # the office CSS610 behind it
         self.cfg = Config(self.dir)
         self.cfg.update({"collectors": {"bind": "127.0.0.1", "flow_port": 0, "syslog_port": 0},
                          "blocklist_file": str(self.dir / "blocklist.txt"), "lan_networks": ["192.168.88.0/24"]})
@@ -93,7 +94,13 @@ class Env:
         self.world.stop()
         self.router.shutdown()
         self.switch.shutdown()
+        self.switch2.shutdown()
         shutil.rmtree(self.dir, ignore_errors=True)
+
+    def connect_switches(self):
+        a = self.hub.connect_switch("127.0.0.1:{}".format(self.switch.server_address[1]), "admin", "")
+        b = self.hub.connect_switch("127.0.0.1:{}".format(self.switch2.server_address[1]), "admin", "", name="office")
+        return a["id"], b["id"]
 
     def __enter__(self):
         return self
@@ -1086,8 +1093,8 @@ def t_e2e_scripted_incidents():
 @test
 def t_switch_polling():
     with Env() as e:
-        e.hub.connect_switch("127.0.0.1:{}".format(e.switch.server_address[1]), "admin", "")
-        ok(wait_for(lambda: any(p.get("rx_bps") for p in e.hub.switch_ports), 15), "switch port rates computed")
+        sid = e.hub.connect_switch("127.0.0.1:{}".format(e.switch.server_address[1]), "admin", "")["id"]
+        ok(wait_for(lambda: any(p.get("rx_bps") for p in e.hub.switches[sid].ports), 15), "switch port rates computed")
         e.world.sw_link[2] = False
         ok(wait_for(lambda: any(t["rule"] == "link_down" and "sfp2" in t["title"] for t in e.hub.detector.list()), 15),
            "switch port link loss detected")
@@ -1109,14 +1116,16 @@ def t_switch_os_detection():
             eq(detect_os("127.0.0.1:1"), "unknown", "nothing listening")
             res = e.hub.connect_switch(ros_host, "admin", "demo")
             eq(res["kind"], "routeros", "auto-detected RouterOS")
-            eq(e.hub.switch_status["kind"], "routeros", "status says RouterOS")
-            names = [p["name"] for p in e.hub.switch_ports]
+            link = e.hub.switches[res["id"]]
+            eq(link.status["kind"], "routeros", "status says RouterOS")
+            names = [p["name"] for p in link.ports]
             eq(names, ["ether1", "ether2", "ether3", "ether4", "ether5", "sfp-sfpplus1"], "physical ports only, no bridge")
-            sfp = e.hub.switch_ports[-1]
+            sfp = link.ports[-1]
             eq((sfp["link"], sfp["speed"]), (True, "10G"), "link and rate from ethernet/monitor")
-            ok(wait_for(lambda: any(p.get("rx_bps") for p in e.hub.switch_ports), 15), "port rates computed from counters")
-            ok("RouterOS" in e.hub.switch_sys["version"], "model/version from the switch")
-            probe = e.hub.swos.probe()
+            ok(wait_for(lambda: any(p.get("rx_bps") for p in link.ports), 15), "port rates computed from counters")
+            ok("RouterOS" in link.sys["version"], "model/version from the switch")
+            ok(link.sys["mac"] and isinstance(link.client.topology()["hosts"], list), "its MACs and bridge host table, for the map")
+            probe = e.hub.switch_probe(res["id"])
             ok(probe["os"] == "routeros" and isinstance(probe["/interface"], list), "probe shows the raw REST data")
             try:
                 e.hub.connect_switch(ros_host, "admin", "wrong")
@@ -1134,6 +1143,7 @@ def t_switch_os_detection():
             except SwOSError as err:
                 ok("couldn't reach" in str(err), "unreachable explained")
             eq(e.hub.connect_switch(swos_host, "admin", "")["kind"], "swos", "SwOS still works")
+            eq(len(e.cfg.get("switches")), 2, "failed connections saved nothing; the two that worked are both kept")
         finally:
             ros_switch.shutdown()
             sw_world.stop()
@@ -1401,6 +1411,145 @@ def t_lan_visibility_live():
         ok(all(e.world.hw_offloaded(n) for n in ("ether2", "ether3", "ether4", "ether5", "sfp-sfpplus1")), "offload back on")
         full = e.hub.full_state()
         ok(full["history"]["lan"], "LAN throughput history for the chart")
+
+
+# ============================================================================================
+# several switches, and the topology
+# ============================================================================================
+@test
+def t_switch_config_migrates():
+    """Before several switches there was one "switch" entry: it becomes the first of "switches"."""
+    d = Path(tempfile.mkdtemp(prefix="mcc-cfg-"))
+    try:
+        (d / "config.json").write_text(json.dumps({"switch": {"host": "192.168.88.2", "user": "admin", "kind": "swos",
+                                                              "fields": {"link": "lnk"}}}), encoding="utf-8")
+        cfg = Config(d)
+        sw = cfg.get("switches")
+        eq((len(sw), sw[0]["id"], sw[0]["host"], sw[0]["kind"], sw[0]["fields"]), (1, "sw1", "192.168.88.2", "swos",
+                                                                                 {"link": "lnk"}), "migrated")
+        ok("switch" not in cfg.data, "the old key is gone")
+        eq(sw[0]["uplink"], {"parent": "", "port": "", "local_port": ""}, "defaults filled in")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test
+def t_topology_build():
+    """The tree from neighbor discovery, the bridge host table and the switches' MAC tables; guesses marked;
+    a switch's uplink set by hand wins."""
+    from mcc.topology import build
+    ifaces = [{"name": "ether1", "type": "ether", "running": True, "rx_bps": 5e6, "tx_bps": 1e6, "mac": "48:A9:8A:00:00:01", "wan": True},
+              {"name": "ether2", "type": "ether", "running": True, "rx_bps": 1e6, "tx_bps": 2e6, "mac": "48:A9:8A:00:00:02"},
+              {"name": "ether5", "type": "ether", "running": True, "rx_bps": 1e5, "tx_bps": 1e5, "mac": "48:A9:8A:00:00:05"},
+              {"name": "sfp1", "type": "ether", "running": False, "rx_bps": 0, "tx_bps": 0, "mac": "48:A9:8A:00:00:06"}]
+    dev = lambda ip, mac, port, name="": {"ip": ip, "mac": mac, "port": port, "name": name}  # noqa: E731
+    devices = [dev("10.0.0.2", "AA:00:00:00:00:02", "sfp1"),  # the core switch's own address
+               dev("10.0.0.10", "AA:00:00:00:00:10", "sfp1", "nas"), dev("10.0.0.20", "AA:00:00:00:00:20", "sfp1", "pc"),
+               dev("10.0.0.30", "AA:00:00:00:00:30", "ether2", "laptop"), dev("10.0.0.3", "AA:00:00:00:00:03", "ether2"),
+               dev("10.0.0.50", "AA:00:00:00:00:50", "ether5", "cam"), dev("10.0.0.51", "AA:00:00:00:00:51", "ether5", "plug")]
+    neighbors = [{"interface": "sfp1,bridge", "mac-address": "AA:00:00:00:00:02", "identity": "core", "platform": "MikroTik",
+                  "interface-name": "sfp1", "address": "10.0.0.2"},
+                 {"interface": "ether2", "mac-address": "AA:00:00:00:00:03", "identity": "ap-hall",
+                  "system-caps-enabled": "bridge,wlan-ap", "address": "10.0.0.3"}]
+    port = lambda n, link=True: {"name": n, "n": 1, "link": link, "speed": "10G", "rx_bps": 1e6, "tx_bps": 3e6}  # noqa: E731
+    core = {"id": "sw1", "label": "core", "host": "10.0.0.2", "state": "ok", "sys": {"mac": "AA:00:00:00:00:02"},
+            "ports": [port("sfp1"), port("sfp2"), port("sfp5", link=False)],
+            "topo": {"table": True, "hosts": [("48:A9:8A:00:00:06", "sfp1"), ("AA:00:00:00:00:10", "sfp2"),
+                                              ("AA:00:00:00:00:61", "sfp5"), ("AA:00:00:00:00:20", "sfp5")]}, "uplink": {}}
+    office = {"id": "sw2", "label": "office", "host": "10.0.0.4", "state": "ok", "sys": {"mac": "AA:00:00:00:00:61"},
+              "ports": [port("Port1"), port("SFP1")],
+              "topo": {"table": True, "hosts": [("48:A9:8A:00:00:06", "SFP1"), ("AA:00:00:00:00:20", "Port1")]}, "uplink": {}}
+    t = build({"identity": "gw", "board": "RB5009", "version": "7.16 (stable)"}, ifaces, devices, neighbors, [core, office],
+              {"10.0.0.30": (1e5, 2e6)})
+    by = {n["id"]: n for n in t["nodes"]}
+    link = {l["to"]: l for l in t["links"]}
+    eq((by["router"]["parent"], by["sw:sw1"]["parent"], by["sw:sw1"]["port"], by["sw:sw1"]["local_port"]),
+       ("internet", "router", "sfp1", "sfp1"), "core switch on the router's sfp1, through its own sfp1")
+    eq((by["sw:sw2"]["parent"], by["sw:sw2"]["port"], by["sw:sw2"]["local_port"]), ("sw:sw1", "sfp5", "SFP1"),
+       "office switch behind core's sfp5 (core's MAC table), uplink SFP1 (where the router's MAC is)")
+    eq((by["dev:AA:00:00:00:00:10"]["parent"], by["dev:AA:00:00:00:00:10"]["port"]), ("sw:sw1", "sfp2"), "NAS on core sfp2")
+    eq((by["dev:AA:00:00:00:00:20"]["parent"], by["dev:AA:00:00:00:00:20"]["port"]), ("sw:sw2", "Port1"),
+       "PC on office Port1, not core's sfp5 (that port leads to a switch)")
+    ok("dev:AA:00:00:00:00:02" not in by, "the switch's own address isn't a device")
+    eq((by["nb:AA:00:00:00:00:03"]["type"], by["nb:AA:00:00:00:00:03"]["port"]), ("ap", "ether2"), "the AP, from LLDP")
+    ok(by["dev:AA:00:00:00:00:30"]["parent"] == "nb:AA:00:00:00:00:03" and by["dev:AA:00:00:00:00:30"]["inferred"],
+       "the laptop behind the AP: a guess")
+    ph = by["unknown:ether5"]
+    eq((ph["type"], by["dev:AA:00:00:00:00:50"]["parent"], by["dev:AA:00:00:00:00:51"]["parent"]),
+       ("unknown", "unknown:ether5", "unknown:ether5"), "two devices on ether5: something between them")
+    eq((link["sw:sw1"]["up"], link["sw:sw2"]["up"], link["sw:sw2"]["speed"]), (False, False, "10G"),
+       "link state from the router port / switch port")
+    eq((link["dev:AA:00:00:00:00:10"]["down_bps"], link["dev:AA:00:00:00:00:30"]["down_bps"]), (3e6, 2e6),
+       "a device's rate: its switch port, or its own traffic")
+    eq((link["router"]["down_bps"], link["router"]["up_bps"]), (5e6, 1e6), "Internet link: the WAN")
+    office["uplink"] = {"parent": "router", "port": "ether5", "local_port": "SFP1"}
+    t2 = build({"identity": "gw"}, ifaces, devices, neighbors, [core, office])
+    n2 = {n["id"]: n for n in t2["nodes"]}["sw:sw2"]
+    eq((n2["parent"], n2["port"], n2["how"]), ("router", "ether5", "set in Setup"), "set by hand: wins")
+    core2 = dict(core, topo={"table": False, "hosts": []})
+    t3 = build({"identity": "gw"}, ifaces, devices, neighbors, [core2])
+    by3 = {n["id"]: n for n in t3["nodes"]}
+    ok(by3["dev:AA:00:00:00:00:10"]["parent"] == "sw:sw1" and by3["dev:AA:00:00:00:00:10"]["inferred"],
+       "no MAC table: devices on the switch's router port hang off it, as a guess")
+    ok(any("no MAC table" in n for n in t3["notes"]), "and the page says why")
+
+
+@test
+def t_multi_switch_live():
+    """Two switches at once: each polled on its own, link alerts per switch, both on the topology (the office
+    one found behind the core one), managed from the API, and one going unreachable doesn't stop the other."""
+    with Env() as e:
+        a, b = e.connect_switches()
+        eq((a, b, e.hub.switch_label(a), e.hub.switch_label(b)), ("sw1", "sw2", "core-switch", "office"), "ids and names")
+        ok(wait_for(lambda: all(any(p.get("rx_bps") for p in e.hub.switches[s].ports) for s in (a, b)), 15), "both polled")
+        st = e.hub.status()["switch"]
+        eq((st["state"], st["count"], st["ok"]), ("ok", 2, 2), "status chip: two, both fine")
+        snap = e.hub.snapshot()
+        eq([(x["id"], len(x["ports"])) for x in snap["switches"]], [("sw1", 9), ("sw2", 10)], "snapshot lists both")
+        ok(wait_for(lambda: all(l.topo.get("table") for l in e.hub.switches.values()), 40), "MAC tables read")
+        ok(wait_for(lambda: len(e.hub.devices) >= 15, 15), "devices")
+        topo = e.hub.topology_view()
+        by = {n["id"]: n for n in topo["nodes"]}
+        eq((by["sw:" + a]["parent"], by["sw:" + a]["port"]), ("router", "sfp-sfpplus1"), "core on the router")
+        eq((by["sw:" + b]["parent"], by["sw:" + b]["port"], by["sw:" + b]["local_port"]), ("sw:" + a, "sfp5", "SFP1"),
+           "office behind core's sfp5")
+        eq((by["dev:F4:8E:38:10:00:80"]["parent"], by["dev:F4:8E:38:10:00:80"]["port"]), ("sw:" + b, "Port1"),
+           "office PC on office Port1")
+        e.world.sw_link[5] = False  # core's sfp5: the office switch's uplink
+        ok(wait_for(lambda: any(t["key"] == "switch:sw1:sfp5" and "core-switch" in t["title"]
+                                for t in e.hub.detector.list()), 15), "link alert names the switch")
+        ok(wait_for(lambda: e.hub.switches[b].status["state"] == "error", 20), "the office switch goes unreachable")
+        eq(e.hub.switches[a].status["state"], "ok", "the core one keeps polling")
+        eq(e.hub.status()["switch"]["state"], "error", "the chip says so")
+        e.world.sw_link[5] = True
+        ok(wait_for(lambda: e.hub.switches[b].status["state"] == "ok", 20), "and comes back")
+        httpd, _ = make_server(e.hub, "127.0.0.1", 0)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        port = httpd.server_address[1]
+        h = {"X-MCC": "1"}
+        try:
+            st_, body, _ = _req(port, "GET", "/api/topology")
+            ok(st_ == 200 and any(n["id"] == "sw:" + b for n in body["nodes"]), "GET /api/topology")
+            st_, body, _ = _req(port, "POST", "/api/switches/" + b, {"name": "Office", "uplink": {"parent": "nope"}}, h)
+            eq(st_, 400, "an uplink to a switch that doesn't exist is refused")
+            st_, body, _ = _req(port, "POST", "/api/switches/" + b,
+                                {"name": "Office", "uplink": {"parent": "router", "port": "ether4"}}, h)
+            eq((st_, e.hub.switch_label(b), e.hub.switch_cfg(b)["uplink"]["port"]), (200, "Office", "ether4"), "renamed, uplink set")
+            eq({n["id"]: n for n in e.hub.topology_view()["nodes"]}["sw:" + b]["how"], "set in Setup", "the map follows")
+            st_, _, _ = _req(port, "GET", "/api/switch/probe?id=" + b)
+            eq(st_, 200, "probe one switch")
+            st_, _, _ = _req(port, "POST", "/api/disconnect", {"what": "switch", "id": b}, h)
+            eq((st_, e.hub.switches[b].status["state"]), (200, "off"), "disconnect one")
+            eq(e.hub.switches[a].status["state"], "ok", "the other carries on")
+            st_, _, _ = _req(port, "POST", "/api/switches/{}/remove".format(b), {}, h)
+            eq(st_, 400, "remove needs confirm")
+            st_, _, _ = _req(port, "POST", "/api/switches/{}/remove".format(b), {"confirm": True}, h)
+            eq((st_, [c["id"] for c in e.cfg.get("switches")], b in e.hub.switches), (200, ["sw1"], False), "removed")
+            st_, _, _ = _req(port, "POST", "/api/switches/nope", {"name": "x"}, h)
+            eq(st_, 404, "unknown switch -> 404")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 # ============================================================================================

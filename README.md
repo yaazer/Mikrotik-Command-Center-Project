@@ -2,7 +2,8 @@
 
 A self-contained NOC console for a MikroTik network: a **RouterOS 7** router and a **SwOS** switch.
 
-- **Live telemetry**: throughput, CPU, memory, temperature, every interface and switch port.
+- **Live telemetry**: throughput, CPU, memory, temperature, every interface, and every port of every switch.
+- **A topology map**: the router, your switches (chained ones too) and access points, each device on the port it's plugged into, with each link's live rate and state.
 - **A live traffic map**: who on your LAN is talking to whom on the Internet, at what rate, animated as it happens.
 - **Device-to-device traffic**: which devices inside your network talk to each other (backups to the NAS, casting, printing, IoT to Home Assistant), and an honest account of what the router can and can't see.
 - **Threat detection**: port scans, brute force, router login guessing, floods, worm-like spreading, blocklisted addresses, unusual uploads, new devices, link failures.
@@ -44,7 +45,7 @@ It prints the console URL, `http://<vm-ip>:8840/?token=…`. Open it from your d
 
 **Reconnecting after a reboot.** MCC keeps passwords in memory only, so after a restart you'd enter them again in Setup. To have the service reconnect on its own:
 1. Connect once from Setup; that saves the address and user.
-2. Put the password in `/etc/mcc/mcc.env` (`MCC_ROUTER_PASSWORD=…`, `MCC_SWITCH_PASSWORD=…`). The file is root-only.
+2. Put the password in `/etc/mcc/mcc.env` (`MCC_ROUTER_PASSWORD=…`, `MCC_SWITCH_PASSWORD=…`). The file is root-only. `MCC_SWITCH_PASSWORD` is used for every switch; if your switches have different passwords, set `MCC_SWITCH_PASSWORD_SW2=…` (by the id Setup shows) for that one.
 3. Run `systemctl restart mcc`.
 
 MCC itself still never writes a password. Use a dedicated, limited RouterOS user for this. A wrong password is tried once, not retried, so the account doesn't get locked.
@@ -56,7 +57,7 @@ MCC itself still never writes a password. Use a dedicated, limited RouterOS user
 
 ## The demo
 
-`--demo` starts a simulated RB5009 and CRS309 with a small LAN:
+`--demo` starts a simulated RB5009 and two SwOS switches: a CRS309 on the router, and an office CSS610 behind the CRS309 (with a PC and a VoIP phone), all on a small LAN:
 - a NAS, a workstation, a TV, a gaming PC, cameras, a homelab with an SSH port forward;
 - an IoT VLAN (a smart plug and a thermostat talking to Home Assistant), and devices using each other: backups to the NAS, Plex, casting, printing, a camera recorded by Home Assistant. The router's switch chip forwards between its ports in hardware, as an RB5009's does, so the LAN page shows that traffic only after you approve the two LAN items in Setup;
 - a repeating script of incidents: SSH brute force, router login guessing, a port scan, a camera that starts spreading like a worm, a beacon to a blocklisted server, a new device (in turn: an ESP32 smart plug, a Galaxy phone, an iPhone with a private address, a Wyze camera), a link flap, a large upload, and an IRC connection.
@@ -85,7 +86,7 @@ Enter the router's address, user and password.
 - **Credentials stay in memory only.** They are never written to disk, so after a restart you enter the password again.
 - **The certificate is pinned on first connect** (trust on first use). From then on, MCC refuses to talk to the router if its certificate changes. Compare the fingerprint with `/certificate print` on the router.
 
-The switch is optional. Enter its address and SwOS user. (Its default user is `admin` with an empty password.)
+Switches are optional. Add each one in **Setup › Switches** with its address and user. (SwOS's default user is `admin` with an empty password.)
 
 ### 3. Approve telemetry (optional, recommended)
 
@@ -374,20 +375,53 @@ The palette button in the header (or `Ctrl+K`, then type a theme name) opens the
 
 Choices are saved per browser.
 
-## The switch (RouterOS or SwOS)
+## Switches (RouterOS or SwOS)
+
+Add as many switches as you have in **Setup › Switches**. Each is listed with its state and what it runs, and has its own **Connect**, **Disconnect**, **Edit** (name, and its uplink for the topology map), **Probe** and **Remove**.
+- **Polling:** each switch is polled on its own, so one that is slow or unreachable never holds up the others.
+- **Alerts:** a port losing link raises an alert that names the switch.
+- **Where they show:** the Overview and Interfaces pages show every switch's ports. The header chip covers them all.
 
 CRS switches can boot either RouterOS or SwOS. In Setup, the switch type defaults to **Auto-detect**. It works this out from how the switch refuses an unauthenticated request: RouterOS's REST API answers with JSON, and SwOS asks for a digest login. Either way, MCC **only reads the switch**.
 
-- **RouterOS:** MCC uses the same REST API as the router: per-port counters, link state, link rate (`/interface/ethernet/monitor`), model, version and temperature.
+- **RouterOS:** MCC uses the same REST API as the router: per-port counters, link state, link rate (`/interface/ethernet/monitor`), model, version and temperature. For the topology map it also reads the bridge host table (which MAC is on which port) and the switch's neighbors.
   - Enable the `www` or `www-ssl` service.
   - A user with `read` and `rest-api` policies is enough.
-- **SwOS:** SwOS has no API, so MCC reads the status files the switch's own web page loads (`link.b`, `stats.b`, `sys.b`) over HTTP digest auth.
+- **SwOS:** SwOS has no API, so MCC reads the status files the switch's own web page loads (`link.b`, `stats.b`, `sys.b`, and `!dhost.b`, the learnt MAC table, for the topology map) over HTTP digest auth.
   - Those files are undocumented, and their field names vary a little between SwOS releases.
-  - If a column reads "—", **Setup › Switch probe** shows the raw data, and `switch.fields` in `data/config.json` can remap a field.
+  - If a column reads "—", **Probe** (Setup › Switches) shows the raw data, and that switch's `fields` in `switches` in `data/config.json` can remap a field.
 
 If you force a type that doesn't match the switch, MCC says so rather than showing an empty port list.
 
 To act on a switch port, disable the router port facing it, or quarantine the hosts behind it.
+
+## Topology
+
+The **Topology** page draws the network top-down: the Internet, the router, your switches and access points, and every device on the port it's plugged into.
+
+**Reading the map:**
+- **Infrastructure** is a tree. Each node's devices are stacked under it, so a busy switch stays narrow.
+- **Each link** shows the parent's port → the child's port (`sfp5 → SFP1`), the link speed and the live rate.
+  - **Thickness** follows the rate, and particles flow along busy links (Theme Studio › Motion stops them).
+  - **Amber or orange** means the link is over 50% or 80% of its speed.
+  - **Red and dashed** means it's down. A switch MCC can't reach is marked too.
+- **Click a switch, the router or an access point** for its details: what it plugs into, how MCC placed it, its ports, and what's plugged into it. **Click a device** to open it.
+- **Infrastructure only** hides the devices. Drag to pan, scroll to zoom, and double-click (or the target button) to fit.
+- **Links** under the map lists every link with its ports, speed, state and rates.
+
+**How MCC works out where things are.** It never probes or scans the network for this. It reads:
+
+| Source | What it gives |
+|---|---|
+| The router's neighbor table (LLDP, CDP, MNDP) | Which router port a switch or access point is on, and the switch's own port facing it. |
+| The router's bridge host table | Which router port each device is behind. |
+| Each switch's learnt MAC table | Which of its ports each device, and each other switch, is behind. A switch that sees another switch on one of its ports (not its uplink) is that switch's parent, which is how chained switches are found. |
+| **Setup › Switches › Edit › Plugs into** | A switch's uplink set by hand. This always wins. |
+
+**Where MCC can't tell, it says so:**
+- **Unknown switch / AP:** several devices on one router port with nothing known between them hang off a placeholder of that name.
+- **Guesses:** devices behind an access point (from LLDP), or behind a switch whose MAC table MCC can't read, are drawn with dashed links.
+- **Notes:** the page explains anything it couldn't place.
 
 ## Security of MCC itself
 
@@ -404,7 +438,9 @@ To act on a switch port, disable the router port facing it, or quarantine the ho
 ```
 mcc.py               entry point (--demo, --bind, --port, --speed, --data)
 mcc/routeros.py      RouterOS 7 REST client, certificate pinning, CLI rendering
-mcc/swos.py          read-only SwOS reader
+mcc/swos.py          read-only SwOS reader (ports, system, MAC table)
+mcc/rosswitch.py     read-only reader for switches running RouterOS, and OS auto-detection
+mcc/topology.py      the network's shape: router -> switches / access points -> devices, from neighbors and MAC tables
 mcc/collectors.py    IPFIX / NetFlow v9 / v5 and syslog listeners + RouterOS log parsing
 mcc/traffic.py       traffic model (connection table + flows -> hosts, peers, conversations; LAN device to device)
 mcc/detect.py        threat rules, blocklist

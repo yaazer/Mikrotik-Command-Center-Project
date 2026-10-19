@@ -13,8 +13,11 @@ DATA_DIR = ROOT / "data"
 
 DEFAULTS: Dict[str, Any] = {
     "router": {"host": "", "scheme": "https", "port": 0, "user": "", "verify_tls": False, "pinned_sha256": ""},
-    # kind: auto (detect) | swos | routeros -- CRS switches can boot either OS
-    "switch": {"host": "", "scheme": "http", "user": "admin", "kind": "auto", "fields": {}},
+    # Switches MCC reads (never writes): [{id, name, host, scheme, user, kind, fields, uplink}].
+    # kind: auto (detect) | swos | routeros -- CRS switches can boot either OS. fields: SwOS field remaps.
+    # uplink: where it plugs in, for the topology map when MCC can't work it out: {parent: "router" | a switch id,
+    # port: the parent's port, local_port: this switch's port}; blank = work it out.
+    "switches": [],
     "ui": {"bind": "127.0.0.1", "port": 8840},
     "collectors": {
         "bind": "0.0.0.0",
@@ -82,6 +85,19 @@ def _merge(base: Dict[str, Any], over: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+SWITCH_DEFAULTS: Dict[str, Any] = {"id": "", "name": "", "host": "", "scheme": "http", "user": "admin", "kind": "auto",
+                                   "fields": {}, "uplink": {"parent": "", "port": "", "local_port": ""}}
+
+
+def _migrate(data: Dict[str, Any]) -> None:
+    """Before several switches: one "switch" entry. It becomes the first of "switches"."""
+    old = data.pop("switch", None)
+    if isinstance(old, dict) and old.get("host") and not data.get("switches"):
+        data["switches"] = [dict(SWITCH_DEFAULTS, id="sw1", **{k: old[k] for k in ("host", "scheme", "user", "kind", "fields")
+                                                              if k in old})]
+    data["switches"] = [_merge(SWITCH_DEFAULTS, sw) for sw in data.get("switches") or [] if isinstance(sw, dict) and sw.get("id")]
+
+
 def strip_secrets(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {k: strip_secrets(v) for k, v in obj.items() if k.lower() not in _SECRET}
@@ -102,6 +118,7 @@ class Config:
                 self.data = _merge(DEFAULTS, json.loads(self.path.read_text(encoding="utf-8")))
             except (OSError, ValueError):
                 pass
+        _migrate(self.data)
 
     def get(self, dotted: str, default: Any = None) -> Any:
         with self._lock:

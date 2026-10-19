@@ -2,7 +2,7 @@
 as the router -- plus detection of which OS a switch is running.
 
 Read-only: MCC polls /interface counters, /interface/ethernet/monitor (link rate) and system
-resource/health. The output matches swos.SwOS.read() so the rest of MCC treats both alike.
+resource/health, and for the topology map the bridge host table (MAC -> port) and /ip/neighbor. The output matches swos.SwOS.read() so the rest of MCC treats both alike.
 """
 
 from __future__ import annotations
@@ -79,10 +79,12 @@ class RouterOSSwitch:
         self._speeds_at = 0.0
         self._sys: Dict[str, Any] = {}
         self._sys_at = 0.0
+        self._macs: List[str] = []
 
     def _ports(self) -> List[Dict[str, Any]]:
         rows = self.ros.get_list("/interface", {".proplist": ".id,name,default-name,type,running,disabled,rx-byte,"
-                                                              "tx-byte,rx-error,tx-error,comment,link-downs"})
+                                                              "tx-byte,rx-error,tx-error,comment,link-downs,mac-address"})
+        self._macs = sorted({r["mac-address"].upper() for r in rows if r.get("mac-address")})
         return [r for r in rows if r.get("type") == "ether"]
 
     def _refresh_speeds(self, names: List[str]) -> None:
@@ -133,7 +135,22 @@ class RouterOSSwitch:
                 "rx_errors": float(to_int(r.get("rx-error"))),
                 "sfp": r["name"].startswith(("sfp", "qsfp")) or "sfp" in str(r.get("default-name", "")),
             })
-        return {"ports": ports, "sys": dict(self._sys)}
+        return {"ports": ports, "sys": dict(self._sys, mac=self._macs[0] if self._macs else "", macs=list(self._macs))}
+
+    def topology(self) -> Dict[str, Any]:
+        """The bridge host table ([(mac, port)]) and the switch's own neighbors (LLDP / CDP / MNDP)."""
+        hosts, neighbors, table = [], [], True
+        try:
+            for h in self.ros.get_list("/interface/bridge/host"):
+                if not to_bool(h.get("local")) and h.get("mac-address"):
+                    hosts.append((h["mac-address"].upper(), h.get("on-interface") or h.get("interface", "")))
+        except RouterOSError:
+            table = False
+        try:
+            neighbors = self.ros.get_list("/ip/neighbor")
+        except RouterOSError:
+            pass
+        return {"hosts": hosts, "neighbors": neighbors, "table": table}
 
     def probe(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {"os": "routeros"}

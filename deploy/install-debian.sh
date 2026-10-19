@@ -85,6 +85,8 @@ MCC_TOKEN=$TOKEN
 # Use a dedicated RouterOS user with limited rights (see README: "Give MCC its own RouterOS user").
 #MCC_ROUTER_PASSWORD=
 #MCC_SWITCH_PASSWORD=
+# Several switches with different passwords: one line per switch, by the id Setup shows (sw1, sw2...).
+#MCC_SWITCH_PASSWORD_SW2=
 EOF
   chmod 0600 "$ENVF"
 fi

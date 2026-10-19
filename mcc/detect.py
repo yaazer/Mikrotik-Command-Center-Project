@@ -754,21 +754,24 @@ class Detector:
         if t and t["status"] in ("open", "acknowledged"):
             self.set_status(tid, "resolved", note)
 
-    def on_links(self, kind: str, states: Dict[str, Dict[str, Any]], ts: Optional[float] = None) -> None:
-        """kind 'router' or 'switch'; states name -> {up: bool, disabled: bool}."""
+    def on_links(self, kind: str, states: Dict[str, Dict[str, Any]], ts: Optional[float] = None,
+                 where: str = "", label: str = "") -> None:
+        """kind 'router' or 'switch'; states name -> {up: bool, disabled: bool}. where: which switch (its id, so
+        Port1 on one switch isn't Port1 on another); label: its name for the alert."""
         ts = ts or time.time()
         memo = self._iface_state if kind == "router" else self._port_state
         with self.lock:
             for name, st in states.items():
                 up = bool(st.get("up"))
-                prev = memo.get(name)
-                memo[name] = up
-                key = "{}:{}".format(kind, name)
+                key = "{}:{}:{}".format(kind, where, name) if where else "{}:{}".format(kind, name)
+                prev = memo.get(key)
+                memo[key] = up
                 if prev is True and not up and not st.get("disabled"):
-                    where = "switch port" if kind == "switch" else "interface"
-                    self.raise_threat("link_down", key, "medium", "{} {} lost link".format(where.capitalize(), name),
+                    what = "switch port" if kind == "switch" else "interface"
+                    on = " on {}".format(label or where) if where else ""
+                    self.raise_threat("link_down", key, "medium", "{} {}{} lost link".format(what.capitalize(), name, on),
                                       "It was up on the last poll.", ts, subject="", role=kind, target=name,
-                                      evidence=[(ts, "{} {} link down".format(where, name))])
+                                      evidence=[(ts, "{} {}{} link down".format(what, name, on))])
                 elif up and prev is False:
                     self._auto_resolve("link_down", key, "link back up")
 

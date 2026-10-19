@@ -28,6 +28,7 @@ from .setup_plan import SetupPlanner
 from .rosswitch import RouterOSSwitch, detect_os
 from .swos import SwOS, SwOSError
 from .traffic import TrafficModel, lan_flow_ends
+from . import topology
 from .util import in_networks, is_local_scope, ip_obj, parse_duration, parse_networks, to_bool, to_float, to_int
 
 HIST = 900  # points kept per series (30 min at the default 2 s poll)
@@ -42,6 +43,24 @@ RETRY_TABLE_S = 600
 VPN_TYPES = {"wg": "WireGuard", "wireguard": "WireGuard", "ovpn-out": "OpenVPN", "ovpn-client": "OpenVPN",
              "l2tp-out": "L2TP", "sstp-out": "SSTP", "pptp-out": "PPTP", "gre-tunnel": "GRE", "ipip-tunnel": "IPIP",
              "eoip-tunnel": "EoIP", "6to4-tunnel": "6to4", "vxlan": "VXLAN", "zerotier": "ZeroTier"}
+
+class SwitchLink:
+    """A switch MCC reads (never writes): its reader, state, ports, port history and learnt MAC table. Each is
+    polled by its own thread, so a slow or unreachable switch never holds up the others."""
+    TOPO_EVERY = 30.0
+
+    def __init__(self, sid: str) -> None:
+        self.id = sid
+        self.client: Any = None
+        self.status: Dict[str, Any] = {"state": "off", "error": "", "last_ok": 0.0, "kind": ""}
+        self.ports: List[Dict[str, Any]] = []
+        self.sys: Dict[str, Any] = {}
+        self.prev: Dict[int, Tuple[float, float, float]] = {}
+        self.hist: Dict[int, Deque[Tuple[float, float, float]]] = defaultdict(lambda: deque(maxlen=HIST))
+        self.topo: Dict[str, Any] = {"hosts": [], "neighbors": [], "table": None}
+        self.topo_at = 0.0
+        self.stop = threading.Event()
+
 
 class Broadcaster:
     def __init__(self) -> None:
@@ -92,10 +111,9 @@ class Hub:
         self.lock = threading.RLock()
         self.ros: Optional[RouterOS] = None
         self._ros_slow: Optional[RouterOS] = None
-        self.swos: Optional[SwOS] = None
+        self.switches: Dict[str, SwitchLink] = {s["id"]: SwitchLink(s["id"]) for s in cfg.get("switches") or []}
         self.router_host_ip = ""
         self.router_status: Dict[str, Any] = {"state": "disconnected", "error": "", "last_ok": 0.0, "tasks": {}}
-        self.switch_status: Dict[str, Any] = {"state": "off", "error": "", "last_ok": 0.0}
         self.router_info: Dict[str, Any] = {}
         self.ifaces: Dict[str, Dict[str, Any]] = {}
         self._if_prev: Dict[str, Tuple[float, int, int]] = {}
@@ -106,10 +124,8 @@ class Hub:
         # chip forwards in hardware -- together they decide what device-to-device traffic the router can see
         self.bridge_fw: Optional[bool] = None
         self.bridge_ports: Dict[str, Dict[str, Any]] = {}
-        self.switch_ports: List[Dict[str, Any]] = []
-        self.switch_sys: Dict[str, Any] = {}
-        self._sw_prev: Dict[int, Tuple[float, float, float]] = {}
-        self.switch_hist: Dict[int, Deque[Tuple[float, float, float]]] = defaultdict(lambda: deque(maxlen=HIST))
+        self.neighbors: List[Dict[str, Any]] = []  # the router's /ip/neighbor (LLDP / CDP / MNDP)
+        self.last_hosts: List[Dict[str, Any]] = []  # LAN hosts' Internet rates, from the last tick
         self.devices: Dict[str, Dict[str, Any]] = {}
         self.mac_of: Dict[str, str] = {}  # LAN address -> MAC
         self.vendors = MacVendors(self.data_dir)  # IEEE MAC vendor registry (bundled snapshot, or refreshed in Setup)
@@ -173,8 +189,7 @@ class Hub:
                 else:
                     c.last_error = "cannot listen on UDP {}: {}".format(c.port, e)
             c.start()
-        for name, fn in (("fast", self._fast_loop), ("slow", self._slow_loop), ("switch", self._switch_loop),
-                         ("tick", self._tick_loop)):
+        for name, fn in (("fast", self._fast_loop), ("slow", self._slow_loop), ("tick", self._tick_loop)):
             t = threading.Thread(target=fn, name="mcc-" + name, daemon=True)
             t.start()
             self.threads.append(t)
@@ -189,6 +204,8 @@ class Hub:
         for r in (self.ros, self._ros_slow):
             if r:
                 r.close()
+        for link in list(self.switches.values()):
+            self._stop_switch(link)
 
     def publish(self, event: str, data: Any) -> None:
         self.bus.publish(event, data)
@@ -254,9 +271,28 @@ class Hub:
                 r.close()
         self.publish("status", self.status())
 
+    # -- switches: as many as you have ------------------------------------------------------------
+    def switch_cfg(self, sid: str) -> Dict[str, Any]:
+        return next((s for s in self.cfg.get("switches") or [] if s["id"] == sid), {})
+
+    def switch_label(self, sid: str) -> str:
+        c, link = self.switch_cfg(sid), self.switches.get(sid)
+        return c.get("name") or (link.sys.get("identity") if link else "") or c.get("host") or sid
+
+    def _save_switch(self, sid: str, **fields: Any) -> None:
+        from .config import SWITCH_DEFAULTS
+        lst = self.cfg.get("switches") or []
+        hit = next((s for s in lst if s["id"] == sid), None)
+        if hit is None:
+            hit = dict(SWITCH_DEFAULTS, id=sid)
+            lst.append(hit)
+        hit.update(fields)
+        self.cfg.update({"switches": lst})
+
     def connect_switch(self, host: str, user: str, password: str, scheme: str = "http",
-                       kind: str = "auto") -> Dict[str, Any]:
-        """kind: 'auto' (detect), 'swos' or 'routeros'. CRS switches can run either OS."""
+                       kind: str = "auto", sid: str = "", name: Optional[str] = None) -> Dict[str, Any]:
+        """kind: 'auto' (detect), 'swos' or 'routeros'. CRS switches can run either OS. sid: which of your
+        switches (blank: the one at this address, or a new one)."""
         host = host.strip()
         if kind not in ("auto", "swos", "routeros"):
             raise SwOSError("switch type must be auto, swos or routeros")
@@ -274,26 +310,82 @@ class Hub:
                     e, " (the www or www-ssl service must be enabled, and the user needs the rest-api policy)"
                     if e.status in (0, 403) else ""))
         else:
-            sw = SwOS(host, user or "admin", password or "", scheme, fields=self.cfg.get("switch.fields") or {})
+            sid = sid or next((c["id"] for c in self.cfg.get("switches") or [] if c.get("host") == host), "")
+            sw = SwOS(host, user or "admin", password or "", scheme, fields=self.switch_cfg(sid).get("fields") or {})
             data = sw.read()  # raises SwOSError
         if not data["ports"]:
+            if hasattr(sw, "close"):
+                sw.close()
             raise SwOSError("connected to the switch but found no ports in its data -- open Switch probe")
-        self.cfg.update({"switch": {"host": host, "user": user or "admin", "scheme": scheme, "kind": kind}})
-        old, self.swos = self.swos, sw
-        if old is not None and hasattr(old, "close"):
-            old.close()
-        self._sw_prev.clear()
-        self.switch_status.update({"state": "ok", "error": "", "last_ok": time.time(), "kind": detected})
-        self._ingest_switch(data, time.time())
+        known = self.cfg.get("switches") or []
+        sid = sid or next((c["id"] for c in known if c.get("host") == host), "") or \
+            "sw{}".format(1 + max([int(c["id"][2:]) for c in known if c["id"][2:].isdigit()] or [0]))
+        fields: Dict[str, Any] = {"host": host, "user": user or "admin", "scheme": scheme, "kind": kind}
+        if name is not None:
+            fields["name"] = name.strip()[:40]
+        self._save_switch(sid, **fields)
+        link = self.switches.setdefault(sid, SwitchLink(sid))
+        self._stop_switch(link)
+        link.stop = threading.Event()
+        link.client, link.prev, link.topo_at = sw, {}, 0.0
+        link.status.update({"state": "ok", "error": "", "last_ok": time.time(), "kind": detected})
+        self._ingest_switch(link, data, time.time())
+        threading.Thread(target=self._switch_poll, args=(link, link.stop), name="mcc-switch-" + sid, daemon=True).start()
         self.publish("status", self.status())
-        return {"ports": len(data["ports"]), "sys": data["sys"], "kind": detected}
+        return {"id": sid, "label": self.switch_label(sid), "ports": len(data["ports"]), "sys": data["sys"],
+                "kind": detected}
 
-    def disconnect_switch(self) -> None:
-        old, self.swos = self.swos, None
+    @staticmethod
+    def _stop_switch(link: SwitchLink) -> None:
+        link.stop.set()
+        old, link.client = link.client, None
         if old is not None and hasattr(old, "close"):
             old.close()
-        self.switch_status.update({"state": "off", "error": "", "kind": ""})
-        self.switch_ports = []
+
+    def disconnect_switch(self, sid: str) -> None:
+        link = self.switches.get(sid)
+        if link is None:
+            raise KeyError(sid)
+        self._stop_switch(link)
+        link.status.update({"state": "off", "error": "", "kind": ""})
+        link.ports = []
+        self.publish("status", self.status())
+
+    def remove_switch(self, sid: str) -> None:
+        """Stop reading it and forget it (its address, user and the uplink you set). The switch isn't touched."""
+        link = self.switches.pop(sid, None)
+        if link is not None:
+            self._stop_switch(link)
+        lst = [c for c in self.cfg.get("switches") or [] if c["id"] != sid]
+        for c in lst:  # another switch said it hangs off this one: back to working it out
+            if (c.get("uplink") or {}).get("parent") == sid:
+                c["uplink"] = {"parent": "", "port": "", "local_port": ""}
+        self.cfg.update({"switches": lst})
+        self.publish("status", self.status())
+
+    def update_switch(self, sid: str, name: Optional[str] = None, uplink: Optional[Dict[str, Any]] = None,
+                      fields: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if not self.switch_cfg(sid):
+            raise KeyError(sid)
+        patch: Dict[str, Any] = {}
+        if name is not None:
+            patch["name"] = str(name).strip()[:40]
+        if uplink is not None:
+            parent = str(uplink.get("parent") or "")
+            if parent and parent != "router" and (parent == sid or not self.switch_cfg(parent)):
+                raise ValueError("a switch can hang off the router or another of your switches")
+            patch["uplink"] = {"parent": parent, "port": str(uplink.get("port") or "")[:40],
+                               "local_port": str(uplink.get("local_port") or "")[:40]}
+        if fields is not None:
+            patch["fields"] = {str(k): v for k, v in fields.items()}
+        self._save_switch(sid, **patch)
+        return self.switch_cfg(sid)
+
+    def switch_probe(self, sid: str) -> Dict[str, Any]:
+        link = self.switches.get(sid)
+        if link is None or link.client is None:
+            raise KeyError(sid)
+        return link.client.probe()
 
     # ------------------------------------------------------------------------------------------
     # knowledge used by the other modules
@@ -807,6 +899,7 @@ class Hub:
                                           "band": r.get("band", ""),
                                           "signal": r.get("signal") or r.get("signal-strength") or r.get("rx-signal") or ""})
         wifi_ifaces = {n for n, i in list(self.ifaces.items()) if i.get("type") in ("wlan", "wifi", "wifiwave2", "cap")}
+        self.neighbors = neighbors
         for mac, d in devs.items():
             d["port"] = port_of.get(mac, "")
             w = wifi.get(mac) or ({"interface": d["port"]} if d["port"] in wifi_ifaces else None)
@@ -855,46 +948,80 @@ class Hub:
             self.dns_names = names
         self.name_memory.remember("dns", names, now)
 
-    def _switch_loop(self) -> None:
-        while not self._stop.is_set():
-            sw = self.swos
+    def _switch_poll(self, link: SwitchLink, stop: threading.Event) -> None:
+        while not stop.is_set() and not self._stop.is_set():
+            sw = link.client
             if sw is None:
-                self._stop.wait(1.0)
-                continue
+                break
             now = time.time()
             try:
                 data = sw.read()
-                self._ingest_switch(data, now)
-                self.switch_status.update({"state": "ok", "error": "", "last_ok": now})
+                if stop.is_set():
+                    break
+                self._ingest_switch(link, data, now)
+                link.status.update({"state": "ok", "error": "", "last_ok": now})
+                if now - link.topo_at >= link.TOPO_EVERY and hasattr(sw, "topology"):
+                    link.topo_at = now
+                    link.topo = sw.topology()
             except (SwOSError, RouterOSError) as e:
-                self.switch_status.update({"state": "error", "error": str(e)})
+                link.status.update({"state": "error", "error": str(e)})
             except Exception as e:
-                self.switch_status.update({"state": "error", "error": "{}: {}".format(type(e).__name__, e)})
-            self._stop.wait(max(1.0, float(self.cfg.get("poll.switch_s") or 5)))
+                link.status.update({"state": "error", "error": "{}: {}".format(type(e).__name__, e)})
+            stop.wait(max(1.0, float(self.cfg.get("poll.switch_s") or 5)))
 
-    def _ingest_switch(self, data: Dict[str, Any], now: float) -> None:
+    def _ingest_switch(self, link: SwitchLink, data: Dict[str, Any], now: float) -> None:
         ports = []
         for p in data.get("ports", []):
             n = p["n"]
             rx_bps, tx_bps = p.get("rx_rate_bps"), p.get("tx_rate_bps")
             if rx_bps is None and p.get("rx_bytes") is not None and p.get("tx_bytes") is not None:
-                prev = self._sw_prev.get(n)
+                prev = link.prev.get(n)
                 rx_bps = tx_bps = None
                 if prev and now > prev[0] and p["rx_bytes"] >= prev[1] and p["tx_bytes"] >= prev[2]:
                     dt = now - prev[0]
                     rx_bps, tx_bps = (p["rx_bytes"] - prev[1]) * 8 / dt, (p["tx_bytes"] - prev[2]) * 8 / dt
-                self._sw_prev[n] = (now, p["rx_bytes"], p["tx_bytes"])
+                link.prev[n] = (now, p["rx_bytes"], p["tx_bytes"])
             q = dict(p)
             q["rx_bps"], q["tx_bps"] = rx_bps, tx_bps
             if rx_bps is not None:
-                self.switch_hist[n].append((now, rx_bps, tx_bps or 0.0))
+                link.hist[n].append((now, rx_bps, tx_bps or 0.0))
             ports.append(q)
         with self.lock:
-            self.switch_ports = ports
-            self.switch_sys = data.get("sys", {})
+            link.ports = ports
+            link.sys = data.get("sys", {})
         self.detector.on_links("switch", {p["name"] or str(p["n"]): {"up": bool(p.get("link")),
                                                                     "disabled": p.get("enabled") is False}
-                                          for p in ports if p.get("link") is not None}, now)
+                                          for p in ports if p.get("link") is not None}, now,
+                               where=link.id, label=self.switch_label(link.id))
+
+    def switches_view(self) -> List[Dict[str, Any]]:
+        """Your switches, in the order you added them: identity, state, system info and ports."""
+        out = []
+        with self.lock:
+            for c in self.cfg.get("switches") or []:
+                link = self.switches.get(c["id"])
+                if link is None:
+                    continue
+                out.append({"id": c["id"], "label": self.switch_label(c["id"]), "name": c.get("name", ""),
+                            "host": c.get("host", ""), "uplink": c.get("uplink") or {}, "sys": dict(link.sys),
+                            "ports": list(link.ports), **{k: link.status.get(k, "") for k in ("state", "error", "kind")},
+                            "table": link.topo.get("table")})
+        return out
+
+    def topology_view(self) -> Dict[str, Any]:
+        """The network's shape, for the Topology page (mcc/topology.py)."""
+        switches = self.switches_view()
+        for sw in switches:
+            sw["topo"] = self.switches[sw["id"]].topo
+        with self.lock:
+            ifaces = [dict(i, wan=i["name"] in self.wan_ifaces()) for i in self.ifaces.values()]
+            devices = [dict(d) for d in self.devices.values()]
+            neighbors = list(self.neighbors)
+            info = dict(self.router_info)
+        rates = {h["ip"]: (h.get("up", 0.0), h.get("down", 0.0)) for h in self.last_hosts}
+        out = topology.build(info, ifaces, devices, neighbors, switches, rates, self.vpn_ifaces())
+        out["at"] = time.time()
+        return out
 
     # ------------------------------------------------------------------------------------------
     # snapshots
@@ -912,6 +1039,7 @@ class Hub:
                 snap = self.snapshot(t0)
                 self.detector.on_hosts(snap["traffic"]["hosts"], t0)
                 self.lan_hist.append((t0, snap["lan"]["to_clients_bps"], snap["lan"]["to_servers_bps"]))
+                self.last_hosts = snap["traffic"]["hosts"]
                 with self.lock:
                     logs, self._log_pending = self._log_pending, []
                 with self._dirty_lock:
@@ -942,7 +1070,10 @@ class Hub:
         r["stale"] = bool(self.ros) and now - r.get("last_ok", 0) > 15
         return {
             "router": r,
-            "switch": dict(self.switch_status, host=self.cfg.get("switch.host")),
+            "switch": self._switch_summary(),
+            "switches": [{"id": sid, "label": self.switch_label(sid), "host": self.switch_cfg(sid).get("host", ""),
+                          **{k: link.status.get(k, "") for k in ("state", "error", "kind")}}
+                         for sid, link in list(self.switches.items())],
             "flows": dict(self.flow_col.status(), records=self.flow_records, rate=self.flow_rate(now),
                           live=now - self.flow_col.last_at < 120, templates_waiting=self.flow_parser.waiting),
             "syslog": dict(self.syslog_col.status(), live=now - self.syslog_at < 120),
@@ -952,6 +1083,16 @@ class Hub:
             "server": {"tick_ms": round(self.tick_ms, 1), "clients": len(self.bus.clients),
                        "ticks_skipped": self.bus.ticks_skipped, "resyncs": self.bus.resyncs},
         }
+
+    def _switch_summary(self) -> Dict[str, Any]:
+        """All your switches in one status chip: ok when every connected one answers."""
+        links = list(self.switches.values())
+        on = [x for x in links if x.status["state"] != "off"]
+        bad = [x for x in on if x.status["state"] == "error"]
+        return {"state": "off" if not on else "error" if bad else "ok", "count": len(links), "connected": len(on),
+                "ok": len(on) - len(bad), "error": "; ".join("{}: {}".format(self.switch_label(x.id), x.status["error"])
+                                                             for x in bad),
+                "kind": on[0].status.get("kind", "") if len(on) == 1 else ""}
 
     def snapshot(self, now: Optional[float] = None) -> Dict[str, Any]:
         now = now or time.time()
@@ -963,7 +1104,7 @@ class Hub:
             ifaces = sorted(self.ifaces.values(), key=lambda i: (not i["wan"], i["name"]))
             wan = [i for i in ifaces if i["wan"]]
             info = dict(self.router_info)
-            ports = list(self.switch_ports)
+        switches = self.switches_view()
         threats = self.detector.list()
         open_t = [t for t in threats if t["status"] == "open"]
         return {
@@ -975,10 +1116,10 @@ class Hub:
             "wan": {"rx_bps": sum(i["rx_bps"] for i in wan), "tx_bps": sum(i["tx_bps"] for i in wan),
                     "names": [i["name"] for i in wan],
                     "down_mbps": self.cfg.get("wan.down_mbps"), "up_mbps": self.cfg.get("wan.up_mbps")},
-            "switch": {"ports": ports, "sys": self.switch_sys},
+            "switches": switches,
             "traffic": traffic,
             "vpn": self.vpn_status(now),
-            "lan": self._lan_view(traffic, ifaces, ports),
+            "lan": self._lan_view(traffic, ifaces, switches),
             "geo": self._geo_view(traffic),
             "counts": {"threats_open": len(open_t),
                        "threats_new": len([t for t in open_t if now - t.get("first_ts", 0) < 300]),
@@ -987,7 +1128,7 @@ class Hub:
         }
 
     def _lan_view(self, traffic: Dict[str, Any], ifaces: List[Dict[str, Any]],
-                  switch_ports: List[Dict[str, Any]]) -> Dict[str, Any]:
+                  switches: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Device-to-device traffic, what the router can see of it, and each LAN port's activity: how much of a
         port's traffic MCC can put a conversation to. The rest was switched where the router can't see it."""
         lan = traffic.pop("lan")
@@ -1038,8 +1179,9 @@ class Hub:
                              "via_cpu": sorted(n for n, b in bports.items() if not b["hw"]),
                              "segments": [{"iface": a, "net": n} for a, n in segments]}
         lan["ports"] = ports
-        lan["switch"] = [{"n": p["n"], "name": p.get("name") or str(p["n"]), "link": p.get("link"),
-                          "rx_bps": p.get("rx_bps"), "tx_bps": p.get("tx_bps")} for p in switch_ports if p.get("link")]
+        lan["switches"] = [{"id": sw["id"], "label": sw["label"], "ports": [
+            {"n": p["n"], "name": p.get("name") or str(p["n"]), "link": p.get("link"), "rx_bps": p.get("rx_bps"),
+             "tx_bps": p.get("tx_bps")} for p in sw["ports"] if p.get("link")]} for sw in switches]
         return lan
 
     def public_addrs(self) -> List[str]:
@@ -1074,7 +1216,8 @@ class Hub:
             hist = {n: [[round(t, 1), round(rx), round(tx)] for t, rx, tx in h] for n, h in self.iface_hist.items()}
             health = [[round(t, 1), round(c, 1), round(m, 1)] for t, c, m in self.health_hist]
             lan = [[round(t, 1), round(d), round(u)] for t, d, u in self.lan_hist]
-            sw = {str(n): [[round(t, 1), round(rx), round(tx)] for t, rx, tx in h] for n, h in self.switch_hist.items()}
+            sw = {sid: {str(n): [[round(t, 1), round(rx), round(tx)] for t, rx, tx in h] for n, h in link.hist.items()}
+                  for sid, link in self.switches.items()}
             logs = list(self.logs)[-500:]
         return {"snapshot": snap, "history": {"ifaces": hist, "health": health, "switch": sw, "lan": lan},
                 "threats": self.detector.list(), "actions": self.actions.list(), "logs": logs,

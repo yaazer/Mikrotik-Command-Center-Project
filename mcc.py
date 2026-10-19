@@ -8,7 +8,7 @@ On a server (see deploy/), settings can come from the environment instead of fla
     MCC_BIND, MCC_PORT, MCC_DATA     like --bind / --port / --data
     MCC_TOKEN                        a fixed access token, so the console URL survives restarts
     MCC_ROUTER_PASSWORD              optional: reconnect to the router (host/user from Setup) at start
-    MCC_SWITCH_PASSWORD              optional: the same for the switch
+    MCC_SWITCH_PASSWORD              optional: the same for your switches (MCC_SWITCH_PASSWORD_SW2: just that one)
 
 Python 3.8+ standard library only. Passwords are kept in memory and never written to disk.
 """
@@ -71,7 +71,7 @@ def main(argv=None) -> int:
         (data_dir / "blocklist.txt").write_text(DEMO_BLOCKLIST, encoding="utf-8")
         world = sim.World(speed=args.speed).start()
         router = sim.serve(sim.make_router(world))
-        switch = sim.serve(sim.make_swos(world))
+        switches = {sid: sim.serve(sim.make_swos(world, sid=sid)) for sid in sim.SWITCHES}
         cfg = Config(data_dir)
         cfg.update({"collectors": {"bind": "127.0.0.1", "flow_port": 0, "syslog_port": 0},
                     "blocklist_file": str(data_dir / "blocklist.txt"),
@@ -113,7 +113,9 @@ def main(argv=None) -> int:
 
     if args.demo:
         hub.connect_router("127.0.0.1", "admin", "demo", scheme="http", port=router.server_address[1])
-        hub.connect_switch("127.0.0.1:{}".format(switch.server_address[1]), "admin", "")
+        for sid, srv in switches.items():
+            hub.connect_switch("127.0.0.1:{}".format(srv.server_address[1]), "admin", "", sid=sid,
+                               name=sim.SWITCHES[sid]["identity"])
     else:
         auto_connect(hub, cfg)
 
@@ -164,14 +166,19 @@ def auto_connect(hub: Hub, cfg: Config) -> None:
     elif rpw is not None:
         print("  ! MCC_ROUTER_PASSWORD is set but no router address/user is known yet: connect once from Setup "
               "(or set MCC_ROUTER_HOST and MCC_ROUTER_USER)", file=sys.stderr)
-    spw = os.environ.get("MCC_SWITCH_PASSWORD")
-    sw = cfg.get("switch") or {}
-    shost = os.environ.get("MCC_SWITCH_HOST") or sw.get("host")
-    if spw is not None and shost:
-        def switch() -> None:
-            hub.connect_switch(shost, os.environ.get("MCC_SWITCH_USER") or sw.get("user") or "admin", spw,
-                               sw.get("scheme") or "http", sw.get("kind") or "auto")
-        jobs.append(("switch " + shost, switch))
+    # every switch saved from Setup: MCC_SWITCH_PASSWORD_<ID> (e.g. MCC_SWITCH_PASSWORD_SW2), else MCC_SWITCH_PASSWORD
+    switches = list(cfg.get("switches") or [])
+    if os.environ.get("MCC_SWITCH_HOST") and not any(s.get("host") == os.environ["MCC_SWITCH_HOST"] for s in switches):
+        switches.append({"id": "", "host": os.environ["MCC_SWITCH_HOST"], "user": os.environ.get("MCC_SWITCH_USER")})
+    for sw in switches:
+        spw = os.environ.get("MCC_SWITCH_PASSWORD_" + str(sw.get("id", "")).upper(), os.environ.get("MCC_SWITCH_PASSWORD"))
+        if spw is None or not sw.get("host"):
+            continue
+
+        def switch(sw: dict = sw, spw: str = spw) -> None:
+            hub.connect_switch(sw["host"], sw.get("user") or os.environ.get("MCC_SWITCH_USER") or "admin", spw,
+                               sw.get("scheme") or "http", sw.get("kind") or "auto", sw.get("id") or "")
+        jobs.append(("switch " + sw["host"], switch))
 
     def run() -> None:
         pending = list(jobs)

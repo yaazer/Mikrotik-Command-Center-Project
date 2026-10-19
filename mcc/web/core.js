@@ -142,8 +142,9 @@ function connectStream() {
       pushHist(S.hist.health, [t, snap.router.cpu, mem]);
     }
     if (snap.lan) pushHist(S.hist.lan = S.hist.lan || [], [t, snap.lan.to_clients_bps, snap.lan.to_servers_bps]);
-    for (const p of (snap.switch && snap.switch.ports) || []) {
-      if (p.rx_bps != null) pushHist(S.hist.switch[p.n] = S.hist.switch[p.n] || [], [t, p.rx_bps, p.tx_bps || 0]);
+    for (const sw of snap.switches || []) {
+      const h = S.hist.switch[sw.id] = S.hist.switch[sw.id] || {};
+      for (const p of sw.ports || []) if (p.rx_bps != null) pushHist(h[p.n] = h[p.n] || [], [t, p.rx_bps, p.tx_bps || 0]);
     }
     emit("tick");
   });
@@ -301,8 +302,9 @@ function renderHeader() {
       st.flows.live ? `${st.flows.rate.toFixed(1)} records/s on UDP ${st.flows.port}` : "No IPFIX/NetFlow arriving — see Setup", "#/setup"),
     chip("Syslog", st.syslog.live ? "ok" : st.syslog.packets ? "warn" : "",
       st.syslog.live ? `receiving on UDP ${st.syslog.port}` : "No syslog arriving — MCC reads the router's memory log instead", "#/setup"),
-    chip("Switch", st.switch.state === "ok" ? "ok" : st.switch.state === "off" ? "" : "bad",
-      st.switch.state === "ok" ? `${st.switch.kind === "routeros" ? "RouterOS REST" : "SwOS"} polling OK` : (st.switch.error || "no switch connected"), "#/interfaces"),
+    chip(st.switch.count > 1 ? "Switches" : "Switch", st.switch.state === "ok" ? "ok" : st.switch.state === "off" ? "" : "bad",
+      st.switch.state === "ok" ? (st.switch.count > 1 ? `${st.switch.ok} switches polling OK` : `${st.switch.kind === "routeros" ? "RouterOS REST" : "SwOS"} polling OK`)
+        : st.switch.state === "off" ? (st.switch.count ? "no switch connected — enter the password in Setup" : "no switch added") : st.switch.error, "#/topology"),
   ];
   $("#chips").innerHTML = chips.join("");
   const lvl = s.level || "calm";
@@ -855,7 +857,7 @@ const cmdk = {
   search(q) {
     q = q.trim().toLowerCase();
     const out = [];
-    const pages = ["overview", "traffic", "lan", "vpn", "threats", "actions", "devices", "interfaces", "logs", "setup"];
+    const pages = ["overview", "topology", "traffic", "lan", "vpn", "threats", "actions", "devices", "interfaces", "logs", "setup"];
     const titles = { lan: "LAN: device to device", vpn: "VPN" };
     pages.forEach((p) => out.push({ kind: "page", label: titles[p] || p[0].toUpperCase() + p.slice(1), key: p, run: () => go(p) }));
     out.push({ kind: "layout", label: "Reset this page's layout", run: () => Layout.resetPage() });

@@ -1,7 +1,7 @@
 """Read-only SwOS reader.
 
-SwOS has no API. Its web UI loads small JavaScript-object files (link.b, stats.b, sys.b) over HTTP
-digest auth; MCC reads the same files. They are undocumented and the field names differ a little
+SwOS has no API. Its web UI loads small JavaScript-object files (link.b, stats.b, sys.b, and !dhost.b for
+the learnt MAC table) over HTTP digest auth; MCC reads the same files. They are undocumented and the field names differ a little
 between SwOS releases, so the mapping below is a list of candidates, overridable through
 config switch.fields, and Setup shows the raw files ("Switch probe") when a column reads blank.
 Nothing is ever written to the switch.
@@ -98,6 +98,14 @@ def hexstr(value: Any) -> str:
     return value
 
 
+def mac_text(value: Any) -> str:
+    """'dc2c6e300901' / 'DC:2C:6E:30:09:01' -> 'DC:2C:6E:30:09:01'; '' if it isn't a MAC."""
+    h = re.sub(r"[^0-9A-Fa-f]", "", str(value or ""))
+    if len(h) != 12 and isinstance(value, str):  # some builds hex-encode it as text, like names
+        h = re.sub(r"[^0-9A-Fa-f]", "", hexstr(value))
+    return ":".join(h[i:i + 2] for i in range(0, 12, 2)).upper() if len(h) == 12 else ""
+
+
 SPEEDS = {0: "10M", 1: "100M", 2: "1G", 3: "10G", 4: "2.5G", 5: "5G", 6: "25G", 7: "40G"}
 
 # candidate keys, first present wins; config switch.fields can override any of these
@@ -119,6 +127,10 @@ FIELDS: Dict[str, List[str]] = {
     "version": ["ver"],
     "uptime": ["upt"],
     "temp": ["temp", "tmp"],
+    "mac": ["mac", "i03"],
+    # the MAC table (!dhost.b): a list of entries; SwOS names the fields adr/prt, SwOS Lite i01/i02
+    "host_mac": ["adr", "i01"],
+    "host_port": ["prt", "i02"],
 }
 
 
@@ -131,6 +143,7 @@ class SwOS:
         self.fields = {k: list(v) for k, v in FIELDS.items()}
         for k, v in (fields or {}).items():
             self.fields[k] = [v] if isinstance(v, str) else list(v)
+        self._names: List[str] = []
         mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
         mgr.add_password(None, self.base + "/", user, password)
         self._opener = urllib.request.build_opener(urllib.request.HTTPDigestAuthHandler(mgr))
@@ -162,7 +175,7 @@ class SwOS:
 
     def probe(self) -> Dict[str, Any]:
         out = {}
-        for name in ("sys.b", "link.b", "stats.b"):
+        for name in ("sys.b", "link.b", "stats.b", "!dhost.b"):
             try:
                 out[name] = self._get(name)
             except SwOSError as e:
@@ -225,10 +238,26 @@ class SwOS:
                 "tx_rate_bps": tr * 8 if tr is not None else None,
                 "rx_errors": arr("rx_errors", i),
             })
+        self._names = [p["name"] for p in ports]
         info = {
             "identity": hexstr(self._pick(sysd, "identity")),
             "model": hexstr(self._pick(sysd, "model")),
             "version": hexstr(self._pick(sysd, "version")),
             "temp": self._pick(sysd, "temp"),
+            "mac": mac_text(self._pick(sysd, "mac")),
         }
         return {"ports": ports, "sys": info}
+
+    def topology(self) -> Dict[str, Any]:
+        """What the switch knows about its neighbours: the MAC table, as [(mac, port name)]. Best effort -- an
+        older SwOS without !dhost.b just gives no table."""
+        try:
+            rows = self._get("!dhost.b")
+        except SwOSError:
+            rows = None
+        hosts = []
+        for r in rows if isinstance(rows, list) else []:
+            mac, port = mac_text(self._pick(r, "host_mac")), self._pick(r, "host_port")
+            if mac and isinstance(port, int):
+                hosts.append((mac, self._names[port] if port < len(self._names) else "Port{}".format(port + 1)))
+        return {"hosts": hosts, "neighbors": [], "table": isinstance(rows, list)}
