@@ -936,8 +936,10 @@ class Hub:
     def _poll_dns(self, ros: RouterOS, now: float) -> None:
         try:
             rows = ros.get_list("/ip/dns/cache")
-        except RouterOSError:
-            return
+        except RouterOSError as e:
+            if e.status in (400, 404):
+                return  # older RouterOS, or DNS caching off: no menu to read
+            raise  # anything else (permissions, unreachable...) surfaces in Setup like every other task
         names = {}
         for r in rows:
             if r.get("type", "A") in ("A", "AAAA"):

@@ -1573,6 +1573,38 @@ def _req(port, method, path, body=None, headers=None):
 
 
 @test
+def t_poll_dns_surfaces_real_errors():
+    """_poll_dns feeds classify.py's name-based traffic typing (classify.py, mcc/traffic.py). A
+    400/404 (no DNS cache menu -- older RouterOS, or caching disabled) is silently treated as
+    'no names to read', the same way _poll_health treats a missing /system/health. Anything else
+    -- e.g. RouterOS's own 500 'not enough permissions' when the REST user's group can't read this
+    menu -- must propagate so _run_tasks surfaces it in router_status['tasks']['dns'] (shown on the
+    Setup page). Swallowing it unconditionally, as this used to, silently degrades every Internet
+    conversation to a port-number guess with no error anywhere to explain why."""
+    tmp = tempfile.mkdtemp()
+    try:
+        hub = Hub(Config(tmp), Path(tmp))
+
+        class FakeRos:
+            def __init__(self, status):
+                self.status = status
+
+            def get_list(self, path, params=None):
+                raise RouterOSError("the router said {}".format(self.status), self.status, "not enough permissions (9)")
+
+        hub._poll_dns(FakeRos(404), 0.0)
+        eq(hub.dns_names, {}, "no DNS cache menu: silently empty, not an error")
+
+        try:
+            hub._poll_dns(FakeRos(500), 0.0)
+            raise AssertionError("a 500 (e.g. permissions) must not be swallowed")
+        except RouterOSError as e:
+            eq(e.status, 500, "a real error propagates so it can be shown")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
 def t_server_security():
     with Env() as e:
         httpd, token = make_server(e.hub, "127.0.0.1", 0)
