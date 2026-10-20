@@ -263,6 +263,12 @@ FW_RE = re.compile(
 LOGIN_FAIL_RE = re.compile(r"login failure for user (?P<user>.+?) from (?P<src>\S+) via (?P<via>\S+)")
 LOGIN_OK_RE = re.compile(r"user (?P<user>.+?) logged in from (?P<src>\S+) via (?P<via>\S+)")
 LINK_RE = re.compile(r"^(?P<iface>\S+) link (?P<state>up|down)\b")
+# RouterOS's own explanation, logged on the boot after an unclean one: "...rebooted without proper
+# shut down, probably power outage" / "...kernel failure" / "...by watchdog timer", or separately
+# "system rebooted because of ping watchdog timeout" for the watch-address feature. Wording has
+# varied a little across RouterOS 6.x/7.x releases (e.g. "shutdown" vs "shut down").
+REBOOT_CAUSE_RE = re.compile(
+    r"rebooted (?:without proper shut ?down|because of)\b[,:]?\s*(?:probably\s+|by\s+)?(?P<reason>.+?)\.?$", re.I)
 
 
 def split_syslog(data: bytes) -> Tuple[str, str]:
@@ -303,6 +309,10 @@ def classify(topics: str, msg: str) -> Dict[str, Any]:
     m = LINK_RE.match(msg)
     if m:
         return {"kind": "link", "iface": m.group("iface"), "up": m.group("state") == "up"}
+    if "critical" in tset:
+        m = REBOOT_CAUSE_RE.search(msg)
+        if m:
+            return {"kind": "reboot_cause", "reason": m.group("reason").strip()}
     return {"kind": "other"}
 
 

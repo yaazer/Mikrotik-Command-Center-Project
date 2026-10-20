@@ -26,6 +26,7 @@ from .pins import Pins
 from .routeros import CertificateChanged, RouterOS, RouterOSError, local_ip_toward
 from .setup_plan import SetupPlanner
 from .rosswitch import RouterOSSwitch, detect_os
+from .stability import StabilityLog
 from .swos import SwOS, SwOSError
 from .traffic import TrafficModel, lan_flow_ends
 from . import topology
@@ -142,10 +143,19 @@ class Hub:
         self._wan: Set[str] = set()
         self.entries: List[Dict[str, Any]] = []
         self.blocked: Set[str] = set()
+        self.stability = StabilityLog(self.data_dir)
         self.logs: Deque[Dict[str, Any]] = deque(maxlen=3000)
-        self.log_seq = 0
+        restored = self.stability.tail()
+        self.logs.extend(restored)
+        # warning+ only (what stability.append keeps), kept separately and much longer: routine
+        # firewall/info lines push self.logs' 3000-line window past them within hours
+        self.important_logs: Deque[Dict[str, Any]] = deque(restored, maxlen=2000)
+        self.log_seq = max([0] + [e.get("seq", 0) for e in restored])
         self._log_pending: List[Dict[str, Any]] = []
         self._last_log_id = -1
+        self._reboot_tid: Optional[str] = None
+        self._reboot_at = 0.0
+        self._pending_cause: Optional[Tuple[str, float]] = None
         self.syslog_at = 0.0
         self.flow_records = 0
         self._flow_rate: Deque[Tuple[float, int]] = deque(maxlen=120)
@@ -600,12 +610,27 @@ class Hub:
                 entry["ip"] = info.get("src", "")
             self.logs.append(entry)
             self._log_pending.append(entry)
+            # kept past an MCC restart so a line that explains a failure isn't lost the moment
+            # someone goes looking for it; fw/info lines are frequent and not stability-relevant
+            if entry["level"] in ("warn", "error", "crit"):
+                self.stability.append(entry)
+                self.important_logs.append(entry)
+            # Just parked here, even with detect=False (MCC's own first poll after its own
+            # restart, or the post-reboot backlog re-read): the cause line only ever appears once,
+            # so dropping it here loses it for good, not just this alert. _check_reboot (the fast
+            # poll, which also owns _reboot_tid/_reboot_at) is the only place that decides which
+            # reboot a cause belongs to -- never here, where a log line and a boot-time jump can
+            # arrive in either order across independent threads (log/syslog vs. the fast poll).
+            if info["kind"] == "reboot_cause":
+                self._pending_cause = (info["reason"], now)
             if not detect:
                 return
             if info["kind"] == "fw":
                 self.detector.on_fw(info, now)
             elif info["kind"] in ("login_fail", "login_ok"):
                 self.detector.on_login(info["src"], info["user"], info["via"], info["kind"] == "login_ok", now)
+            elif info["kind"] != "reboot_cause" and entry["level"] == "crit":
+                self.detector.on_router_log(msg, now)
 
     # ------------------------------------------------------------------------------------------
     # pollers
@@ -632,6 +657,7 @@ class Hub:
                     self.router_status["tasks"][name] = ""
                     if name == "fast":
                         self.router_status.update({"state": "ok", "error": "", "last_ok": now})
+                        self.detector.on_router_status(True, "", now)
                 except CertificateChanged as e:
                     self.router_status.update({"state": "error", "error": str(e)})
                     self.disconnect_router()
@@ -646,6 +672,8 @@ class Hub:
                         break
                     if name == "fast":
                         self.router_status.update({"state": "error", "error": str(e)})
+                        if e.status == 0:  # unreachable, not a credentials/config problem
+                            self.detector.on_router_status(False, str(e), now, context=self._health_snapshot())
                 except Exception as e:  # keep polling whatever one table does
                     self.router_status["tasks"][name] = "{}: {}".format(type(e).__name__, e)
                 next_at[name] = now + max(0.5, float(every()))
@@ -662,6 +690,63 @@ class Hub:
                          ("log", p("log_s"), self._poll_log), ("devices", p("devices_s"), self._poll_devices),
                          ("dns", p("dns_s"), self._poll_dns), ("vpn", lambda: 10, self._poll_vpn)], "slow")
 
+    def _health_snapshot(self, before: Optional[float] = None) -> str:
+        """Recent CPU/memory/temperature/voltage, for a stability alert's summary -- the only
+        explanation available for an outage or reboot RouterOS didn't itself log a cause for
+        (memory exhaustion, a CPU lockup...). Anchored on the newest sample at or before `before`
+        (or just the newest sample there is, for an ongoing outage) rather than on wall-clock
+        "now": health_hist stops gaining samples once polling starts failing, so an outage past
+        5 minutes would otherwise age the window out to nothing, and -- for a reboot, where the
+        poll has already succeeded once by the time this is called -- health_hist may already
+        hold a fresh, healthy post-boot sample that would swamp the pre-failure picture."""
+        with self.lock:
+            hist = [h for h in self.health_hist if before is None or h[0] < before]
+            temp, voltage = self.router_info.get("temp"), self.router_info.get("voltage")
+        if not hist:
+            return ""
+        anchor = hist[-1][0]
+        recent = [h for h in hist if anchor - h[0] <= 300]
+        bits = ["peak CPU {:.0f}%".format(max(h[1] for h in recent)),
+                "peak memory {:.0f}%".format(max(h[2] for h in recent))]
+        if before is None:  # current temp/voltage mean something for an ongoing outage (frozen,
+            if temp is not None:  # since _poll_health fails too); not for a reboot already past,
+                bits.append("{:.0f}°C".format(temp))  # where they'd be fresh post-boot readings
+            if voltage is not None:
+                bits.append("{}V".format(voltage))
+        return "last 5 min before: " + ", ".join(bits)
+
+    def _check_reboot(self, uptime_s: float, prev_uptime: Optional[float], now: float) -> None:
+        """Reboot = the router's boot time (now - uptime) moved, not just uptime going down: that
+        also catches a restart that happened while MCC itself was down, when there's no previous
+        uptime in memory to compare against. The boot time is persisted so it survives an MCC
+        restart too, and compared against every poll (not a possibly days-old saved value) so
+        ordinary clock drift between MCC and the router never looks like a reboot.
+
+        This is also the only place that decides which reboot a cause (parked by _ingest_log, on
+        another thread, as self._pending_cause) belongs to -- it and self._reboot_tid/_reboot_at
+        are read and written only here and in _ingest_log, always under self.lock."""
+        if not uptime_s:
+            return
+        boot = now - uptime_s
+        rebooted = self.stability.update_boot(boot)
+        with self.lock:
+            cause = self._pending_cause
+            self._pending_cause = None
+        if rebooted:
+            t = self.detector.on_reboot(prev_uptime, boot, now, context=self._health_snapshot(before=boot))
+            tid = t["id"] if t else None
+            with self.lock:
+                self._reboot_tid, self._reboot_at = tid, now
+            if tid and cause and now - cause[1] < 600:
+                self.detector.on_reboot_cause(tid, cause[0], cause[1])
+            return
+        if not cause or now - cause[1] >= 600:
+            return
+        with self.lock:
+            tid, at = self._reboot_tid, self._reboot_at
+        if tid and now - at < 600 and "Cause:" not in self.detector.threats.get(tid, {}).get("summary", ""):
+            self.detector.on_reboot_cause(tid, cause[0], cause[1])
+
     def _poll_fast(self, ros: RouterOS, now: float) -> None:
         res = ros.get("/system/resource") or {}
         rows = ros.get_list("/interface", {".proplist": ".id,name,type,running,disabled,rx-byte,tx-byte,"
@@ -671,13 +756,16 @@ class Hub:
         free = to_int(res.get("free-memory"))
         cpu = to_float(res.get("cpu-load"))
         with self.lock:
+            prev_uptime = self.router_info.get("uptime_s")
+            uptime_s = parse_duration(res.get("uptime", ""))
+            mem_pct = (total - free) * 100.0 / total if total else None
             self.router_info.update({
                 "board": res.get("board-name", ""), "version": res.get("version", ""),
                 "arch": res.get("architecture-name", ""), "cpu": cpu, "cpu_count": to_int(res.get("cpu-count"), 1),
-                "uptime": res.get("uptime", ""), "uptime_s": parse_duration(res.get("uptime", "")),
+                "uptime": res.get("uptime", ""), "uptime_s": uptime_s,
                 "mem_total": total, "mem_used": max(0, total - free),
                 "hdd_total": to_int(res.get("total-hdd-space")), "hdd_free": to_int(res.get("free-hdd-space"))})
-            self.health_hist.append((now, cpu, (total - free) * 100.0 / total if total else 0.0))
+            self.health_hist.append((now, cpu, mem_pct or 0.0))
             seen = set()
             wan = self.wan_ifaces()
             for r in rows:
@@ -708,7 +796,8 @@ class Hub:
                       if i["type"] in ("ether", "wlan", "wifi", "vlan", "pppoe-out", "lte", "sfp", "") or
                       n.startswith(("ether", "sfp", "combo", "wlan", "wifi", "qsfp"))}
         self.detector.on_links("router", states, now)
-        self.detector.on_health(cpu, self.router_info.get("temp"), now)
+        self.detector.on_health(cpu, self.router_info.get("temp"), mem_pct, now)
+        self._check_reboot(uptime_s, prev_uptime, now)
 
     def _poll_health(self, ros: RouterOS, now: float) -> None:
         try:
@@ -846,10 +935,16 @@ class Hub:
         if first:
             new = new[-200:]  # some history for the screen, but don't alert on the past
         for _, r in new:
-            topics = r.get("topics", "")
-            if syslog_live and set(topics.split(",")) & {"firewall", "critical", "interface"}:
+            topics, msg = r.get("topics", ""), r.get("message", "")
+            # critical lines are skipped like the rest when syslog is live -- a login failure is
+            # also logged at 'critical', and double-counting it drops the login-failures threshold
+            # to one third. The one exception is the reboot-cause line: it may be logged right at
+            # boot, before the router's network is up to send it over syslog, so losing it here
+            # means losing it for good, not just getting it a second way.
+            if syslog_live and set(topics.split(",")) & {"firewall", "critical", "interface"} and \
+                    classify(topics, msg)["kind"] != "reboot_cause":
                 continue  # syslog already delivered it
-            self._ingest_log("router", topics, r.get("message", ""), r.get("time", ""), detect=not first)
+            self._ingest_log("router", topics, msg, r.get("time", ""), detect=not first)
         self._last_log_id = top
 
     def _poll_devices(self, ros: RouterOS, now: float) -> None:
@@ -1218,7 +1313,13 @@ class Hub:
             lan = [[round(t, 1), round(d), round(u)] for t, d, u in self.lan_hist]
             sw = {sid: {str(n): [[round(t, 1), round(rx), round(tx)] for t, rx, tx in h] for n, h in link.hist.items()}
                   for sid, link in self.switches.items()}
-            logs = list(self.logs)[-500:]
+            recent = list(self.logs)[-500:]
+            # routine firewall/info lines push self.logs' 3000-line window past anything
+            # warning+ within hours; merge in the longer-lived, warning+-only deque so the
+            # Logs page's "Warnings+" filter still has something to show well after that
+            seen = {e["seq"] for e in recent}
+            logs = sorted(recent + [e for e in self.important_logs if e["seq"] not in seen],
+                          key=lambda e: e["seq"])[-1000:]
         return {"snapshot": snap, "history": {"ifaces": hist, "health": health, "switch": sw, "lan": lan},
                 "threats": self.detector.list(), "actions": self.actions.list(), "logs": logs,
                 "entries": self.entries, "config": self.cfg.public(), "rules": RULES,

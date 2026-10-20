@@ -61,6 +61,11 @@ DEFAULTS: Dict[str, Any] = {
         "cpu_pct": 90,
         "cpu_s": 30,
         "temp_c": 75,
+        "mem_pct": 90,
+        "mem_s": 60,
+        # the fast poll (poll.router_s) has an 8s timeout and one retry, so a single miss isn't an
+        # outage -- this is how long the router must stay unreachable before it's reported as one
+        "down_s": 15,
         "quiet_s": 600,
     },
     "actions": {"default_block": "1h"},

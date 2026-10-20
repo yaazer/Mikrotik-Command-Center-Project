@@ -30,6 +30,7 @@ from mcc.config import Config  # noqa: E402
 from mcc.detect import Blocklist, Detector  # noqa: E402
 from mcc import hub as hub_mod  # noqa: E402
 from mcc.hub import Hub  # noqa: E402
+from mcc.stability import StabilityLog  # noqa: E402
 from mcc.identify import Fingerprints, brand_of, identify  # noqa: E402
 from mcc.oui import MacVendors, build as oui_build, is_random, short_name  # noqa: E402
 from mcc.routeros import RouterOS, RouterOSError, cli_line  # noqa: E402
@@ -231,6 +232,12 @@ def t_syslog_parsing():
     eq(classify("interface,info", "ether3 link down")["kind"], "link", "link")
     icmp = classify("firewall,info", "input: in:ether1 out:(unknown 0), proto ICMP (type 8, code 0), 1.2.3.4->5.6.7.8, len 84")
     eq((icmp["src"], icmp["dport"]), ("1.2.3.4", 0), "ICMP has no ports")
+    rb = classify("system,error,critical", "router was rebooted without proper shut down, probably power outage")
+    eq((rb["kind"], rb["reason"]), ("reboot_cause", "power outage"), "unclean-reboot cause, 'shut down' wording")
+    rb = classify("system,error,critical", "router was rebooted without proper shutdown by watchdog timer")
+    eq((rb["kind"], rb["reason"]), ("reboot_cause", "watchdog timer"), "unclean-reboot cause, watchdog wording")
+    ok(classify("system,error,critical", "some other critical system message")["kind"] == "other",
+       "a critical line that isn't the reboot message falls through to 'other' (-> on_router_log)")
 
 
 # ============================================================================================
@@ -452,6 +459,149 @@ def t_detect_state_rules():
         ok(all(t["status"] != "open" for t in d2.threats.values()), "reloaded threats are not open")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_detect_stability_rules():
+    tmp = tempfile.mkdtemp()
+    try:
+        d, _ = _detector(tmp, down_s=10, mem_pct=90, mem_s=20)
+        # router_down: unreachable for less than down_s raises nothing; past it, it does -- and
+        # resolving records how long it was down, in the persisted summary (not just evidence)
+        d.on_router_status(False, "cannot reach the router at 10.0.0.1:443", 100.0)
+        d.on_router_status(False, "cannot reach the router at 10.0.0.1:443", 105.0)
+        ok(not d.list(), "not yet past down_s")
+        d.on_router_status(False, "cannot reach the router at 10.0.0.1:443", 111.0)
+        rd = next(t for t in d.list() if t["rule"] == "router_down")
+        eq(rd["status"], "open", "unreachable past the grace period")
+        d.on_router_status(True, "", 145.0)
+        eq(d.threats[rd["id"]]["status"], "resolved", "reachable again resolves it")
+        ok("back up after" in d.threats[rd["id"]]["summary"], "duration recorded in the persisted summary")
+
+        # reboot: each occurrence is its own alert, keyed by boot time (stable across an MCC
+        # restart, unlike a sequence number); the cause attaches to the summary too, so it
+        # survives threats.jsonl dropping evidence
+        t1 = d.on_reboot(12345.0, 1000.0, 200.0)
+        ok("3h 25m" in t1["summary"], "previous uptime, human-readable")
+        d.on_reboot_cause(t1["id"], "power outage", 201.0)
+        ok("Cause: power outage" in d.threats[t1["id"]]["summary"], "cause attached to the open reboot alert")
+        t2 = d.on_reboot(None, 2000.0, 500.0)
+        ok(t2["id"] != t1["id"], "a second reboot (different boot time) is its own alert")
+
+        # a critical log line nothing else classifies: one alert, repeats count against it instead
+        # of flooding the feed (ids/addresses normalised out of the key)
+        d.on_router_log("some odd critical message about 192.168.88.1 code 7", 300.0)
+        d.on_router_log("some odd critical message about 192.168.88.5 code 9", 301.0)
+        rl = [t for t in d.list() if t["rule"] == "router_log"]
+        eq(len(rl), 1, "normalised key coalesces near-identical lines")
+        eq(rl[0]["count"], 2, "...but still counts both")
+
+        # memory, same shape as the existing cpu/temp rules
+        d.on_health(None, None, 95.0, 400.0)
+        ok(not any(t["rule"] == "mem" for t in d.list()), "not yet past mem_s")
+        d.on_health(None, None, 95.0, 421.0)
+        mt = next(t for t in d.list() if t["rule"] == "mem")
+        eq(mt["status"], "open", "sustained high memory")
+        d.on_health(None, None, 40.0, 425.0)
+        eq(d.threats[mt["id"]]["status"], "resolved", "memory back down resolves it")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_stability_log_persists():
+    """self.logs (hub.py) is in-memory only; StabilityLog is what lets a warning/error/critical
+    line -- and the last known boot time -- survive an MCC restart."""
+    tmp = tempfile.mkdtemp()
+    try:
+        s = StabilityLog(Path(tmp))
+        ok(s.last_boot is None, "nothing saved yet")
+        s.set_last_boot(1000.0)
+        s.append({"seq": 1, "ts": 1.0, "level": "info", "msg": "not kept"})  # hub.py filters these before calling
+        s.append({"seq": 2, "ts": 2.0, "level": "warn", "msg": "low voltage"})
+        s.append({"seq": 3, "ts": 3.0, "level": "crit", "msg": "router was rebooted without proper shut down"})
+        s2 = StabilityLog(Path(tmp))
+        eq(s2.last_boot, 1000.0, "boot time survives a restart")
+        tail = s2.tail()
+        eq([e["seq"] for e in tail], [1, 2, 3], "log lines survive a restart, in order")
+        s2.set_last_boot(2000.0)
+        s3 = StabilityLog(Path(tmp))
+        eq(s3.last_boot, 2000.0, "updated boot time also persists")
+
+        # update_boot: compares against the previous POLL, not a possibly days-old saved value,
+        # so ordinary clock drift between MCC and the router never accumulates into a false reboot
+        s4 = StabilityLog(Path(tmp))
+        s4.set_last_boot(10000.0)
+        ok(not s4.update_boot(10001.0), "tiny drift, one poll later: not a reboot")
+        ok(not s4.update_boot(10002.0), "tiny drift again: still compared against the last poll")
+        ok(s4.update_boot(20000.0), "a real jump is still caught")
+
+        # the saved value has to track along, not just sit at whatever set_last_boot last wrote --
+        # otherwise a restart right after a long run of drift reloads a stale value and falsely
+        # looks like a 30s+ jump on the very next poll
+        s5 = StabilityLog(Path(tmp))
+        s5.set_last_boot(10000.0)
+        for b in range(10001, 10041):
+            s5.update_boot(float(b))
+        s6 = StabilityLog(Path(tmp))
+        ok(not s6.update_boot(10041.0), "the saved value stayed within a few seconds of the drift")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_stability_cause_order_independent():
+    """The reboot cause (from the router's own log) can arrive before or after MCC notices the
+    boot-time jump, and may arrive on the very first log poll after MCC's own restart, which runs
+    with detect=False. Either way it must still reach the alert -- it only ever appears once."""
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg = Config(tmp)
+        hub = Hub(cfg, Path(tmp))
+        now = time.time()
+        hub._check_reboot(100000.0, None, now - 100)  # establish a boot-time baseline
+
+        # case 1: the cause line arrives first (e.g. via syslog, ahead of the next REST poll)
+        hub._ingest_log("router", "system,error,critical",
+                        "router was rebooted without proper shut down, probably power outage", "", detect=True)
+        hub._check_reboot(5.0, 100000.0, now)  # boot time jumps: reboot detected
+        rb = next(t for t in hub.detector.list() if t["rule"] == "reboot")
+        ok("Cause: power outage" in rb["summary"], "cause attached even though the log line came first")
+
+        # case 2: MCC itself restarts (e.g. the same outage took down this machine too) and its
+        # first-ever log poll -- which runs with detect=False -- is the one that reads the cause
+        # line; the persisted last_boot from before MCC's restart means the very next
+        # _check_reboot call detects the router's reboot too. Still not dropped.
+        hub2 = Hub(cfg, Path(tmp))  # inherits the persisted last_boot case 1 left behind
+        hub2._ingest_log("router", "system,error,critical",
+                         "router was rebooted without proper shut down, probably kernel failure", "", detect=False)
+        hub2._check_reboot(5.0, None, now + 200)
+        rb2 = next(t for t in hub2.detector.list() if t["rule"] == "reboot")
+        ok("Cause: kernel failure" in rb2["summary"], "cause attached even with detect=False")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # case 3: a crash loop -- two reboots within 10 minutes. The second reboot's cause must land
+    # on the second alert, not get misread onto the first (already-explained) one.
+    tmp3 = tempfile.mkdtemp()
+    try:
+        hub3 = Hub(Config(tmp3), Path(tmp3))
+        t0 = time.time()
+        hub3._check_reboot(50000.0, None, t0 - 1000)  # baseline
+        hub3._ingest_log("router", "system,error,critical",
+                         "router was rebooted without proper shut down, probably power outage", "", detect=True)
+        hub3._check_reboot(5.0, 50000.0, t0 - 900)  # reboot 1
+        rb1 = next(t for t in hub3.detector.list() if t["rule"] == "reboot")
+        ok("Cause: power outage" in rb1["summary"], "reboot 1 got its own cause")
+        hub3._ingest_log("router", "system,error,critical",  # reboot 2's cause, arriving first
+                         "router was rebooted without proper shut down, probably kernel failure", "", detect=True)
+        hub3._check_reboot(5.0, 20005.0, t0 - 800)  # reboot 2: a different (later) boot time
+        rb2 = next(t for t in hub3.detector.list() if t["rule"] == "reboot" and t["id"] != rb1["id"])
+        ok("Cause: kernel failure" in rb2["summary"], "reboot 2 got its own cause")
+        ok("kernel failure" not in hub3.detector.threats[rb1["id"]]["summary"],
+           "reboot 1's alert wasn't overwritten by reboot 2's cause")
+    finally:
+        shutil.rmtree(tmp3, ignore_errors=True)
 
 
 @test
@@ -1082,12 +1232,82 @@ def t_e2e_detect_and_block():
 
 
 @test
+def t_e2e_critical_log_not_doublecounted_via_syslog():
+    """RouterOS logs a login failure at 'critical', and the syslog plan forwards 'critical' lines.
+    _poll_log must still skip critical lines once syslog is live -- the reboot-cause exemption is
+    the only one -- or every critical line (including this one) is counted twice and the
+    login-failures threshold effectively drops to a third of its configured value."""
+    with Env() as e:
+        e.cfg.update({"poll": {"log_s": 0.3}})  # several REST re-reads within the test's wait
+        plan = e.hub.setup.plan()
+        e.hub.setup.apply(plan["id"], [i["id"] for i in plan["items"]])
+        # the very first-ever _poll_log pass treats everything it sees as pre-existing history
+        # (detect=False, so it never reaches on_login at all) -- let that pass go first, on an
+        # unrelated line, so the REST path is actually live for the lines that matter below
+        with e.world.lock:
+            e.world.log("system,info", "warm-up")
+        e.hub.refresh_soon("log")  # the "log" task may have an older, slower poll already scheduled
+        ok(wait_for(lambda: e.hub._last_log_id >= 0, 10), "first-ever log poll done")
+        attacker = "203.0.113.55"
+        with e.world.lock:
+            e.world.log("system,error,critical", "login failure for user admin from {} via winbox".format(attacker))
+        ok(wait_for(lambda: e.hub.status()["syslog"]["live"], 10), "syslog telemetry approved and live")
+        for i in range(4):
+            with e.world.lock:
+                e.world.log("system,error,critical", "login failure for user admin from {} via winbox".format(attacker))
+        e.hub.refresh_soon("log")
+        t = wait_for(lambda: next((x for x in e.hub.detector.list() if x["rule"] == "login" and x["subject"] == attacker), None), 10)
+        ok(t, "login failures detected")
+        time.sleep(1.0)
+        e.hub.refresh_soon("log")  # one more forced REST re-read; it must not re-deliver what syslog already did
+        time.sleep(1.0)
+        eq(e.hub.detector.threats[t["id"]]["count"], 5, "each failure counted once, not twice")
+
+
+@test
 def t_e2e_scripted_incidents():
     """The demo's incident script, sped up: the conntrack/log-based rules fire with no setup at all."""
     with Env(script=True, speed=12) as e:
-        want = {"bruteforce", "login", "worm", "blocklist", "new_device", "link_down", "watchport", "vpn_leak"}
+        want = {"bruteforce", "login", "worm", "blocklist", "new_device", "link_down", "watchport", "vpn_leak",
+                "reboot"}
         got = wait_for(lambda: (lambda r: r if want <= r else None)({t["rule"] for t in e.hub.detector.list()}), 40, 0.5)
         ok(got, "scripted incidents detected: {}".format(sorted({t["rule"] for t in e.hub.detector.list()})))
+
+
+@test
+def t_e2e_stability_outage_and_reboot():
+    """An unreachable router raises and resolves router_down; a reboot (boot time moving) raises
+    its own alert and picks up the cause from the router's own log once MCC polls it -- all
+    through the real poller, not called on the detector directly."""
+    with Env() as e:
+        e.cfg.update({"poll": {"router_s": 0.3, "log_s": 0.3}, "detect": {"down_s": 0.6}})
+        e.world.unreachable_until = time.time() + 3.0
+        e.hub.refresh_soon("fast")  # the fast loop may have an older, slower poll already scheduled
+        rd = wait_for(lambda: next((t for t in e.hub.detector.list() if t["rule"] == "router_down"), None), 10)
+        ok(rd and rd["status"] == "open", "unreachable router detected by the real poller")
+        ok(wait_for(lambda: e.hub.detector.threats[rd["id"]]["status"] == "resolved", 10),
+           "reconnecting resolves it")
+        ok("back up after" in e.hub.detector.threats[rd["id"]]["summary"], "duration in the persisted summary")
+
+        # the router "reboots": boot time jumps first (detected on its own, with no cause yet)...
+        with e.world.lock:
+            e.world.boot = time.time()
+        rb = wait_for(lambda: next((t for t in e.hub.detector.list() if t["rule"] == "reboot"), None), 10)
+        ok(rb, "boot time change detected by the real poller")
+        # ...then RouterOS logs why, and MCC attaches it to the alert it already raised
+        with e.world.lock:
+            e.world.log("system,error,critical", "router was rebooted without proper shutdown, probably power outage")
+        ok(wait_for(lambda: "Cause: power outage" in e.hub.detector.threats[rb["id"]]["summary"], 10),
+           "reboot cause picked up from the router's own log and attached to the alert")
+        ok(any(e["level"] == "crit" and "power outage" in e["msg"] for e in e.hub.logs),
+           "the critical line itself is in the log view too")
+        # ...and survives an MCC restart (self.logs is otherwise in-memory only)
+        data_dir, cfg = e.hub.data_dir, e.hub.cfg
+        e.hub.stop()
+        hub2 = Hub(cfg, data_dir)
+        ok(any(x["level"] == "crit" and "power outage" in x["msg"] for x in hub2.logs),
+           "the critical log line is still there after a restart")
+        ok(hub2.stability.last_boot is not None, "last known boot time is still there after a restart")
 
 
 @test

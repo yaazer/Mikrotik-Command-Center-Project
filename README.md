@@ -7,6 +7,7 @@ A self-contained NOC console for a MikroTik network: a **RouterOS 7** router and
 - **A live traffic map**: who on your LAN is talking to whom on the Internet, at what rate, animated as it happens.
 - **Device-to-device traffic**: which devices inside your network talk to each other (backups to the NAS, casting, printing, IoT to Home Assistant), and an honest account of what the router can and can't see.
 - **Threat detection**: port scans, brute force, router login guessing, floods, worm-like spreading, blocklisted addresses, unusual uploads, new devices, link failures.
+- **Router stability**: an unreachable router, a reboot (with RouterOS's own explanation when it logs one), high memory, and critical log lines -- kept across an MCC restart, so you can still tell why the router failed after the fact.
 - **Device identification**: what each device is (an iPhone, a Brother printer, a Wyze camera, an ESP32 smart plug), with the evidence, so a new device is recognisable the moment it joins.
 - **Interactive responses**: block an address, quarantine a host, drop its connections, disable a port. Each one is shown as the exact router change, applied only when you confirm, logged, and undoable.
 
@@ -60,7 +61,7 @@ MCC itself still never writes a password. Use a dedicated, limited RouterOS user
 `--demo` starts a simulated RB5009 and two SwOS switches: a CRS309 on the router, and an office CSS610 behind the CRS309 (with a PC and a VoIP phone), all on a small LAN:
 - a NAS, a workstation, a TV, a gaming PC, cameras, a homelab with an SSH port forward;
 - an IoT VLAN (a smart plug and a thermostat talking to Home Assistant), and devices using each other: backups to the NAS, Plex, casting, printing, a camera recorded by Home Assistant. The router's switch chip forwards between its ports in hardware, as an RB5009's does, so the LAN page shows that traffic only after you approve the two LAN items in Setup;
-- a repeating script of incidents: SSH brute force, router login guessing, a port scan, a camera that starts spreading like a worm, a beacon to a blocklisted server, a new device (in turn: an ESP32 smart plug, a Galaxy phone, an iPhone with a private address, a Wyze camera), a link flap, a large upload, and an IRC connection.
+- a repeating script of incidents: SSH brute force, router login guessing, a port scan, a camera that starts spreading like a worm, a beacon to a blocklisted server, a new device (in turn: an ESP32 smart plug, a Galaxy phone, an iPhone with a private address, a Wyze camera), a link flap, a large upload, an IRC connection, and a brief router outage ending in a reboot with the critical log line RouterOS itself writes after an unclean shutdown.
 
 The simulated router behaves like the real one:
 - **Your responses take effect:** a blocked attacker stops, a quarantined host goes quiet, a disabled port drops.
@@ -154,7 +155,18 @@ Blocks and quarantines also drop the address's open connections. Without that, c
 | VPN tunnel down | a tunnel interface stops running, or WireGuard has no handshake for 5 min | — |
 | New device | a MAC never seen before (the first run is the baseline); the alert says what the device appears to be, and sharpens that as its traffic arrives | quarantine, or mark known |
 | Link down | a router or switch port that was up loses link | — |
-| Router CPU / temperature | ≥ 90 % for 30 s / ≥ 75 °C | — |
+| Router CPU / memory / temperature | ≥ 90 % for 30 s / ≥ 90 % for 60 s / ≥ 75 °C | — |
+| Router unreachable | MCC can't reach the router's REST API for 15 s straight | — |
+| Router rebooted | the router's uptime shows an earlier boot time than last seen -- it restarted | — |
+| Router critical log | the router logs a `critical` line MCC doesn't already have a specific rule for | — |
+
+**Router stability.** Four rules above exist to answer *why did the router fail*, not just *that* it did:
+
+- **Router unreachable** fires only once MCC has retried and failed for `down_s` seconds straight (**Settings › Detection thresholds**, default 15 s) -- one slow poll isn't an outage. It covers an unreachable router only: a wrong password or a changed certificate is a credentials/config problem, shown on the Setup page instead.
+- **Router rebooted** compares the router's boot time (now minus its reported uptime), not just whether uptime went down, so a restart that happened while MCC itself was offline is still caught. If RouterOS logged why on the next boot -- it does this for an unclean shutdown, with a cause of probably power loss, a kernel fault or a watchdog reset -- that cause is attached to the same alert once MCC reads the log.
+- **Router critical log** catches anything else logged at RouterOS's `critical` level: firewall hits, logins and link changes already have their own rules and don't also raise this one.
+- When RouterOS didn't log a cause -- memory exhaustion and a CPU lockup usually don't -- the *Router unreachable* and *Router rebooted* alerts fall back to the router's own CPU, memory, temperature and voltage from just before it went quiet.
+- Warning, error and critical log lines are kept in **data/router_log.jsonl**, and the last known boot time in **data/stability_state.json**, both reloaded on startup. Boot time is compared every poll rather than against a possibly days-old saved value, so ordinary clock drift between MCC and a router without NTP never looks like a reboot. `self.logs` itself is in-memory only and fills with routine traffic within hours, so warning+ lines also live in a longer, separate list the Logs page's *Warnings+* filter draws on.
 
 **VPN leaks.** Give your kill-switch rule a log prefix, and every hit becomes a *VPN leak* threat for the device it caught, with the interface it tried to use:
 
@@ -455,10 +467,11 @@ mcc/identify.py      what a device is: clues from MAC, names, DHCP, neighbors an
 mcc/oui.py           IEEE MAC vendor registry (stdlib), opt-in refresh; mcc/oui.tsv.gz is the shipped snapshot
 mcc/geo.py           .mmdb reader (stdlib), locator, home location, opt-in DB-IP download
 mcc/geodata.py       country label points (Natural Earth) for country-level databases
+mcc/stability.py     router log lines (warning+) and last known boot time, kept across an MCC restart
 mcc/sim.py           simulated router, switch and network (demo + tests)
 data/                config.json, actions.jsonl, threats.jsonl, devices.json, setup_state.json, blocklist.txt,
                      ignore.json + ignore.log.jsonl, pins.json, names.json, fingerprints.json, geo/*.mmdb,
-                     oui/oui.tsv.gz (a refreshed vendor registry)
+                     oui/oui.tsv.gz (a refreshed vendor registry), router_log.jsonl + stability_state.json
 ```
 
 ## Tests

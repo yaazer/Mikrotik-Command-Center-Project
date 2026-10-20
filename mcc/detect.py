@@ -12,6 +12,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import threading
 import time
 from collections import defaultdict, deque
@@ -19,7 +20,11 @@ from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 from .traffic import service_label
-from .util import ip_obj, now_iso
+from .util import human_duration, ip_obj, now_iso
+
+# IPs, MACs and bare numbers vary run to run; normalised out so repeats of the same critical line
+# count against one alert instead of flooding the feed with a fresh one each time.
+_LOG_KEY_RE = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}|\d+")
 
 # How far an "ignore" reaches. Narrowest first; the console offers them in this order.
 IGNORE_SCOPES = {
@@ -66,6 +71,16 @@ RULES: Dict[str, Dict[str, str]] = {
     "cpu": {"name": "Router CPU high", "why": "The router's CPU has stayed above the threshold. Under attack, "
             "packets may be dropped."},
     "temp": {"name": "Router temperature", "why": "The router is running hot."},
+    "mem": {"name": "Router memory high", "why": "Free memory has stayed low. Memory exhaustion is a common cause "
+            "of a RouterOS hang or reboot."},
+    "router_down": {"name": "Router unreachable", "why": "MCC could not reach the router's REST API for a "
+                    "sustained period. It may be rebooting, hung, overloaded, or cut off from this machine's "
+                    "network path."},
+    "reboot": {"name": "Router rebooted", "why": "The router's uptime reset to a lower value: it restarted. "
+               "RouterOS logs the likely cause -- power loss, a kernel fault, or a watchdog reset -- on the next "
+               "boot when it knows one, and that's attached here if it arrives."},
+    "router_log": {"name": "Router critical log", "why": "The router logged a critical system message outside "
+                   "the firewall/login/link lines MCC already classifies."},
 }
 
 
@@ -179,6 +194,8 @@ class Detector:
         self._iface_state: Dict[str, bool] = {}
         self._port_state: Dict[str, bool] = {}
         self._cpu_since = 0.0
+        self._mem_since = 0.0
+        self._down_since = 0.0
         self._exfil_since: Dict[str, float] = {}
         self._known: Optional[Dict[str, Any]] = None
         self._log_path = self.data_dir / "threats.jsonl"
@@ -727,7 +744,8 @@ class Detector:
                     self._blocklisted(c["local"], c["remote"], False, ts, text)
             self._seen_conns = seen
 
-    def on_health(self, cpu: Optional[float], temp: Optional[float], ts: Optional[float] = None) -> None:
+    def on_health(self, cpu: Optional[float], temp: Optional[float], mem: Optional[float] = None,
+                 ts: Optional[float] = None) -> None:
         ts = ts or time.time()
         with self.lock:
             if cpu is not None:
@@ -747,6 +765,88 @@ class Detector:
                                       evidence=[(ts, "temperature {:.0f} °C".format(temp))])
                 elif temp < self.d("temp_c") - 5:
                     self._auto_resolve("temp", "router", "temperature back to {:.0f} °C".format(temp))
+            if mem is not None:
+                if mem >= self.d("mem_pct"):
+                    self._mem_since = self._mem_since or ts
+                    if ts - self._mem_since >= self.d("mem_s"):
+                        self.raise_threat("mem", "router", "medium", "Router memory at {:.0f}%".format(mem),
+                                          "Above {}% for {}s".format(self.d("mem_pct"), int(ts - self._mem_since)),
+                                          ts, subject="", role="router", evidence=[(ts, "memory {:.0f}%".format(mem))])
+                else:
+                    self._mem_since = 0.0
+                    self._auto_resolve("mem", "router", "memory back to {:.0f}%".format(mem))
+
+    def on_router_status(self, reachable: bool, error: str, ts: Optional[float] = None, *,
+                         context: str = "") -> None:
+        """reachable=False only for a genuinely unreachable router (status 0: timeout, refused, DNS,
+        TLS). A wrong password or a changed certificate is a credentials/config problem, not a
+        stability one, and hub.py already disconnects for those without calling this.
+        context: hub.py's recent CPU/memory/temperature/voltage, when it has any -- the only
+        explanation available for an outage that isn't a RouterOS-logged reboot cause."""
+        ts = ts or time.time()
+        with self.lock:
+            if not reachable:
+                self._down_since = self._down_since or ts
+                waited = ts - self._down_since
+                if waited >= self.d("down_s"):
+                    summary = "No response for {}: {}".format(human_duration(waited), error)
+                    self.raise_threat("router_down", "router", "high", "Router unreachable",
+                                      "{} ({})".format(summary, context) if context else summary, ts,
+                                      subject="", role="router", evidence=[(ts, error)])
+            elif self._down_since:
+                waited = ts - self._down_since
+                self._down_since = 0.0
+                if waited >= self.d("down_s"):
+                    tid = self.by_key.get(("router_down", "router"))
+                    t = self.threats.get(tid)
+                    if t and t["status"] in ("open", "acknowledged"):
+                        note = "back up after {}".format(human_duration(waited))
+                        t["summary"] = "{} -- {}.".format(t["summary"], note)
+                        self.set_status(tid, "resolved", note)
+
+    def on_reboot(self, prev_uptime_s: Optional[float], boot: float, ts: Optional[float] = None, *,
+                 context: str = "") -> Optional[Dict[str, Any]]:
+        """The router's boot time moved: it restarted. Keyed by the boot time itself (not a
+        sequence number) so each reboot is its own alert -- the way a new device is, rather than
+        one entry whose count climbs across unrelated reboots -- and the key stays stable and
+        collision-free across an MCC restart, when any in-process counter would start over.
+        context: see on_router_status -- useful here when RouterOS didn't log a cause itself."""
+        ts = ts or time.time()
+        with self.lock:
+            key = "router:{}".format(int(boot))
+            prev = human_duration(prev_uptime_s) if prev_uptime_s else "an unknown time"
+            summary = "Was up for {} before restarting.".format(prev)
+            if context:
+                summary += " ({})".format(context)
+            return self.raise_threat("reboot", key, "medium", "Router rebooted", summary, ts,
+                                     subject="", role="router",
+                                     evidence=[(ts, "previous uptime {}".format(prev))])
+
+    def on_reboot_cause(self, tid: str, reason: str, ts: Optional[float] = None) -> None:
+        """RouterOS's own explanation for an unclean reboot, parsed from its log (collectors.classify)
+        and attached to the reboot alert on_reboot already raised, so the cause survives in the
+        persisted summary (threats.jsonl drops evidence, but not summary) even after MCC restarts."""
+        ts = ts or time.time()
+        with self.lock:
+            t = self.threats.get(tid)
+            if t is None:
+                return
+            if "Cause:" not in t["summary"]:
+                t["summary"] = "{} Cause: {}.".format(t["summary"], reason)
+            t["evidence"].append({"ts": ts, "text": "cause: " + reason})
+            del t["evidence"][:-25]
+            self._persist(t)
+            self.on_change(t)
+
+    def on_router_log(self, msg: str, ts: Optional[float] = None) -> None:
+        """A 'critical' log line MCC doesn't already have a specific rule for (firewall, login,
+        link, reboot cause). Error/warning lines are kept in the log but don't raise an alert --
+        routine DHCP/wireless/IPsec retries log at that level too often to be worth one each."""
+        ts = ts or time.time()
+        key = "router:" + _LOG_KEY_RE.sub("#", msg)[:120]
+        with self.lock:
+            self.raise_threat("router_log", key, "high", "Router critical log", msg[:300], ts,
+                              subject="", role="router", evidence=[(ts, msg)])
 
     def _auto_resolve(self, rule: str, key: str, note: str) -> None:
         tid = self.by_key.get((rule, key))

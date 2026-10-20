@@ -3,7 +3,8 @@
   World       a small LAN (NAS, workstation, TV, cameras...) talking to the Internet, plus a
               repeating script of incidents: SSH brute force on a port forward, router login
               guessing, a port scan, a worm-like camera, a C2 beacon, a new device, a link flap,
-              a big upload, an IRC connection, a VPN leak caught by a kill-switch rule.
+              a big upload, an IRC connection, a VPN leak caught by a kill-switch rule, and a
+              brief router outage ending in a reboot with an unclean-shutdown log line.
   FakeRouter  RouterOS 7 REST API over the World (Basic auth). Changes made through it have
               effect: blocked attackers stop, quarantined hosts go quiet, disabled ports drop.
   FakeSwOS    a CRS309 running SwOS: link.b / stats.b / sys.b behind HTTP digest auth.
@@ -188,8 +189,10 @@ ROUTER_MACS = ("48:A9:8A:00:00:10", "48:A9:8A:00:00:06")  # the bridge, and sfp-
 
 # (offset s, event, duration s) within each cycle
 SCRIPT = [(6, "ssh_brute", 50), (20, "login_fail", 45), (40, "scan", 40), (75, "worm", 40), (100, "c2", 60),
-          (125, "new_device", 1), (140, "link_flap", 20), (165, "exfil", 150), (185, "irc", 60), (235, "vpn_leak", 30)]
+          (125, "new_device", 1), (140, "link_flap", 20), (165, "exfil", 150), (185, "irc", 60), (235, "vpn_leak", 30),
+          (270, "reboot", 35)]
 CYCLE = 330
+REBOOT_CAUSES = ["power outage", "kernel failure", "watchdog timer"]
 
 
 class QuietServer(ThreadingHTTPServer):
@@ -233,6 +236,7 @@ class World:
         self.script_on = script
         self.t0 = time.time()
         self.boot = time.time() - 3 * 86400 - 5 * 3600
+        self.unreachable_until = 0.0  # the "reboot" incident: the REST server stops answering until this
         self.ids: Dict[str, int] = defaultdict(lambda: 0x10)
         self.tables: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         self.single: Dict[str, Dict[str, Any]] = {}
@@ -702,6 +706,18 @@ class World:
             self.log("interface,info", "ether3 link up (speed 1G, full duplex)")
         self.sw_link[5] = True
 
+    def _start_reboot(self, e: Dict[str, Any]) -> None:
+        """The REST server stops answering -- a real unreachable router, not a fake status flag --
+        for the rest of this incident's window, then comes back up with a reset uptime and the
+        critical log line RouterOS itself writes after an unclean shutdown."""
+        self.unreachable_until = e["end"]
+
+    def _end_reboot(self, e: Dict[str, Any]) -> None:
+        self.unreachable_until = 0.0
+        self.boot = time.time()
+        cause = self.rng.choice(REBOOT_CAUSES)
+        self.log("system,error,critical", "router was rebooted without proper shutdown, probably {}".format(cause))
+
     def _start_exfil(self, e: Dict[str, Any]) -> None:
         if not self.quarantined("192.168.88.10"):
             e["conn"] = self.new_conn("192.168.88.10", 50123, SERVICES["s3.amazonaws.com"], 443, "tcp",
@@ -993,6 +1009,11 @@ def make_router(world: World, user: str = "admin", password: str = "demo", bind:
             self._out(status, {"error": status, "message": msg, **({"detail": detail} if detail else {})})
 
         def _handle(self, method: str) -> None:
+            if world.unreachable_until > time.time():
+                # the "reboot" incident: hang up without a response, the way a router that's down
+                # or mid-boot does, instead of answering with some fake "I'm down" status
+                self.close_connection = True
+                return
             n = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(n) if n else b""
             if self.headers.get("Authorization") != expected:

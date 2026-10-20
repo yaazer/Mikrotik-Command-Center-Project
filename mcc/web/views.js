@@ -356,7 +356,8 @@ VIEWS.overview = {
         <div class="sub">${capU ? usage(s.wan.tx_bps, capU, s.wan.up_mbps) : esc(s.wan.names.join(", ") || "WAN")}</div><canvas class="spark" id="sp-u"></canvas></div>
       <div class="panel kpi"><div class="k">CPU</div><div class="v">${fmt.pct(r.cpu)}</div><div class="sub">${r.cpu_count || "?"} cores · ${esc(r.arch || "")}</div>${Charts.gauge(r.cpu, pctColor(r.cpu || 0))}</div>
       <div class="panel kpi"><div class="k">Memory</div><div class="v">${fmt.pct(memPct)}</div><div class="sub">${fmt.bytes(r.mem_used)} of ${fmt.bytes(r.mem_total)}</div>${Charts.gauge(memPct, pctColor(memPct || 0))}</div>
-      <div class="panel kpi"><div class="k">Temperature</div><div class="v">${r.temp != null ? Math.round(r.temp) + "<small>°C</small>" : "—"}</div><div class="sub">${r.voltage ? r.voltage + " V" : "router health"}</div></div>
+      <div class="panel kpi"><div class="k">Temperature</div><div class="v">${r.temp != null ? Math.round(r.temp) + "<small>°C</small>" : "—"}</div>
+        <div class="sub">${[r.uptime ? `up ${esc(r.uptime)}` : "", r.voltage ? `${r.voltage} V` : ""].filter(Boolean).join(" · ") || "router health"}</div></div>
       <div class="panel kpi clickable" data-go="traffic"><div class="k">Connections</div><div class="v">${tr.conns.toLocaleString()}</div><div class="sub">${tr.host_count} hosts · ${tr.peer_count} peers</div></div>
       <div class="panel kpi clickable" data-go="threats"><div class="k">Open threats</div><div class="v" style="color:${s.counts.threats_open ? "var(--crit)" : "var(--ok)"}">${s.counts.threats_open}</div>
         <div class="sub">${s.counts.blocked} blocked · ${s.counts.actions_pending} pending</div></div>`;
@@ -1552,7 +1553,8 @@ VIEWS.setup = {
         ${num("scan_ports", "Scan: ports / window")}${num("scan_hosts", "Sweep: hosts / window")}${num("scan_window_s", "Scan window (s)")}
         ${num("login_failures", "Login failures")}${num("login_window_s", "Login window (s)")}${num("service_conns", "Brute force: conns")}
         ${num("fanout_peers", "Fan-out: peers / min")}${num("worm_dsts", "Worm: dsts / min")}${num("exfil_mbps", "Upload alert (Mb/s)")}
-        ${num("exfil_s", "Sustained for (s)")}${num("cpu_pct", "CPU alert (%)")}${num("temp_c", "Temperature alert (°C)")}${num("quiet_s", "Quiet after (s)")}
+        ${num("exfil_s", "Sustained for (s)")}${num("cpu_pct", "CPU alert (%)")}${num("temp_c", "Temperature alert (°C)")}
+        ${num("mem_pct", "Memory alert (%)")}${num("down_s", "Unreachable alert after (s)")}${num("quiet_s", "Quiet after (s)")}
         <label for="d-leak">VPN leak log prefixes</label><input type="text" id="d-leak" value="${esc((d.leak_prefixes || []).join(", "))}" placeholder="VPN-LEAK" title="A firewall rule logged with one of these prefixes is a VPN kill switch: every hit raises a VPN leak threat">
       </div></details></div>
       <span></span><div class="btnrow"><button class="btn primary" type="submit">Save settings</button></div></form>`;

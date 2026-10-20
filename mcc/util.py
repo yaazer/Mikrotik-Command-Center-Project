@@ -73,6 +73,26 @@ def parse_duration(text: Any) -> float:
     return total
 
 
+def human_duration(seconds: float) -> str:
+    """Seconds -> '2d 3h', '14m 5s', '32s' -- for alert text, not RouterOS's own '1w2d3h4m' syntax."""
+    s = max(0, int(seconds))
+    if s < 60:
+        return "{}s".format(s)
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m, sec = divmod(rem, 60)
+    parts = []
+    if d:
+        parts.append("{}d".format(d))
+    if h and len(parts) < 2:
+        parts.append("{}h".format(h))
+    if m and len(parts) < 2:
+        parts.append("{}m".format(m))
+    if not parts:
+        parts.append("{}s".format(sec))
+    return " ".join(parts)
+
+
 def to_int(value: Any, default: int = 0) -> int:
     try:
         return int(str(value).strip())
