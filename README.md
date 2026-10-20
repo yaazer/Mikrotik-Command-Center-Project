@@ -157,7 +157,7 @@ Blocks and quarantines also drop the address's open connections. Without that, c
 | Link down | a router or switch port that was up loses link | — |
 | Router CPU / memory / temperature | ≥ 90 % for 30 s / ≥ 90 % for 60 s / ≥ 75 °C | — |
 | Router unreachable | MCC can't reach the router's REST API for 15 s straight | — |
-| Router rebooted | the router's uptime shows an earlier boot time than last seen -- it restarted | — |
+| Router rebooted | the router's uptime shows a newer boot time than last known -- it restarted | — |
 | Router critical log | the router logs a `critical` line MCC doesn't already have a specific rule for | — |
 
 **Router stability.** Four rules above exist to answer *why did the router fail*, not just *that* it did:
@@ -165,7 +165,7 @@ Blocks and quarantines also drop the address's open connections. Without that, c
 - **Router unreachable** fires only once MCC has retried and failed for `down_s` seconds straight (**Settings › Detection thresholds**, default 15 s) -- one slow poll isn't an outage. It covers an unreachable router only: a wrong password or a changed certificate is a credentials/config problem, shown on the Setup page instead.
 - **Router rebooted** compares the router's boot time (now minus its reported uptime), not just whether uptime went down, so a restart that happened while MCC itself was offline is still caught. If RouterOS logged why on the next boot -- it does this for an unclean shutdown, with a cause of probably power loss, a kernel fault or a watchdog reset -- that cause is attached to the same alert once MCC reads the log.
 - **Router critical log** catches anything else logged at RouterOS's `critical` level: firewall hits, logins and link changes already have their own rules and don't also raise this one.
-- When RouterOS didn't log a cause -- memory exhaustion and a CPU lockup usually don't -- the *Router unreachable* and *Router rebooted* alerts fall back to the router's own CPU, memory, temperature and voltage from just before it went quiet.
+- When RouterOS didn't log a cause -- memory exhaustion and a CPU lockup usually don't -- the alerts fall back to the router's own recent CPU and memory peaks (plus temperature and voltage, for *Router unreachable* specifically, since those are still frozen at their last known reading rather than a fresh post-boot one).
 - Warning, error and critical log lines are kept in **data/router_log.jsonl**, and the last known boot time in **data/stability_state.json**, both reloaded on startup. Boot time is compared every poll rather than against a possibly days-old saved value, so ordinary clock drift between MCC and a router without NTP never looks like a reboot. `self.logs` itself is in-memory only and fills with routine traffic within hours, so warning+ lines also live in a longer, separate list the Logs page's *Warnings+* filter draws on.
 
 **VPN leaks.** Give your kill-switch rule a log prefix, and every hit becomes a *VPN leak* threat for the device it caught, with the interface it tried to use:
@@ -496,3 +496,7 @@ SHOTS=out python tools/ui_check.py # ...and saves screenshots
 - **Names need the router:** device and host names come from the router's DHCP leases, ARP comments and DNS cache. After a restart MCC uses the names it remembers (`data/names.json`) until you reconnect the router in Setup, or set `MCC_ROUTER_PASSWORD` so it reconnects by itself. Devices it has never seen show as addresses until then.
 - **Flow lag:** flow records arrive in batches, so the live map's rates come from the connection table.
 - **Validation:** the SwOS field mapping is best effort (see above). Developed against RouterOS 7.x REST and SwOS 2.x behaviour, using the bundled simulator.
+- **Stability logging:**
+  - **Syslog topics:** the syslog plan forwards only `firewall`, `critical` and `interface`. A warning or error line logged just before a crash arrives only through the 3 s REST poll, and is lost if the router dies before that poll runs. Approving `error` and `warning` too would close this, but existing installs would need to re-approve the plan.
+  - **Older alerts:** only the newest 400 threats reload after an MCC restart. On a busy network, an older reboot or outage alert can drop out of that window, along with the duration and health context that live only in its summary. The raw log lines themselves stay in `router_log.jsonl` regardless.
+  - **Duplicate lines on restart:** each MCC restart re-reads up to 200 router log lines as history (`detect=False`) and re-appends any warning-and-above ones to `router_log.jsonl`/the Logs page, including ones already saved there. A line from the router's current boot -- the reboot-cause line among them -- can briefly show twice under *Warnings+* right after an MCC restart.
