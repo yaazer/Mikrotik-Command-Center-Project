@@ -93,9 +93,21 @@ function typeDot(cat) {
   return cat ? `<i class="tdot" style="background:${Types.color(cat)}" title="${esc(Types.label(cat))}"></i>` : "";
 }
 /* every live panel: legend over the map/globe and the Type/Direction switch */
+function legendTypes(el) {
+  const snap = S.snap;
+  if (!snap) return [];
+  // the LAN and VPN maps colour their own traffic, so their keys list the types that appear there
+  const pairs = el.closest("#lan-map") ? (snap.lan || {}).pairs : el.closest("#vpn-map") ? (snap.traffic.vpn || {}).pairs : null;
+  if (!pairs) return snap.traffic.types;
+  const by = {};
+  for (const p of pairs) {
+    const t = by[p.cat] || (by[p.cat] = { id: p.cat, label: Types.label(p.cat), bps: 0 });
+    t.bps += (p.up || 0) + (p.down || 0);
+  }
+  return Object.values(by).sort((a, b) => b.bps - a.bps);
+}
 function refreshTypeUI() {
-  const types = S.snap && S.snap.traffic.types;
-  $$(".type-legend").forEach((el) => { el.innerHTML = Types.legend(types); });
+  $$(".type-legend").forEach((el) => { el.innerHTML = Types.legend(legendTypes(el)); });
   $$(".color-by button").forEach((b) => b.classList.toggle("on", b.dataset.by === Types.by));
 }
 document.addEventListener("click", (e) => {

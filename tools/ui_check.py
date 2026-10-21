@@ -399,6 +399,7 @@ def sc_update(d: Demo, c: Check) -> None:
 def sc_types(d: Demo, c: Check) -> None:
     with Browser(1600, 1000) as b:
         b.nav(d.url + "#/overview")
+        see(b, "#types")  # live panels fill in once scrolled to
         c(b.until("document.querySelectorAll('#types .trow').length >= 5", 20), "Overview lists traffic types")
         c(b.eval("!!document.querySelector('#types .tbar.big')"), "with a breakdown bar")
         c(b.until("document.querySelectorAll('#live .type-legend .tl').length >= 5", 5), "the live view's legend shows the types")

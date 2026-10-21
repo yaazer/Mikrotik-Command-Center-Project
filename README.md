@@ -259,7 +259,7 @@ Every conversation is classified into one of these types:
 - **Per row:** Conversations gets a Type column (hover it to see why a row was classified that way), host and peer rows get a type dot, and the host drawer breaks a host's traffic down by type.
 
 **How a type is decided** (`mcc/classify.py`):
-1. **The name your device looked up**, from the router's DNS cache. For example, `*.nflxvideo.net` and `*.googlevideo.com` are streaming, and `*.steamcontent.com` is gaming. A name must be the listed domain or a subdomain of it, so a lookalike such as `netflix.com.evil.example` doesn't count.
+1. **The name your device looked up**, from the router's DNS cache. MCC follows the cache's CNAME chains, so an address MCC only sees as `d1.cloudfront.net` still counts as Netflix if your device looked up `www.netflix.com` to get there. For example, `*.nflxvideo.net` and `*.googlevideo.com` are streaming, and `*.steamcontent.com` is gaming. A name must be the listed domain or a subdomain of it, so a lookalike such as `netflix.com.evil.example` doesn't count.
 2. **Well-known ports:**
    - 6881–6999 and 51413: BitTorrent;
    - 3074: Xbox Live;

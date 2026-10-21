@@ -58,10 +58,11 @@ class TrafficModel:
     CONN_FRESH = 15.0
 
     def __init__(self, lan_nets: Callable[[], List[Any]], router_addrs: Callable[[], Set[str]],
-                 name_of: Callable[[str], str]):
+                 name_of: Callable[[str], str], names_of: Optional[Callable[[str], List[str]]] = None):
         self.lan_nets = lan_nets
         self.router_addrs = router_addrs
         self.name_of = name_of
+        self.names_of = names_of  # every name for an address (CNAME chain), for classifying
         self.conn_pairs: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self.conn_count = 0
         self.conn_at = 0.0
@@ -247,7 +248,7 @@ class TrafficModel:
         types: Dict[str, Dict[str, Any]] = {}
         tot_in = tot_out = 0.0
         plist = []
-        classify.apply(pairs.values(), self.name_of)  # p["cat"] / p["cat_why"]
+        classify.apply(pairs.values(), self.name_of, self.names_of)  # p["cat"] / p["cat_why"]
         for p in pairs.values():
             h = hosts.setdefault(p["local"], {"ip": p["local"], "name": self.name_of(p["local"]), "up": 0.0,
                                               "down": 0.0, "conns": 0, "peers": set(), "_cats": []})
@@ -498,7 +499,7 @@ class TrafficModel:
         now = now or time.time()
         src = self.source(now)
         pairs = self.conn_pairs if src == "conntrack" else self.flow_pairs(now)
-        classify.apply(pairs.values(), self.name_of)
+        classify.apply(pairs.values(), self.name_of, self.names_of)
         rows = [p for p in pairs.values() if p["local"] == ip or p["remote"] == ip]
         rows.sort(key=lambda p: -(p["up"] + p["down"]))
         return {

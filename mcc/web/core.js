@@ -184,7 +184,7 @@ function connectStream() {
 const Types = {
   by: (() => { try { return localStorage.getItem("mcc-color-by") || "type"; } catch (e) { return "type"; } })(),
   focus: null,
-  def(id) { return (S.categories || []).find((c) => c.id === id) || { id, label: id, hue: 0, c: 0 }; },
+  def(id) { return (S.categories || []).find((c) => c.id === id) || { id, label: id, hue: 0, c: 0, l: 0.56 }; },
   label(id) { return this.def(id).label; },
   // the map and globe ask for a colour per particle per frame: compute each once (cleared on a theme
   // change or new category definitions), never per call
@@ -194,7 +194,7 @@ const Types = {
     let c = this._cache.get(key);
     if (c) return c;
     const d = this.def(id), light = document.documentElement.dataset.theme === "light";
-    const l = d.c === 0 ? (light ? 0.55 : 0.62) : d.c < 0.05 ? (light ? 0.5 : 0.7) : (light ? 0.58 : 0.76);
+    const l = d.l === undefined ? (light ? 0.58 : 0.76) : light ? d.l - 0.18 : d.l;
     c = `oklch(${l} ${d.c} ${d.hue}${alpha === undefined ? "" : " / " + alpha})`;
     this._cache.set(key, c);
     return c;
@@ -230,7 +230,7 @@ const Types = {
     if (this.by !== "type") {
       return '<span><i style="background:var(--in)"></i>download</span><span><i style="background:var(--out)"></i>upload</span><span><i style="background:var(--crit)"></i>threat</span>';
     }
-    return (types || []).filter((t) => t.bps > 0).slice(0, 9).map((t) => `<button class="tl ${this.focus === t.id ? "on" : ""} ${this.focus && this.focus !== t.id ? "dim" : ""}" data-type="${esc(t.id)}" title="${esc(t.label)}: ${fmt.bps(t.bps)} · click to highlight">
+    return (types || []).filter((t) => t.bps > 0).map((t) => `<button class="tl ${this.focus === t.id ? "on" : ""} ${this.focus && this.focus !== t.id ? "dim" : ""}" data-type="${esc(t.id)}" title="${esc(t.label)}: ${fmt.bps(t.bps)} · click to highlight">
         <i style="background:${this.color(t.id)}"></i>${esc(t.label)}</button>`).join("") + '<span><i style="background:var(--crit)"></i>threat</span>';
   },
 };

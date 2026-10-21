@@ -134,6 +134,7 @@ class Hub:
         self._table_off: Dict[str, float] = {}  # optional router tables that errored -> retry after
         self.ip_names: Dict[str, str] = {}
         self.dns_names: Dict[str, str] = {}
+        self.dns_chains: Dict[str, List[str]] = {}
         self.name_memory = NameMemory(self.data_dir)  # names seen before: kept across restarts and DNS-cache expiry
         self.router_addrs: Set[str] = set()
         self.router_nets: List[Tuple[str, Any]] = []  # (interface, network)
@@ -157,7 +158,7 @@ class Hub:
         self.threads: List[threading.Thread] = []
         self.started = time.time()
 
-        self.traffic = TrafficModel(self.lan_nets, lambda: self.router_addrs, self.name_of)
+        self.traffic = TrafficModel(self.lan_nets, lambda: self.router_addrs, self.name_of, self.names_of)
         self.traffic.path_of = self._path_of
         self.traffic.segment_of = self._segment_of
         # Threat updates are coalesced and sent with the tick: during a scan or a busy torrent swarm a
@@ -406,6 +407,15 @@ class Hub:
 
     def name_of(self, ip: str) -> str:
         return self.ip_names.get(ip) or self.dns_names.get(ip) or self.name_memory.get(ip)
+
+    def names_of(self, ip: str) -> List[str]:
+        """Every name for an address: what a device looked up (the start of a CNAME chain) as well as the CDN
+        host it ended on, so www.netflix.com -> d1.cloudfront.net is still seen as Netflix."""
+        out = list(self.dns_chains.get(ip) or self.name_memory.chain(ip))
+        n = self.name_of(ip)
+        if n and n not in out:
+            out.append(n)
+        return out
 
     # -- pinned devices: always on the map, first in the lists ------------------------------------
     def pinned(self) -> Dict[str, Dict[str, Any]]:
@@ -943,19 +953,46 @@ class Hub:
         return {"mac": mac, "vendor": vendor, "device": dev, "identity": ident}
 
     def _poll_dns(self, ros: RouterOS, now: float) -> None:
-        try:
-            rows = ros.get_list("/ip/dns/cache")
-        except RouterOSError:
+        rows: List[Dict[str, Any]] = []
+        for path in ("/ip/dns/cache/all", "/ip/dns/cache"):  # "all" also lists the CNAME records that link a CDN name to the name asked for
+            try:
+                rows = ros.get_list(path)
+            except RouterOSError:
+                continue
+            if rows:
+                break
+        if not rows:
             return
-        names = {}
+        names: Dict[str, str] = {}
+        direct: Dict[str, List[str]] = {}  # address -> names with an A/AAAA record for it
+        alias_of: Dict[str, List[str]] = {}  # CNAME target -> the names that point at it
         for r in rows:
-            if r.get("type", "A") in ("A", "AAAA"):
-                data = r.get("data") or r.get("address") or ""
-                if ip_obj(data) and r.get("name"):
-                    names[data] = r["name"].rstrip(".")
+            kind = r.get("type", "A")
+            name = (r.get("name") or "").rstrip(".").lower()
+            data = (r.get("data") or r.get("address") or "").rstrip(".")
+            if not name:
+                continue
+            if kind in ("A", "AAAA") and ip_obj(data):
+                names[data] = r["name"].rstrip(".")
+                direct.setdefault(data, []).append(name)
+            elif kind == "CNAME" and data:
+                alias_of.setdefault(data.lower(), []).append(name)
+        chains: Dict[str, List[str]] = {}
+        for ip, heads in direct.items():
+            seen: List[str] = []
+            todo = list(heads)
+            while todo and len(seen) < 12:  # a CNAME chain is a few hops; the cap guards against loops
+                n = todo.pop(0)
+                if n not in seen:
+                    seen.append(n)
+                    todo.extend(alias_of.get(n, []))
+            if len(seen) > 1:
+                chains[ip] = list(reversed(seen))  # the name a device asked for first
         with self.lock:
             self.dns_names = names
+            self.dns_chains = chains
         self.name_memory.remember("dns", names, now)
+        self.name_memory.remember("chain", {ip: " ".join(c) for ip, c in chains.items()}, now)
 
     def _switch_poll(self, link: SwitchLink, stop: threading.Event) -> None:
         while not stop.is_set() and not self._stop.is_set():

@@ -12,9 +12,9 @@ import json
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-KEEP_S = {"device": 30 * 86400, "dns": 6 * 3600}
+KEEP_S = {"device": 30 * 86400, "dns": 6 * 3600, "chain": 6 * 3600}
 SAVE_EVERY_S = 60.0
 MAX_DNS = 20000
 
@@ -24,7 +24,7 @@ class NameMemory:
         self.data_dir = data_dir
         self.path = data_dir / "names.json"
         self.lock = threading.Lock()
-        self.tables: Dict[str, Dict[str, Tuple[str, float]]] = {"device": {}, "dns": {}}
+        self.tables: Dict[str, Dict[str, Tuple[str, float]]] = {"device": {}, "dns": {}, "chain": {}}
         self._dirty = False
         self._saved_at = 0.0
         try:
@@ -46,7 +46,7 @@ class NameMemory:
                     t[ip] = (name, now)
             for ip in [ip for ip, (_, ts) in t.items() if now - ts >= KEEP_S[kind]]:
                 del t[ip]
-            if kind == "dns" and len(t) > MAX_DNS:  # a busy network's cache: keep the most recent
+            if kind in ("dns", "chain") and len(t) > MAX_DNS:  # a busy network's cache: keep the most recent
                 for ip, _ in sorted(t.items(), key=lambda kv: kv[1][1])[:len(t) - MAX_DNS]:
                     del t[ip]
             self._dirty = True
@@ -57,6 +57,12 @@ class NameMemory:
         with self.lock:
             v = self.tables["device"].get(ip) or self.tables["dns"].get(ip)
         return v[0] if v else ""
+
+    def chain(self, ip: str) -> List[str]:
+        """Every name the router resolved to this address (the CNAME chain), origin first."""
+        with self.lock:
+            v = self.tables["chain"].get(ip)
+        return v[0].split(" ") if v else []
 
     def save(self) -> None:
         with self.lock:

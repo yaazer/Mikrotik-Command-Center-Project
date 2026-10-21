@@ -283,6 +283,14 @@ def t_traffic_types():
         # lookalikes don't count: a name must BE the domain or a subdomain of it
         (("TCP", 443, "netflix.com.evil.example"), "web"), (("TCP", 443, "spring.com"), "web"),
         (("TCP", 443, "notnetflix.com"), "web"),
+        # names, a CNAME chain (first name that matches wins) and the wider port table
+        (("TCP", 443, ["www.netflix.com", "d1.cloudfront.net"]), "streaming"),
+        (("TCP", 443, ["d1.cloudfront.net"]), "web"),
+        (("UDP", 123, "0.pool.ntp.org"), "infra"), (("TCP", 443, "imap.gmail.com"), "mail"),
+        (("TCP", 443, "tracker.opentrackr.org"), "p2p"), (("TCP", 443, "api.petlibro.com"), "iot"),
+        (("TCP", 443, "github.com"), "updates"), (("UDP", 16400, ""), "calls"), (("TCP", 1935, ""), "streaming"),
+        (("TCP", 21, ""), "cloud"), (("TCP", 5228, ""), "social"), (("UDP", 9999, ""), "iot"),
+        (("IGMP", 0, ""), "infra"), (("UDP", 3478, ""), "calls"),
     ]
     for args, want in cases:
         eq(classify.classify(*args)[0], want, "{} ->".format(args))
@@ -772,6 +780,32 @@ def t_names_survive_restart():
         m.remember("device", {"192.168.88.9": "printer"})
         m.remember("dns", {"192.168.88.9": "printer.lan.example"})
         eq(m.get("192.168.88.9"), "printer", "a device name beats a DNS name")
+
+
+@test
+def t_dns_cname_chain():
+    class FakeRos:
+        def get_list(self, path):
+            return [{"name": "www.netflix.com", "type": "CNAME", "data": "e1.edge.example-cdn.net"},
+                    {"name": "e1.edge.example-cdn.net", "type": "CNAME", "data": "d1.cloudfront.net"},
+                    {"name": "d1.cloudfront.net.", "type": "A", "data": "203.0.113.50"},
+                    {"name": "loop-a.example", "type": "CNAME", "data": "loop-b.example"},
+                    {"name": "loop-b.example", "type": "CNAME", "data": "loop-a.example"},
+                    {"name": "plain.example", "type": "A", "data": "203.0.113.51"}]
+    with Env() as e:
+        e.hub._poll_dns(FakeRos(), time.time())
+        eq(e.hub.names_of("203.0.113.50"), ["www.netflix.com", "e1.edge.example-cdn.net", "d1.cloudfront.net"],
+           "the name a device looked up comes first")
+        eq(e.hub.name_of("203.0.113.50"), "d1.cloudfront.net", "the displayed name is unchanged")
+        eq(e.hub.names_of("203.0.113.51"), ["plain.example"], "no chain: just the name")
+        eq(classify_names(e.hub, "203.0.113.50"), "streaming", "a CDN edge address is seen as the service behind it")
+        e.hub.dns_chains = {}
+        eq(e.hub.names_of("203.0.113.50")[0], "www.netflix.com", "the chain is remembered when the cache entry expires")
+
+
+def classify_names(hub, ip):
+    from mcc import classify
+    return classify.classify("TCP", 443, hub.names_of(ip))[0]
 
 
 @test
