@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from mcc import sim  # noqa: E402
-from mcc.actions import ActionError  # noqa: E402
+from mcc.actions import ActionEngine, ActionError  # noqa: E402
 from mcc.collectors import FlowParser, UdpCollector, classify, split_syslog  # noqa: E402
 from mcc.config import Config  # noqa: E402
 from mcc.detect import Blocklist, Detector  # noqa: E402
@@ -1854,6 +1854,367 @@ def t_setup_offers_to_remove_old_flow_target():
 
 
 # ============================================================================================
+# ============================================================================================
+# advisor: findings, fixes (apply -> undo), diagnostics
+# ============================================================================================
+def _advice(e, fix_id, inputs=None):
+    return e.hub.actions.propose("advice_fix", {"fix_id": fix_id, "inputs": inputs or {}}, "test")
+
+
+def _keys(e):
+    return {f["key"]: f for f in e.hub.advisor.refresh()["findings"]}
+
+
+@test
+def t_advisor_findings():
+    with Env() as e:
+        wait_for(lambda: e.hub.wan_ifaces() and e.hub.router_nets, 5)
+        k = _keys(e)
+        for key in ("sec.upnp", "sec.svc.telnet", "sec.svc.ftp", "sec.svc.api", "sec.ssh.crypto", "sys.update",
+                    "perf.sqm"):
+            ok(key in k, "{} should be found on the demo router (got {})".format(key, sorted(k)))
+        ok(k["sec.svc.telnet"]["fix"], "telnet has a fix")
+        # the tests connect to the router over plain HTTP, so MCC itself depends on the www service
+        ok("sec.svc.www" in k and k["sec.svc.www"]["fix"] is None and k["sec.svc.www"]["manual"],
+           "MCC's own service is explained, never offered for shutdown")
+        ok(k["sys.update"]["fix"] is None and k["sys.update"]["manual"], "updates are manual-only")
+        ok(k["perf.sqm"]["fix"]["inputs"], "SQM asks for the line speed")
+        ins = {i["name"]: i for i in k["perf.sqm"]["fix"]["inputs"]}
+        ok(ins["down_mbps"]["estimate"], "with no line speed in Settings the default is labelled an estimate")
+        e.hub.cfg.update({"wan": {"down_mbps": 500, "up_mbps": 100}})
+        ins = {i["name"]: i for i in _keys(e)["perf.sqm"]["fix"]["inputs"]}
+        eq((ins["down_mbps"]["default"], ins["up_mbps"]["default"], ins["down_mbps"]["estimate"]), (500.0, 100.0, False),
+           "the speed set in Settings is used as is")
+        order = [f["severity"] for f in e.hub.advisor.view()["findings"]]
+        eq(order, sorted(order, key=lambda s: {"high": 0, "medium": 1, "low": 2, "info": 3}[s]), "most severe first")
+
+
+@test
+def t_advisor_upnp_apply_undo():
+    with Env() as e:
+        _keys(e)
+        a = _advice(e, "upnp_off")
+        eq(a["status"], "pending", "proposal only")
+        eq(e.world.single["/ip/upnp"]["enabled"], "true", "nothing changed by proposing")
+        ok("enabled=no" in a["changes"][0]["cli"], "shows the exact terminal command: " + a["changes"][0]["cli"])
+        done = e.hub.actions.confirm(a["id"])
+        eq(done["status"], "done", "applied")
+        eq(e.world.single["/ip/upnp"]["enabled"], "false", "UPnP off")
+        eq(done["restore"][0]["body"], {"enabled": "true"}, "the old value was remembered at confirm time")
+        ok("sec.upnp" not in wait_for(lambda: (lambda k: k if "sec.upnp" not in k else None)(_keys(e)), 5),
+           "the finding goes away once it's fixed")
+        u = e.hub.actions.undo(a["id"])
+        eq(u["status"], "undone", "undone")
+        eq(e.world.single["/ip/upnp"]["enabled"], "true", "UPnP back on")
+
+
+@test
+def t_advisor_service_off_and_lockout_guard():
+    with Env() as e:
+        _keys(e)
+        try:
+            _advice(e, "service_off:www")
+            raise AssertionError("turning off the service MCC uses must be refused")
+        except ActionError as err:
+            ok("MCC is connected" in str(err), "refusal explains why: " + str(err))
+        try:
+            _advice(e, "service_off:ssh")
+            raise AssertionError("only insecure services are offered")
+        except ActionError:
+            pass
+        a = _advice(e, "service_off:telnet")
+        e.hub.actions.confirm(a["id"])
+        row = next(r for r in e.world.tables["/ip/service"] if r["name"] == "telnet")
+        eq(row["disabled"], "true", "telnet disabled")
+        e.hub.actions.undo(a["id"])
+        eq(row["disabled"], "false", "telnet back on")
+
+
+@test
+def t_advisor_refuses_when_router_changed():
+    with Env() as e:
+        _keys(e)
+        a = _advice(e, "upnp_off")
+        e.world.single["/ip/upnp"]["enabled"] = "false"  # someone turned it off meanwhile
+        done = e.hub.actions.confirm(a["id"])
+        eq(done["status"], "failed", "refused")
+        ok("changed since" in done["error"], "says why: " + done["error"])
+        eq(done["steps"], [], "nothing was run")
+        ok(not done["undo"]["possible"], "no undo offered for a change that never happened")
+
+
+@test
+def t_advisor_sqm_fasttrack_and_removal():
+    with Env() as e:
+        wait_for(lambda: e.hub.wan_ifaces() and e.hub.router_nets, 5)
+        _keys(e)
+        for bad in ({}, {"down_mbps": "x", "up_mbps": 10, "percent": 95},
+                    {"down_mbps": 100, "up_mbps": 10, "percent": 10}):
+            try:
+                _advice(e, "sqm_enable", bad)
+                raise AssertionError("bad input must be refused: {}".format(bad))
+            except ActionError:
+                pass
+        a = _advice(e, "sqm_enable", {"down_mbps": 500, "up_mbps": 50, "percent": 90})
+        paths = [(c["method"], c["path"].split("/*")[0]) for c in a["changes"]]
+        ok(("PATCH", "/ip/firewall/filter") in paths, "FastTrack is switched off in the same proposal: {}".format(paths))
+        eq(paths[-1], ("PATCH", "/ip/firewall/filter"), "FastTrack goes off last, after the queue was created")
+        ok(any("FastTrack" in w for w in a["warnings"]), "and the cost is stated")
+        simple = next(c for c in a["changes"] if c["path"] == "/queue/simple")
+        eq(simple["body"]["max-limit"], "45M/450M", "90% of 500/50, upload first")
+        ok(simple["body"]["comment"].startswith("mcc:"), "tagged for the removal sweep")
+        e.hub.actions.confirm(a["id"])
+        ft = [r for r in e.world.tables["/ip/firewall/filter"] if r.get("action") == "fasttrack-connection"]
+        ok(ft and all(r["disabled"] == "true" for r in ft), "FastTrack is off")
+        eq(len(e.world.tables["/queue/simple"]), 1, "queue created")
+        eq([r["name"] for r in e.world.tables["/queue/type"]], ["mcc-fqcodel"], "queue type created")
+        ok("perf.sqm" not in _keys(e), "SQM is no longer suggested once queues exist")
+        removal = e.hub.setup.removal_plan()["items"][0]["changes"]
+        ok(any("/queue/simple/" in c["path"] for c in removal) and any("/queue/type/" in c["path"] for c in removal),
+           "the removal sweep covers the advisor's queues")
+        ok(any(c["method"] == "PATCH" and c["path"].startswith("/ip/firewall/filter/") and c["body"] == {"disabled": "no"}
+               for c in removal), "and turns FastTrack back on, so removing the queue doesn't leave neither")
+        try:
+            _advice(e, "sqm_enable", {"down_mbps": 500, "up_mbps": 50, "percent": 90})
+            raise AssertionError("a second set of queues must be refused")
+        except ActionError:
+            pass
+        e.hub.actions.undo(a["id"])
+        eq(e.world.tables["/queue/simple"], [], "queue removed")
+        eq(e.world.tables["/queue/type"], [], "queue type removed")
+        ok(all(r["disabled"] == "false" for r in ft), "FastTrack back on")
+
+
+@test
+def t_advisor_dismiss_and_snooze():
+    with Env() as e:
+        _keys(e)
+        v = e.hub.advisor.dismiss("sec.upnp", 0, "I use it")
+        ok("sec.upnp" not in {f["key"] for f in v["findings"]}, "hidden when dismissed")
+        ok("sec.upnp" in {f["key"] for f in v["dismissed"]}, "listed under dismissed")
+        e.hub.advisor.refresh()
+        ok("sec.upnp" not in {f["key"] for f in e.hub.advisor.view()["findings"]}, "stays hidden across a re-analysis")
+        e.hub.advisor.dismiss("sec.ssh.crypto", 1, "")
+        e.hub.advisor.dismissed["sec.ssh.crypto"]["until"] = time.time() - 5  # the snooze ran out
+        ok("sec.ssh.crypto" in {f["key"] for f in e.hub.advisor.view()["findings"]}, "snooze expires")
+        e.hub.advisor.restore("sec.upnp")
+        ok("sec.upnp" in {f["key"] for f in e.hub.advisor.view()["findings"]}, "restored")
+        e.hub.advisor.dismiss("sys.update", 0, "")
+        ok("sys.update" in Hub(e.cfg, e.dir).advisor.dismissed, "survives a restart")
+
+
+@test
+def t_advisor_diagnose():
+    with Env() as e:
+        wait_for(lambda: e.hub.gateways, 5)
+        r = e.hub.advisor.diagnose()
+        eq(r["verdict"]["level"], "ok", "healthy: " + str(r["verdict"]))
+        ok(any(x["id"] == "dns" and x["ok"] for x in r["results"]), "DNS tested")
+        e.world.ping_down = {"dns"}
+        ok("names" in e.hub.advisor.diagnose()["verdict"]["title"], "DNS-only failure is named")
+        e.world.ping_down = {"internet"}
+        ok("past your router" in e.hub.advisor.diagnose()["verdict"]["text"], "upstream failure is named")
+        e.world.ping_down = set(e.hub.gateways)
+        ok("gateway" in e.hub.advisor.diagnose()["verdict"]["title"], "gateway failure is named")
+
+
+@test
+def t_advisor_http_api():
+    with Env() as e:
+        _keys(e)
+        srv, _tok = make_server(e.hub, "127.0.0.1", 0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+
+        def call(method, path, body=None):
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            c.request(method, path, json.dumps(body) if body is not None else None,
+                      {"X-MCC": "1", "Content-Type": "application/json"})
+            r = c.getresponse()
+            return r.status, json.loads(r.read() or b"null")
+        try:
+            st, v = call("GET", "/api/advisor")
+            eq(st, 200, "advisor view")
+            ok(v["findings"], "findings listed")
+            st, v = call("POST", "/api/advisor/sec.upnp/dismiss", {"days": 7})
+            eq(st, 200, "dismiss")
+            st, v = call("POST", "/api/advisor/nope/dismiss", {})
+            eq(st, 409, "unknown finding")
+            st, v = call("POST", "/api/advisor/diagnose", {})
+            eq(st, 200, "diagnose")
+            st, v = call("POST", "/api/actions/propose", {"kind": "advice_fix", "params": {"fix_id": "service_off:www"}})
+            eq(st, 409, "lockout guard reaches the API")
+        finally:
+            srv.shutdown()
+
+
+def _open_wan_input(e):
+    """The demo router has the stock 'drop everything not from the LAN' rule; take it out."""
+    rows = e.world.tables["/ip/firewall/filter"]
+    rows[:] = [r for r in rows if not (r.get("chain") == "input" and r.get("in-interface-list") == "!LAN")]
+
+
+@test
+def t_advisor_wan_exposure_and_restrict():
+    with Env() as e:
+        wait_for(lambda: e.hub.wan_ifaces() and e.hub.router_nets, 5)
+        k = _keys(e)
+        ok("sec.wan.input" not in k and not [x for x in k if x.startswith("sec.exposed.")],
+           "a router with the stock input drop is not flagged")
+        # an accept-everything rule ahead of the drop makes the drop useless
+        e.world.tables["/ip/firewall/filter"].insert(0, {".id": "*F0", "chain": "input", "action": "accept",
+                                                         "disabled": "false", "comment": "oops"})
+        ok("sec.wan.input" in _keys(e), "an accept-all ahead of the drop leaves the router exposed")
+        e.world.tables["/ip/firewall/filter"].pop(0)
+        _open_wan_input(e)
+        k = _keys(e)
+        f = k["sec.wan.input"]
+        ok(f["severity"] == "high" and f["fix"] is None and f["manual"], "input-chain changes are guidance only")
+        ok("bruteforce" in f["rules"], "linked to the detections it answers")
+        ok(any("accept src-address=" in s for s in f["manual"]), "the guidance keeps MCC's own access")
+        ok("sec.exposed.winbox" in k and k["sec.exposed.winbox"]["fix"], "winbox can be limited to your networks")
+        a = _advice(e, "service_restrict:winbox")
+        addr = a["changes"][0]["body"]["address"]
+        ok("192.168.88.0/24" in addr and "127.0.0.1/32" in addr, "allowed: the LAN and MCC's own address: " + addr)
+        e.hub.actions.confirm(a["id"])
+        row = next(r for r in e.world.tables["/ip/service"] if r["name"] == "winbox")
+        eq(row["address"], addr, "applied")
+        ok("sec.exposed.winbox" not in _keys(e), "the finding clears")
+        e.hub.actions.undo(a["id"])
+        eq(row["address"], "", "address list put back")
+        # the service MCC itself uses can be limited, but only with MCC's own address kept in
+        b = _advice(e, "service_restrict:www")
+        ok("127.0.0.1/32" in b["changes"][0]["body"]["address"], "MCC keeps its own access")
+        ok(b["params"]["acknowledge_risk"] is False and any("DANGER" in w for w in b["warnings"]),
+           "limiting the service MCC connects through needs an explicit acknowledgement (NAT can make MCC's address differ)")
+        try:
+            e.hub.actions.confirm(b["id"])
+            raise AssertionError("must not run without the acknowledgement")
+        except ActionError:
+            pass
+        e.hub.actions.dismiss(b["id"])
+        e.hub._mcc_ip = ""
+        e.cfg.update({"collectors": {"advertise_ip": ""}})
+        e.hub.router_host_ip = ""
+        try:
+            e.hub.mcc_ip = lambda: ""
+            _advice(e, "service_restrict:www")
+            raise AssertionError("must refuse when MCC can't name its own address")
+        except ActionError:
+            pass
+
+
+@test
+def t_advisor_fasttrack():
+    with Env() as e:
+        wait_for(lambda: e.hub.wan_ifaces(), 5)
+        ft = [r for r in e.world.tables["/ip/firewall/filter"] if r.get("action") == "fasttrack-connection"]
+        ft[0]["disabled"] = "true"
+        ok("perf.fasttrack" not in _keys(e), "not suggested while the CPU is idle")
+        with e.hub.lock:
+            e.hub.health_hist.extend((time.time(), 85.0, 40.0) for _ in range(40))
+        k = _keys(e)
+        ok("perf.fasttrack" in k, "suggested when the CPU is busy and FastTrack is off")
+        a = _advice(e, "fasttrack_on")
+        body = a["changes"][0]["body"]
+        ok(body["comment"].startswith("mcc:") and body["chain"] == "forward", "tagged forward rule")
+        ok(any("skips" in w for w in a["warnings"]), "the trade-off is stated")
+        e.hub.actions.confirm(a["id"])
+        rules = e.world.tables["/ip/firewall/filter"]
+        mine = [r for r in rules if r.get("comment", "").startswith("mcc: FastTrack")]
+        eq(len(mine), 1, "rule created")
+        ok(rules.index(mine[0]) < min(i for i, r in enumerate(rules) if r.get("chain") == "forward" and r.get("disabled") == "false"
+                                                  and not r.get("comment", "").startswith("mcc:")),
+           "placed ahead of the other active forward rules")
+        ok("perf.fasttrack" not in _keys(e), "gone once on")
+        e.hub.actions.undo(a["id"])
+        ok(not [r for r in rules if r.get("comment", "").startswith("mcc: FastTrack")], "removed by undo")
+        # queues and FastTrack don't mix
+        e.world.tables["/queue/simple"].append({".id": "*Q1", "name": "mine", "target": "192.168.88.0/24", "disabled": "false"})
+        ok("perf.fasttrack" not in _keys(e), "not suggested while queues exist")
+        try:
+            _advice(e, "fasttrack_on")
+            raise AssertionError("must refuse when it would defeat the queues")
+        except ActionError:
+            pass
+
+
+@test
+def t_advisor_link_health():
+    with Env() as e:
+        wait_for(lambda: e.hub.ifaces, 5)
+        _keys(e)  # baseline: existing counters are not "new"
+        ok(not [x for x in _keys(e) if x.startswith("rel.")], "steady counters raise nothing")
+        with e.hub.lock:
+            e.hub.ifaces["ether2"]["rx_err"] += 60
+            e.hub.ifaces["ether3"]["link_downs"] += 5
+        k = _keys(e)
+        ok("rel.errors.ether2" in k and k["rel.errors.ether2"]["manual"], "new errors on ether2 are reported with steps")
+        ok("rel.flap.ether3" in k, "a flapping port is reported")
+        ok("rel.errors.ether4" not in k, "other ports are left alone")
+        e.hub.advisor._seen["err:ether2"] = time.time() - 4000  # nothing new for a long while
+        ok("rel.errors.ether2" not in _keys(e), "it clears once the errors stop")
+        a, b = e.connect_switches()
+        wait_for(lambda: e.hub.switches[a].ports, 8)
+        with e.hub.lock:
+            port = next(p for p in e.hub.switches[a].ports if p.get("link"))
+            port["full_duplex"] = False
+            pname = port["name"]
+        ok("rel.port.{}.{}".format(a, pname) in _keys(e), "half duplex on a switch port is reported")
+
+
+@test
+def t_advisor_top_talker():
+    with Env() as e:
+        wait_for(lambda: e.hub.wan_ifaces(), 5)
+        e.hub.cfg.update({"wan": {"down_mbps": 100, "up_mbps": 20}})
+        wan = sorted(e.hub.wan_ifaces())[0]
+        with e.hub.lock:
+            for _ in range(60):
+                e.hub.iface_hist[wan].append((time.time(), 80e6, 5e6))
+            e.hub.last_hosts = [{"ip": "192.168.88.30", "name": "nas", "down": 60e6, "up": 1e6},
+                                {"ip": "192.168.88.22", "name": "laptop", "down": 5e6, "up": 1e6}]
+        f = _keys(e).get("perf.hog")
+        ok(f is not None and "nas" in f["title"], "the device using most of the line is named")
+        eq(f["hosts"][0], "192.168.88.30", "with its address, for the host drawer")
+        with e.hub.lock:
+            e.hub.last_hosts = [{"ip": "192.168.88.30", "name": "nas", "down": 10e6, "up": 1e6},
+                                {"ip": "192.168.88.22", "name": "laptop", "down": 9e6, "up": 1e6}]
+        ok("perf.hog" not in _keys(e), "not raised when the load is shared")
+
+
+@test
+def t_advisor_empty_firewall_and_flows_warning():
+    with Env() as e:
+        wait_for(lambda: e.hub.wan_ifaces(), 5)
+        e.world.tables["/ip/firewall/filter"][:] = []  # no rules at all: the most exposed router there is
+        ok("sec.wan.input" in _keys(e), "an empty input chain is flagged, not skipped")
+        e.world.tables["/ip/firewall/filter"][:] = [r for r in [{".id": "*1", "chain": "forward", "action": "accept",
+                                                                 "disabled": "false"}]]
+        with e.hub.lock:
+            e.hub.health_hist.extend((time.time(), 85.0, 40.0) for _ in range(40))
+        e.hub.status = lambda: {"flows": {"live": False}}
+        a = _advice(e, "fasttrack_on")
+        ok(not any("traffic view" in w for w in a["warnings"]), "no telemetry warning while flow export is off")
+        e.hub.status = lambda: {"flows": {"live": True}}
+        b = _advice(e, "fasttrack_on")
+        ok(any("traffic view" in w for w in b["warnings"]), "warns that FastTrack hides traffic from MCC when flows are live")
+        ok("MCC's own traffic view" in " ".join(_keys(e)["perf.fasttrack"]["evidence"]), "and so does the finding")
+
+
+@test
+def t_capture_absent_field():
+    class Fake:
+        def get(self, path):
+            return {"name": "winbox"}  # RouterOS leaves an empty address out
+    rec = {}
+    ActionEngine._capture(Fake(), rec, {"method": "PATCH", "path": "/ip/service/*1",
+                                       "capture": {"read": "/ip/service/*1", "fields": ["address"]}})
+    eq(rec["restore"][0]["body"], {"address": ""}, "an absent field is restored as empty, not skipped")
+    from mcc.actions import _norm
+    eq(_norm(None), "", "None compares as empty")
+
+
 def main(argv):
     sel = [t for t in TESTS if not argv or any(a in t.__name__ for a in argv)]
     passed = failed = 0

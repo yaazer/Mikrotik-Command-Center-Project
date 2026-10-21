@@ -214,6 +214,8 @@ function threatCard(t, full) {
   if (live && full) acts.push(`<button class="btn sm ghost" data-status="resolved" data-tid="${esc(t.id)}">Resolve</button>`);
   if (!live && full) acts.push(`<button class="btn sm ghost" data-status="open" data-tid="${esc(t.id)}">Reopen</button>`);
   if (t.subject) acts.push(`<button class="btn sm ghost" data-host="${esc(t.subject)}">${ICON.eye} ${esc(t.subject)}</button>`);
+  const advice = live ? ((S.advisor || {}).findings || []).filter((f) => (f.rules || []).includes(t.rule)) : [];
+  if (advice.length) acts.push(`<a class="btn sm" href="#/advisor?focus=${encodeURIComponent(advice[0].key)}" title="${esc(advice[0].title)}">${ICON.shield} Harden against this…</a>`);
   if (t.rule === "new_device" && live) acts.push(`<button class="btn sm" data-known="${esc(t.target)}">Mark as known</button>`);
   const sup = t.status === "ignored" ? S.ignore.find((x) => x.id === t.ignored_by) : null;
   if (t.status !== "ignored") acts.push(`<button class="btn sm ghost" data-ignore="${esc(t.id)}" title="Confirmed false positive: stop alerting on it">${ICON.x} Ignore…</button>`);
@@ -1277,6 +1279,118 @@ VIEWS.actions = {
     (mm) => $$("[data-x]", mm).forEach((b) => (b.onclick = closeModal)));
   },
   onAction() { this.draw(); clearTimeout(this.t); this.t = setTimeout(() => this.loadEntries(), 600); },
+};
+
+/* ================= Advisor: what to improve, with fixes you can review and undo (mcc/advisor.py) ================= */
+VIEWS.advisor = {
+  render(m, params) {
+    this.cat = this.cat || "all";
+    this.focus = (params || {}).focus || "";
+    m.innerHTML = `<div class="grid">
+      <section class="panel s12"><header><h2>Is my Internet healthy?</h2><span class="grow"></span>
+        <button class="btn sm primary" id="diag-run">Run a check</button></header>
+        <div class="body" id="diag"><div class="note">Pings from the router itself: your gateway, the Internet by address, and a name lookup. Takes a few seconds and changes nothing.</div></div></section>
+      <section class="panel s12"><header><h2>Improvements</h2>
+        <div class="seg" id="adv-cat">${[["all", "All"], ["security", "Security"], ["performance", "Traffic"]].map(([k, l]) => `<button data-c="${k}" class="${this.cat === k ? "on" : ""}">${l}</button>`).join("")}</div>
+        <span class="grow"></span><span class="hint" id="adv-when"></span><button class="btn sm" id="adv-refresh">Re-check now</button></header>
+        <div class="body" id="adv-list"></div></section>
+      <section class="panel s12" id="adv-dis-panel" hidden><header><h2>Set aside</h2></header><div class="body flush" id="adv-dis"></div></section>
+    </div>`;
+    $("#adv-cat", m).onclick = (e) => { const b = e.target.closest("[data-c]"); if (!b) return; this.cat = b.dataset.c; $$("#adv-cat button").forEach((x) => x.classList.toggle("on", x === b)); this.draw(); };
+    $("#adv-refresh", m).onclick = async (e) => { e.target.disabled = true; try { S.advisor = await api.post("/api/advisor/refresh", {}); } catch (err) { toast("Couldn't re-check", err.message, { bad: true }); } e.target.disabled = false; this.draw(); };
+    $("#diag-run", m).onclick = (e) => this.diagnose(e.target);
+    if (this.last) this.drawDiag();
+    this.load();
+  },
+  async load() {
+    try { S.advisor = await api.get("/api/advisor"); } catch (e) { S.advisor = S.advisor || null; }
+    this.draw();
+  },
+  onAdvisor() { this.draw(); },
+  onAction() { clearTimeout(this.t); this.t = setTimeout(() => this.load(), 800); },
+  draw() {
+    const el = $("#adv-list");
+    if (!el) return;
+    const a = S.advisor;
+    if (!a) { el.innerHTML = '<div class="empty"><b>Reading the router…</b></div>'; return; }
+    $("#adv-when").textContent = a.analyzed_at ? `checked ${fmt.ago(a.analyzed_at)}` : "";
+    const rows = a.findings.filter((f) => this.cat === "all" || f.category === this.cat);
+    const note = a.unreadable && a.unreadable.length ? `<div class="note">Couldn't read: ${esc(a.unreadable.join("; "))}. Checks that need it were skipped.</div>` : "";
+    el.innerHTML = note + (rows.length ? rows.map((f) => this.card(f)).join("")
+      : `<div class="empty"><b>${!a.connected ? "Connect the router in Setup" : a.analyzed_at ? "Nothing to improve here" : "Checking…"}</b>${a.connected && a.analyzed_at ? "Nothing in this list applies right now. MCC re-checks every few minutes." : ""}</div>`);
+    $$("[data-fix]", el).forEach((b) => (b.onclick = () => this.fix(a.findings.find((f) => f.key === b.dataset.fix))));
+    $$("[data-set]", el).forEach((b) => (b.onclick = () => this.setAside(b.dataset.set, +b.dataset.days)));
+    $$("[data-host]", el).forEach((b) => (b.onclick = () => openHost(b.dataset.host)));
+    if (this.focus) {
+      const t = $("#adv-" + this.focus.replace(/\./g, "-"));
+      if (t) { t.scrollIntoView({ block: "center" }); t.classList.add("fresh"); this.focus = ""; }
+    }
+    const dis = a.dismissed || [];
+    $("#adv-dis-panel").hidden = !dis.length;
+    $("#adv-dis").innerHTML = dis.length ? `<table class="t"><tbody>${dis.map((f) => `<tr><td><b>${esc(f.title)}</b><div class="muted" style="font-size:12px">${esc((f.dismissed || {}).note || "")}${f.dismissed && f.dismissed.until ? ` · back ${esc(new Date(f.dismissed.until * 1000).toLocaleDateString())}` : ""}</div></td>
+      <td class="r"><button class="btn sm" data-back="${esc(f.key)}">Show again</button></td></tr>`).join("")}</tbody></table>` : "";
+    $$("[data-back]").forEach((b) => (b.onclick = async () => { S.advisor = await api.post(`/api/advisor/${encodeURIComponent(b.dataset.back)}/restore`, {}); this.draw(); }));
+  },
+  card(f) {
+    const sev = { high: "red", medium: "amber", low: "yellow", info: "blue" }[f.severity] || "";
+    const fix = f.fix;
+    return `<div class="plan-item" id="adv-${esc(f.key.replace(/\./g, "-"))}"><div class="head"><span class="pill ${sev}">${esc(f.severity)}</span>
+        <span class="pill">${f.category === "security" ? "security" : "traffic"}</span><h3>${esc(f.title)}</h3>
+        <button class="btn sm ghost" data-set="${esc(f.key)}" data-days="30" title="Hide this for 30 days">Snooze</button>
+        <button class="btn sm ghost" data-set="${esc(f.key)}" data-days="0" title="Hide this until you show it again">Not for me</button>
+        ${(f.hosts || []).map((ip) => `<button class="btn sm ghost" data-host="${esc(ip)}">${ICON.eye} ${esc(ip)}</button>`).join("")}
+        ${fix ? `<button class="btn sm primary" data-fix="${esc(f.key)}">${esc(fix.label)}</button>` : ""}</div>
+      <p>${esc(f.why)}</p>
+      ${(f.evidence || []).length ? `<ul class="plain muted" style="margin:4px 0 6px 18px">${f.evidence.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}
+      ${fix && f.needs && f.needs.length ? `<div class="faint" style="font-size:12px">Needs the RouterOS ${f.needs.map((n) => `<code>${esc(n)}</code>`).join(", ")} policy. You review the exact commands before anything runs, and Undo puts it back.</div>` : ""}
+      ${(f.manual || []).length ? `<details${fix ? "" : " open"}><summary class="muted" style="cursor:pointer">${fix ? "Prefer to do it by hand?" : "What to do"}</summary><ol style="margin:6px 0 0 18px">${f.manual.map((x) => `<li>${esc(x)}</li>`).join("")}</ol></details>` : ""}
+    </div>`;
+  },
+  async setAside(key, days) {
+    try { S.advisor = await api.post(`/api/advisor/${encodeURIComponent(key)}/dismiss`, { days, note: days ? "snoozed from the console" : "not for me" }); this.draw(); }
+    catch (e) { toast("Couldn't set that aside", e.message, { bad: true }); }
+  },
+  fix(f) {
+    if (!f || !f.fix) return;
+    const inputs = f.fix.inputs || [];
+    if (!inputs.length) { respond("advice_fix", { fix_id: f.fix.id, inputs: {} }, "Advisor: " + f.key); return; }
+    openModal(`<header><div class="grow"><div class="faint" style="font-size:12px;letter-spacing:.1em;text-transform:uppercase">Before MCC prepares this</div><h2>${esc(f.title)}</h2></div><button class="icon-btn" data-x aria-label="Close">${ICON.x}</button></header>
+      <div class="mbody"><div>${esc(f.why)}</div>
+        <form id="adv-form" class="stack" style="display:grid;gap:10px">${inputs.map((i) => `<label style="display:grid;gap:3px"><span>${esc(i.label)}${i.estimate ? ' <span class="pill yellow" title="MCC guessed this from recent traffic; enter your real speed if you know it">estimate</span>' : ""}</span>
+          <input type="number" name="${esc(i.name)}" value="${esc(i.default)}" min="${esc(i.min)}" max="${esc(i.max)}" step="any" required>${i.hint ? `<span class="faint" style="font-size:12px">${esc(i.hint)}</span>` : ""}</label>`).join("")}</form>
+        <div class="note">Nothing changes yet: next you'll see the exact commands and confirm them.</div></div>
+      <footer><span class="grow"></span><button class="btn" data-x>Cancel</button><button class="btn primary" id="adv-go" autofocus>Prepare…</button></footer>`,
+    (m) => {
+      $$("[data-x]", m).forEach((b) => (b.onclick = closeModal));
+      const go = () => {
+        const form = $("#adv-form", m);
+        if (!form.reportValidity()) return;
+        const vals = {};
+        new FormData(form).forEach((v, k) => (vals[k] = Number(v)));
+        closeModal();
+        respond("advice_fix", { fix_id: f.fix.id, inputs: vals }, "Advisor: " + f.key);
+      };
+      $("#adv-go", m).onclick = go;
+      $("#adv-form", m).onsubmit = (e) => { e.preventDefault(); go(); };
+    });
+  },
+  async diagnose(btn) {
+    btn.disabled = true;
+    btn.textContent = "Checking…";
+    $("#diag").innerHTML = '<div class="note">Pinging from the router…</div>';
+    try { this.last = await api.post("/api/advisor/diagnose", {}); this.drawDiag(); }
+    catch (e) { $("#diag").innerHTML = `<div class="callout bad">${esc(e.message)}</div>`; }
+    btn.disabled = false;
+    btn.textContent = "Run again";
+  },
+  drawDiag() {
+    const r = this.last, el = $("#diag");
+    if (!r || !el) return;
+    const cls = { ok: "good", warn: "warn", bad: "bad" }[r.verdict.level] || "";
+    el.innerHTML = `<div class="callout ${cls}"><b>${esc(r.verdict.title)}</b><div>${esc(r.verdict.text)}</div></div>
+      <table class="t"><tbody>${r.results.map((x) => `<tr><td>${esc(x.label)}</td><td><span class="pill ${x.ok ? "green" : "red"}">${x.ok ? "answers" : "no answer"}</span></td><td class="muted">${esc(x.detail)}</td></tr>`).join("")}</tbody></table>
+      <div class="faint" style="font-size:12px">${esc(fmt.ago(r.at))}</div>`;
+  },
 };
 
 /* ================= Devices ================= */

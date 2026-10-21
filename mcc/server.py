@@ -305,6 +305,8 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840, token: Opti
             return hub.identify_mac(mac)
         if path == "/api/build":
             return {"build": build, "build_disk": disk_build_id()}
+        if path == "/api/advisor":
+            return hub.advisor.view()
         if path == "/api/status":
             return hub.status()
         raise ApiError(404, "no such endpoint")
@@ -354,6 +356,18 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840, token: Opti
             if b.get("approve") is not True:
                 raise ApiError(400, "approve must be true")
             return hub.setup.apply(str(b.get("plan_id", "")), [str(i) for i in b.get("items") or []])
+        if path == "/api/advisor/refresh":
+            return hub.advisor.refresh()
+        if path == "/api/advisor/diagnose":
+            return hub.advisor.diagnose()
+        if len(parts) == 4 and parts[:2] == ["api", "advisor"] and parts[3] in ("dismiss", "restore"):
+            if parts[3] == "restore":
+                return hub.advisor.restore(parts[2])
+            try:
+                days = float(b.get("days") or 0)
+            except (TypeError, ValueError):
+                raise ApiError(400, "days must be a number")
+            return hub.advisor.dismiss(parts[2], max(0.0, min(days, 3650.0)), str(b.get("note") or ""))
         if path == "/api/actions/propose":
             return hub.actions.propose(str(b.get("kind", "")), b.get("params") or {}, str(b.get("reason", ""))[:200],
                                        str(b.get("threat_id", "")))

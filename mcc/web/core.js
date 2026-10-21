@@ -130,6 +130,7 @@ function connectStream() {
     setReconnect(false);
     emit("state");
     emit("tick");
+    api.get("/api/advisor").then((a) => { S.advisor = a; }).catch(() => {});  // threat cards link to matching advice
   });
   es.addEventListener("tick", (e) => {
     const snap = JSON.parse(e.data);
@@ -173,6 +174,7 @@ function connectStream() {
   es.addEventListener("ignore", (e) => { S.ignore = JSON.parse(e.data); emit("ignore"); });
   es.addEventListener("pins", (e) => { S.pins = JSON.parse(e.data); emit("pins"); });
   es.addEventListener("setup", (e) => emit("setup", JSON.parse(e.data)));
+  es.addEventListener("advisor", (e) => { S.advisor = JSON.parse(e.data); emit("advisor"); });
   es.addEventListener("resync", () => { es.close(); setTimeout(connectStream, 300); });
   es.onerror = () => { setReconnect(true); };
 }
@@ -317,6 +319,9 @@ function renderHeader() {
   $("#nb-threats").textContent = nOpen || "";
   $("#nb-actions").textContent = s.counts.actions_pending || "";
   $("#nb-actions").className = "badge info";
+  const nAdv = s.counts.advisor_open || 0;
+  $("#nb-advisor").textContent = nAdv || "";
+  $("#nb-advisor").className = "badge" + (s.counts.advisor_high ? "" : " info");
   // VPN tab: a tunnel that is down (or silent) shows on the tab wherever you are
   const tun = ((s.vpn || {}).tunnels || []).filter((t) => t.status === "down" || t.status === "stale");
   const nv = $("#nb-vpn");
@@ -831,6 +836,7 @@ on("threats", (t) => { if (current && current.view.onThreat) current.view.onThre
 on("actions", (a) => { if (current && current.view.onAction) current.view.onAction(a); });
 on("logs", (rows) => { if (current && current.view.onLogs) current.view.onLogs(rows); });
 on("ignore", () => { if (current && current.view.onIgnore) current.view.onIgnore(); });
+on("advisor", () => { if (current && current.view.onAdvisor) current.view.onAdvisor(); });
 
 /* ---------------- command palette ---------------- */
 const cmdk = {

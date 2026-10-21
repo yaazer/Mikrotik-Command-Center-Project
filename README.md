@@ -73,7 +73,7 @@ The simulated router behaves like the real one:
 ### 1. Give MCC its own RouterOS user (recommended)
 
 ```
-/user group add name=mcc policy=read,write,api,rest-api,!local,!telnet,!ssh,!ftp,!reboot,!policy,!password,!sniff,!sensitive,!romon
+/user group add name=mcc policy=read,write,test,api,rest-api,!local,!telnet,!ssh,!ftp,!reboot,!policy,!password,!sniff,!sensitive,!romon
 /user add name=mcc group=mcc password="<long random>" address=<this PC's IP>/32
 /ip service set www-ssl disabled=no
 ```
@@ -185,6 +185,35 @@ If a mitigated threat shows activity again **after a two-minute grace period**, 
 - **Ignoring never changes the router.**
 
 **Blocklist:** put a list you trust in `data/blocklist.txt`, one IP or CIDR per line, with `#` or `;` comments. Spamhaus DROP and FireHOL level1 both work. The file is re-read whenever it changes.
+
+## The Advisor: what to improve
+
+Threats tell you what is happening. **Advisor** tells you what to change so it matters less, and what would make the network run better. MCC reads the router's configuration and its own measurements every few minutes, and lists *findings*: a security weakness or a traffic problem, with the evidence, why it matters, and either a fix MCC can apply or exact steps to do it yourself.
+
+Nothing is applied for you. A fix goes through the same path as every other response: MCC shows the exact commands, you confirm, it is logged in Actions, and **Undo** puts the old values back. Findings you don't want can be snoozed for 30 days or set aside ("Not for me") and brought back from the same page.
+
+| Finding | Why | Fix |
+|---|---|---|
+| UPnP is on | Any device can open Internet-facing ports on its own | Turn it off |
+| Telnet, FTP, plain API or plain web (`www`) is on | They send the router password in clear text | Turn the service off |
+| SSH without strong crypto | Older, weaker ciphers are still offered | Require strong crypto |
+| A RouterOS update is waiting | Updates fix known holes | Steps only: MCC doesn't install updates |
+| Nothing drops Internet traffic on the router's input chain | Every service on the router can be tried from outside | Steps only (a wrong input rule locks you out, and REST has no safe mode); meanwhile *limit* Winbox/SSH/HTTPS to your own networks |
+| FastTrack is off and the CPU is busy | Every packet goes the long way through the firewall | Turn FastTrack on (the proposal says what it hides from queues and from MCC's own traffic view) |
+| A port is dropping packets, flapping, or settled at 10 Mbps / half duplex | Almost always the cable | Steps only |
+| One device is using most of a busy line | Everything else slows while it runs | Who and how much, with a button to open the device |
+| No smart queue on the Internet link | A full line makes calls and pages stall (bufferbloat) | SQM: an fq-codel queue held just under your line speed |
+
+**Rules MCC keeps:**
+- **It never cuts its own access.** The service MCC is connected through (HTTP or HTTPS) is explained, not offered for shutdown: reconnect over HTTPS first, then the plain one can go.
+- **Settings it changes are remembered.** At the moment you confirm, MCC records the old value (and re-checks that the router still has the value it showed you; if someone changed it meanwhile, nothing is applied). Undo restores it. A setting can't carry an `mcc:` tag, so for those, Undo is the way back.
+- **What it creates is tagged** (`mcc:` comments, queue types named `mcc-…`), so Setup › *Remove everything MCC added* finds it.
+- **Fixes know about each other.** FastTrack skips queues, so SQM can't work while FastTrack is on: the SQM proposal turns it off in the same list of changes and says what that costs; Undo turns it back on.
+- **SQM asks for your line speed** (pre-filled from Settings, or marked as an estimate from recent traffic) and shapes to a percentage of it, 95% by default.
+
+Link problems (errors, flapping) are judged on what is *new* since the last check, so a port with an old error count doesn't nag; the finding stays for 30 minutes after the last new error. A threat card for a brute-force, scan, sweep or router-login detection gets a **Harden against this…** button that jumps to the matching finding.
+
+**Is my Internet healthy?** pings from the router itself: your gateway, two Internet addresses, and a name lookup, then says where the problem is: the cable or modem, your ISP, DNS, or a link that is up but struggling. It changes nothing. It needs the `test` policy on MCC's RouterOS user (included in the group command above; add it to an existing one with `/user group set mcc policy=+test`).
 
 ## Where traffic goes: the globe
 
@@ -446,6 +475,7 @@ mcc/traffic.py       traffic model (connection table + flows -> hosts, peers, co
 mcc/detect.py        threat rules, blocklist
 mcc/actions.py       propose / confirm / undo engine with safety rails and audit log
 mcc/setup_plan.py    telemetry setup and removal plans
+mcc/advisor.py       findings (security + traffic), the fixes behind them, and the connectivity check
 mcc/hub.py           pollers, collectors, history, live event fan-out
 mcc/server.py        HTTP API, server-sent events, static console
 mcc/web/             the console (no frameworks); theme.js = Theme Studio, layout.js = resizable panels
@@ -456,7 +486,7 @@ mcc/oui.py           IEEE MAC vendor registry (stdlib), opt-in refresh; mcc/oui.
 mcc/geo.py           .mmdb reader (stdlib), locator, home location, opt-in DB-IP download
 mcc/geodata.py       country label points (Natural Earth) for country-level databases
 mcc/sim.py           simulated router, switch and network (demo + tests)
-data/                config.json, actions.jsonl, threats.jsonl, devices.json, setup_state.json, blocklist.txt,
+data/                config.json, actions.jsonl, threats.jsonl, devices.json, setup_state.json, advisor.json + advisor.log.jsonl, blocklist.txt,
                      ignore.json + ignore.log.jsonl, pins.json, names.json, fingerprints.json, geo/*.mmdb,
                      oui/oui.tsv.gz (a refreshed vendor registry)
 ```

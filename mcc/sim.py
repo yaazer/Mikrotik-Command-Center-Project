@@ -18,6 +18,7 @@ import ipaddress
 import json
 import math
 import random
+import re
 import secrets
 import socket
 import struct
@@ -27,7 +28,7 @@ import urllib.parse
 import base64
 from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 WAN_IP = "198.51.100.2"
 GATEWAY = "198.51.100.1"
@@ -269,6 +270,8 @@ class World:
     def add(self, table: str, row: Dict[str, Any]) -> Dict[str, Any]:
         r = {".id": self.nid(table)}
         r.update({k: _s(v) for k, v in row.items()})
+        if table.startswith(("/ip/firewall/filter", "/ip/firewall/nat", "/ip/service", "/queue")):
+            r.setdefault("disabled", "false")  # RouterOS always reports it on rule-like rows
         self.tables[table].append(r)
         return r
 
@@ -367,6 +370,20 @@ class World:
         self.single["/ip/traffic-flow"] = {"enabled": "false", "interfaces": "all", "cache-entries": "32k",
                                            "active-flow-timeout": "30m", "inactive-flow-timeout": "15s",
                                            "packet-sampling": "false"}
+        # what the Advisor reads: services, UPnP, SSH, DNS, queues and the update channel. The demo router is left
+        # the way a lightly configured one is: telnet/ftp/plain API/UPnP on, no queues, an update waiting.
+        for name, port, off in (("telnet", 23, "false"), ("ftp", 21, "false"), ("www", 80, "false"),
+                                ("ssh", 22, "false"), ("www-ssl", 443, "false"), ("api", 8728, "false"),
+                                ("api-ssl", 8729, "true"), ("winbox", 8291, "false")):
+            self.add("/ip/service", {"name": name, "port": str(port), "address": "", "disabled": off})
+        for t in ("/queue/simple", "/queue/tree", "/queue/type"):
+            self.tables[t] = []
+        self.single["/ip/upnp"] = {"enabled": "true", "allow-disable-external-interface": "false"}
+        self.single["/ip/ssh"] = {"strong-crypto": "false", "forwarding-enabled": "no"}
+        self.single["/ip/dns"] = {"allow-remote-requests": "true", "servers": "1.1.1.1", "cache-size": "2048KiB"}
+        self.single["/system/package/update"] = {"channel": "stable", "installed-version": "7.16.1",
+                                                 "latest-version": "7.18.2", "status": "New version is available"}
+        self.ping_down: Set[str] = set()  # targets that don't answer (tests); "dns" = names don't resolve
         self.log("system,info", "router rebooted")
         self.log("system,info,account", "user admin logged in from 192.168.88.20 via winbox")
 
@@ -950,6 +967,21 @@ class World:
         self._stop.set()
 
     # -- REST views ----------------------------------------------------------------------------
+    def ping(self, address: str, count: int) -> List[Dict[str, Any]]:
+        """RouterOS's /tool/ping over REST: one row per probe, then the summary on the last."""
+        is_ip = bool(re.match(r"^\d+\.\d+\.\d+\.\d+$", address))
+        if not is_ip and "dns" in self.ping_down:
+            raise KeyError("failure: dns name does not exist")
+        down = address in self.ping_down or (not is_ip and "internet" in self.ping_down) or             (is_ip and address in ("1.1.1.1", "8.8.8.8") and "internet" in self.ping_down)
+        rtt = 1 if address.startswith("192.168.") else 14
+        rows = []
+        for i in range(count):
+            rows.append({"seq": str(i), "host": address, "sent": str(i + 1), "received": "0" if down else str(i + 1),
+                         "packet-loss": "100" if down else "0", **({} if down else {"time": "{}ms".format(rtt)})})
+        rows[-1].update({} if down else {"min-rtt": "{}ms".format(rtt), "avg-rtt": "{}ms".format(rtt),
+                                         "max-rtt": "{}ms".format(rtt + 2)})
+        return rows
+
     def resource(self) -> Dict[str, Any]:
         return {"uptime": _dur(time.time() - self.boot), "version": "7.16.1 (stable)", "build-time": "2024-10-10",
                 "free-memory": str(int(1024 ** 3 * 0.78 - len(self.conns) * 2000)), "total-memory": str(1024 ** 3),
@@ -968,7 +1000,7 @@ class World:
 # Fake RouterOS REST
 # ----------------------------------------------------------------------------------------------
 SINGLETONS = {"/system/resource", "/system/identity", "/ip/traffic-flow", "/system/health",
-              "/interface/bridge/settings"}
+              "/interface/bridge/settings", "/ip/upnp", "/ip/ssh", "/ip/dns", "/system/package/update"}
 
 
 def make_router(world: World, user: str = "admin", password: str = "demo", bind: str = "127.0.0.1",
@@ -1064,6 +1096,10 @@ def make_router(world: World, user: str = "admin", password: str = "demo", bind:
                     out.append({"name": r["name"], "status": "link-ok" if up else "no-link",
                                 **({"rate": "10Gbps" if r["name"].startswith("sfp") else "1Gbps", "full-duplex": "true"} if up else {})})
             return 200, out
+        if method == "POST" and path == "/system/package/update/check-for-updates":
+            return 200, [{"status": world.single["/system/package/update"]["status"]}]
+        if method == "POST" and path == "/ping":
+            return 200, world.ping(str(body.get("address", "")), int(body.get("count", 4) or 4))
         if method == "POST":
             menu, _, cmd = path.rpartition("/")
             if cmd == "set" and menu in world.single:

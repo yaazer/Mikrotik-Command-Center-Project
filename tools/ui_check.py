@@ -110,6 +110,7 @@ def sc_pages(d: Demo, c: Check) -> None:
                             ("lan", "document.querySelectorAll('#lan-ports tr').length > 3"),
                             ("topology", "document.querySelectorAll('#topo-svg .tnode').length >= 5"),
                             ("threats", "document.querySelector('#tlist') !== null"),
+                            ("advisor", "document.querySelectorAll('#adv-list .plan-item').length >= 4"),
                             ("actions", "document.querySelector('#history') !== null"),
                             ("devices", "document.querySelectorAll('#devs tr[data-ip]').length >= 9"),
                             ("interfaces", "document.querySelectorAll('#ifs tr[data-if]').length >= 7"),
@@ -787,9 +788,22 @@ def sc_topology(d: Demo, c: Check) -> None:
         c(b.until("document.querySelectorAll('#topo-svg .tdev').length === 0 && document.querySelectorAll('#topo-svg .tnode').length >= 6", 5),
           "infrastructure only")
         click(b, "#topo-devs [data-d=show]")
-        d.world.sw_link[5] = False  # the office switch's uplink fails
-        c(b.until("!!document.querySelector('#topo-svg .tlink.down[data-to=\"sw:css610\"]')", 25), "a failed link turns red")
-        c(b.until("!!document.querySelector('#topo-svg .tnode.st-error[data-id=\"sw:css610\"]')", 25), "and the switch behind it is unreachable")
+        # The demo's own script has a link-flap incident that ends by bringing this same port back up, on a cycle
+        # that can land inside the wait below; so keep the uplink down while waiting instead of setting it once.
+        def held_down(js: str, secs: float) -> bool:
+            end = time.time() + secs
+            while time.time() < end:
+                d.world.sw_link[5] = False  # the office switch's uplink fails
+                # The page re-reads the topology every 2 s, but the red link only exists for about that long (until
+                # the switch's table stops listing the one behind it); ask for a fresh read each time we look.
+                b.eval("VIEWS.topology.load()")
+                time.sleep(0.25)
+                if b.eval(js):
+                    return True
+                time.sleep(0.15)
+            return False
+        c(held_down("!!document.querySelector('#topo-svg .tlink.down[data-to=\"sw:css610\"]')", 25), "a failed link turns red")
+        c(held_down("!!document.querySelector('#topo-svg .tnode.st-error[data-id=\"sw:css610\"]')", 25), "and the switch behind it is unreachable")
         shot(b, "topology-link-down")
         d.world.sw_link[5] = True
         # set the office switch's uplink by hand, then back to "work it out"
@@ -809,7 +823,69 @@ def sc_topology(d: Demo, c: Check) -> None:
         c(not b.errors, "no console errors: {}".format(b.errors[:3]))
 
 
-SCENARIOS = {"pages": sc_pages, "identify": sc_identify, "setup": sc_setup, "respond": sc_respond, "ignore": sc_ignore, "layout": sc_layout, "globe-fade": sc_globe_fade, "theme": sc_theme, "update": sc_update, "types": sc_types, "drawer": sc_drawer, "phone": sc_phone,
+def sc_advisor(d: Demo, c: Check) -> None:
+    """Advisor: findings, a fix from proposal to undo, the input form for SQM, and the connectivity check."""
+    with Browser(1600, 1000) as b:
+        b.nav(d.url + "#/advisor")
+        c(b.until("document.querySelectorAll('#adv-list .plan-item').length >= 4", 20), "findings are listed")
+        c(b.eval("!!document.querySelector('#adv-sec-upnp [data-fix]') && !document.querySelector('#adv-sec-svc-www [data-fix]')"),
+          "UPnP offers a fix; the service MCC itself uses does not")
+        shot(b, "advisor")
+        click(b, "#adv-sec-upnp [data-fix]")
+        c(b.until("document.querySelector('.modal [data-confirm]') !== null", 10), "the fix opens a proposal")
+        c(b.eval("document.querySelector('.modal').innerText.includes('Nothing has changed yet')"), "which says nothing changed yet")
+        c(b.eval("[...document.querySelectorAll('.modal .change pre')].some(p => p.innerText.includes('/ip upnp set enabled=no'))"),
+          "and shows the exact command")
+        c(d.world.single["/ip/upnp"]["enabled"] == "true", "proposing changed nothing")
+        click(b, ".modal [data-confirm]")
+        c(b.until("document.querySelector('.modal') && /applied/i.test(document.querySelector('.modal').innerText)", 10), "applied")
+        c(d.world.single["/ip/upnp"]["enabled"] == "false", "UPnP is off on the router")
+        click(b, ".modal [data-undo]")
+        b.until("document.querySelector('.modal [data-go]') !== null", 5)
+        click(b, ".modal [data-go]")
+        c(b.until("[...document.querySelectorAll('.toast')].some(t => t.innerText.startsWith('Undone'))", 10), "undone")
+        c(d.world.single["/ip/upnp"]["enabled"] == "true", "UPnP is back on")
+        b.nav(d.url + "#/advisor")
+        b.until("!!document.querySelector('#adv-perf-sqm [data-fix]')", 10)
+        click(b, "#adv-perf-sqm [data-fix]")
+        c(b.until("!!document.querySelector('#adv-form input[name=down_mbps]')", 5), "SQM asks for the line speed first")
+        c(b.eval("document.querySelector('#adv-form [name=down_mbps]').value === '500' && !document.querySelector('.modal .pill.yellow')"),
+          "pre-filled from the line speed set in Settings (not flagged as a guess)")
+        b.eval("(() => { document.querySelector('#adv-form [name=down_mbps]').value = 300; document.querySelector('#adv-form [name=up_mbps]').value = 30; })()")
+        click(b, "#adv-go")
+        c(b.until("document.querySelector('.modal [data-confirm]') !== null", 10), "then shows the proposal")
+        c(b.eval("document.querySelector('.modal').innerText.includes('FastTrack')"), "including the FastTrack consequence")
+        shot(b, "advisor-sqm")
+        click(b, ".modal [data-dismiss]")
+        c(not d.world.tables["/queue/simple"], "dismissing it changed nothing")
+        b.nav(d.url + "#/advisor")
+        click(b, "#diag-run")
+        c(b.until("!!document.querySelector('#diag .callout.good')", 20), "the connectivity check reports a healthy link")
+        click(b, "#adv-sec-ssh-crypto [data-set][data-days='0']")
+        c(b.until("!document.querySelector('#adv-sec-ssh-crypto') && !!document.querySelector('[data-back]')", 5),
+          "'Not for me' moves a finding to Set aside")
+        # a link from a threat to the advice that answers it, and from the link to the finding
+        fw = d.world.tables["/ip/firewall/filter"]
+        removed = [r for r in fw if r.get("chain") == "input" and r.get("in-interface-list") == "!LAN"]
+        fw[:] = [r for r in fw if r not in removed]
+        try:
+            b.nav(d.url + "#/advisor")
+            b.eval("api.post('/api/advisor/refresh', {}).then(a => { S.advisor = a; VIEWS.advisor.draw(); })")
+            c(b.until("!!document.querySelector('#adv-sec-wan-input')", 10), "an unprotected router is flagged")
+            c(b.eval("threatCard({id: 'T9', rule: 'bruteforce', status: 'open', severity: 'high', title: 't', summary: 's', count: 1, "
+                     "first_ts: 1, last_ts: 1, proposals: []}, false).includes('#/advisor?focus=sec.wan.input')"),
+              "a brute-force threat card links to the hardening advice")
+            b.nav(d.url + "#/advisor?focus=sec.wan.input")
+            c(b.until("!!document.querySelector('#adv-sec-wan-input.fresh')", 8), "following the link lands on that finding")
+            c(not b.errors, "no console errors: {}".format(b.errors[:3]))
+        finally:
+            # Demo (and its World) is shared across every scenario in one run: put the router's input-chain
+            # drop rule back, or every scenario after this one runs against a permanently exposed router.
+            fw.extend(removed)
+            d.hub.advisor.refresh_soon()
+
+
+SCENARIOS = {"pages": sc_pages, "advisor": sc_advisor, "identify": sc_identify, "setup": sc_setup, "respond": sc_respond, "ignore": sc_ignore, "layout": sc_layout, "globe-fade": sc_globe_fade, "theme": sc_theme, "update": sc_update, "types": sc_types, "drawer": sc_drawer, "phone": sc_phone,
              "light": sc_light, "offscreen": sc_offscreen,
              "single-out": sc_single_out, "globe-fit": sc_globe_fit,
              "vpn": sc_vpn, "lan": sc_lan, "topology": sc_topology}

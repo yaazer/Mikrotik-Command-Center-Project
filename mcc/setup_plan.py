@@ -260,6 +260,30 @@ class SetupPlanner:
                         ch.append(_ch("DELETE", "{}/firewall/address-list/{}".format(base, r[".id"]),
                                       target="[find list={} address={}]".format(lst, r.get("address")),
                                       note="{} {}".format(lst, r.get("address"))))
+        # what the Advisor's fixes created: queues carry the tag in their comment, queue types (which have no
+        # comment) are named mcc-*
+        for table, match in (("/queue/simple", lambda r: str(r.get("comment", "")).startswith(TAG)),
+                             ("/queue/tree", lambda r: str(r.get("comment", "")).startswith(TAG)),
+                             ("/queue/type", lambda r: str(r.get("name", "")).startswith("mcc-"))):
+            try:
+                rows = ros.get_list(table)
+            except RouterOSError:
+                continue
+            for r in rows:
+                if match(r):
+                    ch.append(_ch("DELETE", "{}/{}".format(table, r[".id"]),
+                                  target='[find name="{}"]'.format(r.get("name")),
+                                  note="{} {}".format(table.strip("/").replace("/", " "), r.get("name"))))
+        # An SQM fix turned FastTrack off so its queue could work. Removing the queue without turning it back on
+        # leaves no shaping and a busier CPU, so put it back.
+        for rec in self.hub.actions.list():
+            if rec.get("kind") == "advice_fix" and rec.get("status") == "done" \
+                    and str(rec.get("params", {}).get("fix_id")) == "sqm_enable":
+                for r in rec.get("restore", []):
+                    if str(r.get("path", "")).startswith("/ip/firewall/filter/") and r.get("body", {}).get("disabled") in (
+                            "false", "no", False):
+                        ch.append(_ch("PATCH", r["path"], {"disabled": "no"}, target="FastTrack",
+                                      note="turn FastTrack back on (MCC turned it off for SQM, {})".format(rec["id"])))
         for r in ros.get_list("/system/logging"):
             if r.get("action") == "mcc":
                 ch.append(_ch("DELETE", "/system/logging/{}".format(r[".id"]),

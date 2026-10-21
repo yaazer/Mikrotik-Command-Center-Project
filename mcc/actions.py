@@ -29,6 +29,11 @@ BLOCK_LIST = "mcc-blocked"
 QUARANTINE_LIST = "mcc-quarantine"
 TAG = "mcc:"
 
+def _norm(v: Any) -> str:
+    s = "" if v is None else str(v).strip().lower()
+    return {"yes": "true", "no": "false"}.get(s, s)
+
+
 TIMEOUTS = {"15m": "15m", "1h": "1h", "24h": "1d", "7d": "7d", "0": "", "": ""}
 
 
@@ -280,6 +285,16 @@ class ActionEngine:
                 title, summary = "Unblock {}".format(ip) if lst == BLOCK_LIST else "Release {}".format(ip), \
                     "Take {} off {}.".format(ip, lst)
                 undo["why"] = "puts it back on the list"
+            elif kind == "advice_fix":
+                fix = self.hub.advisor.build_fix(str(params.get("fix_id", "")), params.get("inputs") or {}, ros)
+                changes.extend(fix["changes"])
+                warnings.extend(fix["warnings"])
+                title, summary = fix["title"], fix["summary"]
+                params["finding_key"] = fix["finding_key"]
+                if fix.get("risky"):  # a fix that could cut MCC off needs the acknowledgement, like disabling its port
+                    params["acknowledge_risk"] = bool(params.get("acknowledge_risk"))
+                undo["why"] = fix["undo_why"]
+                reason = reason or "Advisor: {}".format(fix["finding_key"])
             else:
                 raise ActionError("unknown action {!r}".format(kind))
         except RouterOSError as e:
@@ -293,7 +308,7 @@ class ActionEngine:
                     c["cli"] = cli_line("PUT", c["path"], c["body"])
             rec = {"id": aid, "kind": kind, "params": params, "reason": reason, "threat_id": threat_id,
                    "title": title, "summary": summary, "changes": changes, "warnings": warnings, "undo": undo,
-                   "status": "pending", "created": now_iso(), "created_ids": [], "steps": []}
+                   "status": "pending", "created": now_iso(), "created_ids": [], "steps": [], "restore": []}
             self.items[aid] = rec
             self._log(rec, "proposed")
             return rec
@@ -308,10 +323,11 @@ class ActionEngine:
                 raise ActionError("This change can cut MCC off from the router. Tick the acknowledgement to go ahead.")
             rec["status"] = "running"
         ros = self._ros()
-        error = ""
-        for c in rec["changes"]:
+        error = self._recheck(ros, rec)
+        for c in ([] if error else rec["changes"]):
             step = {"cli": c["cli"], "at": now_iso()}
             try:
+                self._capture(ros, rec, c)
                 if c["op"] == "KILL":
                     ip = c["body"]["ip"]
                     killed = 0
@@ -329,8 +345,8 @@ class ActionEngine:
                     rec["created_ids"].append({"path": c["path"], "id": cid, "keep": c.get("keep", False),
                                                "body": c["body"]})
                     step["result"] = "created {}".format(cid or "(no id returned)")
-                elif c["method"] == "PATCH":
-                    ros.request("PATCH", c["path"], c["body"])
+                elif c["method"] in ("PATCH", "POST"):  # POST: a singleton's "set" (e.g. /ip/upnp/set)
+                    ros.request(c["method"], c["path"], c["body"])
                     step["result"] = "updated"
                 elif c["method"] == "DELETE":
                     ros.request("DELETE", c["path"])
@@ -347,6 +363,8 @@ class ActionEngine:
             rec["executed_at"] = now_iso()
             if error:
                 rec["status"], rec["error"] = "failed", error
+                if not rec["steps"]:
+                    rec["undo"] = {"possible": False, "why": "nothing was applied"}
                 self._log(rec, "failed")
             else:
                 rec["status"] = "done"
@@ -361,7 +379,41 @@ class ActionEngine:
                         self.hub.detector.set_status(rec["threat_id"], "mitigated", "{} by {}".format(
                             rec["title"], aid), aid)
             self.hub.refresh_soon()
+            if rec["kind"] == "advice_fix" and not error:
+                self.hub.advisor.refresh_soon()
             return rec
+
+    @staticmethod
+    def _recheck(ros: Any, rec: Dict[str, Any]) -> str:
+        """Settings changes assume the router still looks the way it did when the proposal was made."""
+        for c in rec["changes"]:
+            pre = c.get("pre")
+            if not pre:
+                continue
+            try:
+                cur = ros.get(pre["read"])
+                cur = cur[0] if isinstance(cur, list) and cur else cur
+                now = (cur or {}).get(pre["field"])
+            except RouterOSError as e:
+                return "couldn't re-check the router before applying: {}".format(e)
+            if _norm(now) != _norm(pre["equals"]):
+                return ("the router changed since this was proposed ({} is now {}); nothing was applied. "
+                        "Propose it again from the Advisor.".format(pre["field"], now))
+        return ""
+
+    @staticmethod
+    def _capture(ros: Any, rec: Dict[str, Any], c: Dict[str, Any]) -> None:
+        """Remember the values a settings change is about to overwrite, so Undo can put them back."""
+        cap = c.get("capture")
+        if not cap:
+            return
+        cur = ros.get(cap["read"])
+        cur = cur[0] if isinstance(cur, list) and cur else cur
+        # a field the router leaves out when it is empty (an unset address list) is put back as empty
+        body = {f: ((cur or {}).get(f) if (cur or {}).get(f) is not None else "") for f in cap["fields"]}
+        if body:
+            rec.setdefault("restore", []).append({"method": c["method"], "path": c["path"], "body": body,
+                                                  "cli": cli_line(c["method"], c["path"], body)})
 
     def dismiss(self, aid: str) -> Dict[str, Any]:
         with self.lock:
@@ -397,6 +449,9 @@ class ActionEngine:
                 steps.append({"cli": cli_line("PUT", path, body), "ok": True,
                               "result": "created {}".format((created or {}).get(".id", ""))})
             else:
+                for r in reversed(rec.get("restore", [])):
+                    ros.request(r["method"], r["path"], r["body"])
+                    steps.append({"cli": r.get("cli", ""), "ok": True, "result": "put back"})
                 for c in reversed(rec.get("created_ids", [])):
                     if c.get("keep") or not c.get("id"):
                         continue
@@ -422,6 +477,8 @@ class ActionEngine:
                 rec["status"] = "undone"
                 self._log(rec, "undone")
             self.hub.refresh_soon()
+            if rec["kind"] == "advice_fix":
+                self.hub.advisor.refresh_soon()
             return rec
 
     # -- what's in force now -----------------------------------------------------------------

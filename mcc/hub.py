@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
 from .actions import BLOCK_LIST, QUARANTINE_LIST, ActionEngine
+from .advisor import REFRESH_S, Advisor
 from .collectors import FlowParser, UdpCollector, classify, level_of, split_syslog
 from .config import Config
 from .classify import CATEGORIES
@@ -168,6 +169,7 @@ class Hub:
         self.detector.on_suppressions = lambda lst: self.publish("ignore", lst)
         self.actions = ActionEngine(self, self.data_dir)
         self.setup = SetupPlanner(self, self.data_dir)
+        self.advisor = Advisor(self, self.data_dir)
         self.geo = Geo(cfg, self.data_dir)
         self.pins = Pins(self.data_dir)
         self.flow_parser = FlowParser()
@@ -660,7 +662,14 @@ class Hub:
         p = lambda k: (lambda: self.cfg.get("poll." + k))  # noqa: E731
         self._run_tasks([("meta", lambda: 60, self._poll_meta), ("conns", p("conns_s"), self._poll_conns),
                          ("log", p("log_s"), self._poll_log), ("devices", p("devices_s"), self._poll_devices),
-                         ("dns", p("dns_s"), self._poll_dns), ("vpn", lambda: 10, self._poll_vpn)], "slow")
+                         ("dns", p("dns_s"), self._poll_dns), ("vpn", lambda: 10, self._poll_vpn),
+                         ("advisor", lambda: REFRESH_S, self._poll_advisor)], "slow")
+
+    def _poll_advisor(self, ros: RouterOS, now: float) -> None:
+        # Needs a few minutes of rates behind it before "the line is busy" means anything, so the first
+        # read waits for the first meta poll (gateways, WAN) to have landed.
+        if self.router_addrs:
+            self.advisor.refresh(ros, now)
 
     def _poll_fast(self, ros: RouterOS, now: float) -> None:
         res = ros.get("/system/resource") or {}
@@ -1124,6 +1133,7 @@ class Hub:
             "counts": {"threats_open": len(open_t),
                        "threats_new": len([t for t in open_t if now - t.get("first_ts", 0) < 300]),
                        "actions_pending": len([a for a in self.actions.items.values() if a["status"] == "pending"]),
+                       "advisor_open": self.advisor.counts()["open"], "advisor_high": self.advisor.counts()["high"],
                        "blocked": len(self.blocked), "devices": len(self.devices), "log_seq": self.log_seq},
         }
 
