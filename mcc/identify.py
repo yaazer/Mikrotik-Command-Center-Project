@@ -594,6 +594,33 @@ def decide(clues: List[Dict[str, Any]], random: bool = False, vendor: str = "", 
         model = ""
     if not model and kind:
         model = MODEL_OF.get((brand, kind), "")
+    name = _name(kind, brand, os, model, random)
+    score = max(ks, ms)
+    confidence = _confidence(score, bool(kind or brand or os))
+    clues.sort(key=lambda c: -c["w"])
+    # what else it could be: the other kinds the clues point at, each with its own confidence and the clue behind it
+    alternatives = []
+    for k, s in sorted(kinds.items(), key=lambda kv: -kv[1]):
+        if k == kind or s < 0.5 or len(alternatives) >= 4:
+            continue
+        m = MODEL_OF.get((brand, k), "")
+        b = brand if m else ""  # only credit the maker where it builds that kind of thing
+        why = next((c["text"] for c in clues if c["kinds"].get(k, 0) > 0), "")
+        alternatives.append({"kind": k, "kind_label": KIND_LABEL[k], "label": _name(k, b, "", m, random and not b),
+                             "brand": b, "model": m, "confidence": _confidence(s, True), "score": round(s, 1),
+                             "why": why})
+    return {"label": name, "kind": kind, "kind_label": KIND_LABEL.get(kind, ""), "brand": brand, "os": os,
+            "model": model, "vendor": vendor, "random": random, "wifi": wifi, "confidence": confidence,
+            "score": round(score, 1), "alternatives": alternatives, "overridden": False,
+            "clues": [{"source": c["source"], "text": c["text"], "w": round(c["w"], 1)} for c in clues]}
+
+
+def _confidence(score: float, any_guess: bool) -> str:
+    return "high" if score >= 7 else "medium" if score >= 4 else "low" if any_guess else "none"
+
+
+def _name(kind: str, brand: str, os: str, model: str, random: bool = False) -> str:
+    """The label for a guess: "Brother printer", "Apple iPhone", "Windows computer"."""
     if model and brand and brand.lower() not in model.lower() and model[0].isupper():
         name = "{} {}".format(brand, model)
     elif model:
@@ -613,13 +640,30 @@ def decide(clues: List[Dict[str, Any]], random: bool = False, vendor: str = "", 
         name = "Unknown device"
     if random and not brand and kind != "vm":
         name = "Private-address device" if name == "Unknown device" else name + " (private address)"
-    score = max(ks, ms)
-    confidence = "high" if score >= 7 else "medium" if score >= 4 else "low" if (kind or brand or os) else "none"
-    clues.sort(key=lambda c: -c["w"])
-    return {"label": name, "kind": kind, "kind_label": KIND_LABEL.get(kind, ""), "brand": brand, "os": os,
-            "model": model, "vendor": vendor, "random": random, "wifi": wifi, "confidence": confidence,
-            "score": round(score, 1),
-            "clues": [{"source": c["source"], "text": c["text"], "w": round(c["w"], 1)} for c in clues]}
+    return name
+
+
+def apply_override(auto: Dict[str, Any], ov: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """MCC's guess, replaced by what you said it is. The original stays inside the result, so it can be restored."""
+    if not ov or ov.get("kind") not in KIND_LABEL:
+        return auto
+    kind = ov["kind"]
+    same = kind == auto.get("kind")  # same kind: keep the OS / brand / model MCC worked out
+    maker = auto.get("brand", "")  # still the maker if it builds this kind of thing ("Apple" + tablet = iPad)
+    brand = ov.get("brand") or (maker if same or (maker, kind) in MODEL_OF else "")
+    os = ov.get("os") or (auto.get("os") if same else "")
+    model = ov.get("model") or (auto.get("model", "") if same else MODEL_OF.get((brand, kind), ""))
+    label = (ov.get("label") or "").strip() or _name(kind, brand, os, model, bool(auto.get("random")) and not brand)
+    seen = {"label": auto["label"], "kind": auto.get("kind", ""), "kind_label": auto.get("kind_label", ""),
+            "confidence": auto.get("confidence", "none")}
+    alts = [a for a in auto.get("alternatives", []) if a["kind"] != kind]
+    if auto.get("kind") and not same:
+        alts.insert(0, dict(seen, why="MCC's own best guess", score=auto.get("score", 0), brand=auto.get("brand", ""),
+                            model=auto.get("model", ""), auto=True))
+    out = dict(auto, label=label, kind=kind, kind_label=KIND_LABEL[kind], brand=brand, os=os, model=model,
+               confidence="high", overridden=True, auto=seen, alternatives=alts[:4])
+    out["clues"] = [{"source": "you", "text": "You set this: {}".format(label), "w": 10.0}] + list(auto.get("clues", []))
+    return out
 
 
 _OS_RX = re.compile(r"linux|windows|freebsd|openbsd|darwin|mac os", re.I)

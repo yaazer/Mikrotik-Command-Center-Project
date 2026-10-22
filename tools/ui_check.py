@@ -438,6 +438,36 @@ def sc_types(d: Demo, c: Check) -> None:
         c(not b.errors, "no console errors: {}".format(b.errors[:3]))
 
 
+def sc_identity_override(d: Demo, c: Check) -> None:
+    """A wrong guess can be corrected: pick one of MCC's candidates or say what it is, then undo it."""
+    with Browser(1600, 1000) as b:
+        b.nav(d.url + "#/devices")
+        row = "[...document.querySelectorAll('#devs tr[data-ip]')].find(r => r.dataset.ip === '192.168.88.60')"
+        c(b.until("(%s || {innerText: ''}).innerText.includes('Brother printer')" % row, 15), "the printer is guessed first")
+        b.eval("(%s).click()" % row)
+        c(b.until("!!document.querySelector('#drawer.open .ident-fix')", 8), "the drawer offers 'Not right?'")
+        b.eval("document.querySelector('#drawer .ident-fix').open = true")
+        c(b.eval("document.querySelectorAll('#drawer #id-kind option').length") >= 10, "every kind can be picked by hand")
+        b.wait(2.5)  # the drawer refreshes every 2 s: an open editor must survive it
+        c(b.eval("document.querySelector('#drawer .ident-fix').open"), "the open editor isn't redrawn away")
+        b.eval("document.querySelector('#drawer #id-kind').value = 'camera'")
+        b.eval("document.querySelector('#drawer #id-label').value = 'Hallway cam'")
+        shot(b, "identity-editor")
+        b.eval("document.querySelector('#drawer [data-id-save]').click()")
+        c(b.until("document.querySelector('#drawer .ident-hero b') && document.querySelector('#drawer .ident-hero b').innerText === 'Hallway cam'", 8),
+          "the drawer shows your answer")
+        c(b.eval("document.querySelector('#drawer .ident-set').innerText.includes('Brother printer')"), "and what MCC had guessed")
+        c(b.eval("document.querySelector('#drawer .ident-hero .pill').innerText.includes('high')"), "at high confidence")
+        b.nav(d.url + "#/devices")
+        c(b.until("(%s || {innerText: ''}).innerText.includes('Hallway cam')" % row, 10), "Devices lists it too")
+        b.eval("(%s).click()" % row)
+        c(b.until("!!document.querySelector('#drawer [data-id-reset]')", 8), "there is a way back")
+        b.eval("document.querySelector('#drawer [data-id-reset]').click()")
+        c(b.until("document.querySelector('#drawer .ident-hero b') && document.querySelector('#drawer .ident-hero b').innerText === 'Brother printer'", 8),
+          "reset restores MCC's guess")
+        c(not b.errors, "no console errors: {}".format(b.errors[:3]))
+
+
 def sc_drawer(d: Demo, c: Check) -> None:
     with Browser(1600, 1000) as b:
         b.nav(d.url + "#/overview")
@@ -886,7 +916,7 @@ def sc_advisor(d: Demo, c: Check) -> None:
             d.hub.advisor.refresh_soon()
 
 
-SCENARIOS = {"pages": sc_pages, "advisor": sc_advisor, "identify": sc_identify, "setup": sc_setup, "respond": sc_respond, "ignore": sc_ignore, "layout": sc_layout, "globe-fade": sc_globe_fade, "theme": sc_theme, "update": sc_update, "types": sc_types, "drawer": sc_drawer, "phone": sc_phone,
+SCENARIOS = {"pages": sc_pages, "advisor": sc_advisor, "identify": sc_identify, "identity-override": sc_identity_override, "setup": sc_setup, "respond": sc_respond, "ignore": sc_ignore, "layout": sc_layout, "globe-fade": sc_globe_fade, "theme": sc_theme, "update": sc_update, "types": sc_types, "drawer": sc_drawer, "phone": sc_phone,
              "light": sc_light, "offscreen": sc_offscreen,
              "single-out": sc_single_out, "globe-fit": sc_globe_fit,
              "vpn": sc_vpn, "lan": sc_lan, "topology": sc_topology}

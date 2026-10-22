@@ -417,6 +417,16 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840, token: Opti
                 return hub.detector.unsuppress(parts[2])
             except KeyError:
                 raise ApiError(404, "no such ignore rule")
+        if path == "/api/identity":
+            mac = str(b.get("mac") or "")
+            if len("".join(c for c in mac.upper() if c in "0123456789ABCDEF")) != 12:
+                raise ApiError(400, "give a full MAC address, e.g. 3C:22:FB:12:34:56")
+            try:
+                return hub.set_identity(mac, str(b.get("kind") or ""), str(b.get("label") or ""),
+                                        str(b.get("brand") or ""), str(b.get("os") or ""), str(b.get("model") or ""),
+                                        reset=b.get("reset") is True)
+            except ValueError as e:
+                raise ApiError(400, str(e))
         if path == "/api/pins":
             try:
                 return {"pins": hub.set_pin(str(b.get("ip") or "").strip(), b.get("pinned") is not False)}

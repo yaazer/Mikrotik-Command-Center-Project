@@ -30,7 +30,7 @@ from mcc.config import Config  # noqa: E402
 from mcc.detect import Blocklist, Detector  # noqa: E402
 from mcc import hub as hub_mod  # noqa: E402
 from mcc.hub import Hub  # noqa: E402
-from mcc.identify import Fingerprints, brand_of, identify  # noqa: E402
+from mcc.identify import Fingerprints, apply_override, brand_of, identify  # noqa: E402
 from mcc.oui import MacVendors, build as oui_build, is_random, short_name  # noqa: E402
 from mcc.routeros import RouterOS, RouterOSError, cli_line  # noqa: E402
 from mcc.server import make_server  # noqa: E402
@@ -1271,6 +1271,51 @@ def t_identify_guesses():
     eq(lab["kind"], "printer", "the name you gave it on the router counts too")
     eq(brand_of("Hangzhou Hikvision Digital Technology"), "Hikvision", "brands tidied")
     eq(brand_of("Wyze Labs"), "Wyze", "generic words trimmed")
+
+
+@test
+def t_identity_alternatives_and_override():
+    from mcc.overrides import Overrides
+    v = MacVendors(Path(tempfile.gettempdir()) / "mcc-none")
+    mac = "3C:22:FB:00:00:22"
+    auto = identify({"mac": mac, "hostname": "Janes-iPhone", "name": "Janes-iPhone"}, v.lookup(mac), ())
+    eq(auto["kind"], "phone", "MCC's guess")
+    alts = auto["alternatives"]
+    ok(alts and all(a["confidence"] in ("high", "medium", "low") and a["kind"] != "phone" for a in alts),
+       "other candidates, each with a confidence: {}".format(alts))
+    ok(alts[0]["score"] >= alts[-1]["score"], "most likely candidate first")
+    ok(auto["overridden"] is False, "an untouched guess says so")
+    tablet = apply_override(auto, {"kind": "tablet"})
+    eq((tablet["kind"], tablet["confidence"], tablet["overridden"]), ("tablet", "high", True), "your answer wins")
+    eq(tablet["label"], "Apple iPad", "named like a guess would be")
+    eq(tablet["auto"]["label"], "Apple iPhone", "MCC's own guess is kept")
+    ok(any(a.get("auto") and a["kind"] == "phone" for a in tablet["alternatives"]), "and offered as a way back")
+    eq(tablet["clues"][0]["source"], "you", "the first clue is yours")
+    eq(apply_override(auto, {"kind": "printer", "label": "Study printer"})["label"], "Study printer", "your own name")
+    eq(apply_override(auto, {"kind": "nonsense"}), auto, "an unknown kind is ignored")
+    tmp = Path(tempfile.mkdtemp(prefix="mcc-ov-"))
+    try:
+        o = Overrides(tmp)
+        o.set(mac, "tablet", brand="Apple")
+        eq(Overrides(tmp).get(mac.lower())["kind"], "tablet", "kept across restarts, found by MAC in any case")
+        try:
+            o.set(mac, "toaster")
+            raise AssertionError("an unknown kind should fail")
+        except ValueError:
+            pass
+        ok(o.clear(mac) and Overrides(tmp).get(mac) is None, "reset forgets it")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    with Env() as e:
+        dev = wait_for(lambda: next((d for d in e.hub.devices.values() if d.get("identity", {}).get("kind") == "printer"), None), 15)
+        m = dev["mac"]
+        r = e.hub.set_identity(m, "camera")
+        eq((r["identity"]["kind"], r["identity"]["overridden"]), ("camera", True), "applies at once")
+        eq(e.hub.devices[m]["identity"]["kind"], "camera", "and to the live device list")
+        time.sleep(0.2)
+        wait_for(lambda: e.hub.devices[m]["identity"]["kind"] == "camera", 20)
+        r = e.hub.set_identity(m, reset=True)
+        eq((r["identity"]["kind"], r["identity"]["overridden"]), ("printer", False), "reset restores MCC's guess")
 
 
 @test

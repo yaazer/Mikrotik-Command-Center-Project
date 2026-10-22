@@ -368,6 +368,12 @@ A guess is built from every clue MCC can see. Each clue adds weight to a kind (p
 
 **Looking up any MAC.** Paste a MAC into `Ctrl+K`, or use **Setup › Device identification**, to see its vendor and MCC's guess.
 
+**When the guess is wrong.** Open the device (click it in Devices, or on the map) and look under **What it is**:
+- **Other candidates:** **Not right? Change what it is** lists what else the clues point at, most likely first. Each has its own Low, Medium or High confidence and the clue behind it. Click one to use it.
+- **Say what it is yourself:** pick any kind from the list and, if you like, give it a name ("Kitchen tablet"). Your answer counts as High confidence and wins over every clue.
+- **It sticks:** the override is kept by MAC in `data/identity_overrides.json`, so it follows the device to a new address and survives restarts.
+- **Undo:** an overridden device shows what MCC had guessed. **Use MCC's guess** puts it back. The same editor appears when you look up a MAC with `Ctrl+K`.
+
 **What it doesn't do.**
 - **No probing:** MCC never scans, pings or probes a device to identify it. Everything comes from the router or from traffic that was already flowing.
 - **Traffic clues are remembered:** they're kept per MAC in `data/fingerprints.json` for 30 days, so a device that only phones home now and then is still recognised.

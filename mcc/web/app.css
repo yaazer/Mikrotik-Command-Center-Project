@@ -680,3 +680,16 @@ h4.mini { margin: 0 0 8px; font-size: 11px; letter-spacing: .1em; text-transform
 body[data-motion="off"] .tlink .tl-flow { animation: none; opacity: 0; }
 @media (max-width: 720px) { .topo-wrap { height: 480px; } }
 
+/* ---------- overriding what a device is ---------- */
+.ident-set { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; font-size: 12.5px; color: var(--muted); }
+.ident-fix { margin-top: 8px; }
+.ident-fix summary { cursor: pointer; font-size: 12.5px; color: var(--accent); }
+.ident-alts { display: flex; flex-direction: column; gap: 5px; margin: 6px 0 10px; }
+.ident-alt { display: flex; align-items: center; gap: 9px; text-align: left; padding: 6px 10px; border: 1px solid var(--line-soft); border-radius: 8px; background: transparent; cursor: pointer; }
+.ident-alt:hover { border-color: var(--accent); }
+.ident-alt .who { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.ident-alt .who span { font-size: 11.5px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ident-alt .cw { font-size: 11px; color: var(--muted); min-width: 52px; text-align: right; }
+.ident-alt .conf { margin-left: 0; }
+.ident-manual { display: grid; grid-template-columns: 1fr; gap: 6px; margin: 8px 0; }
+.ident-manual label { font-size: 12px; color: var(--muted); }

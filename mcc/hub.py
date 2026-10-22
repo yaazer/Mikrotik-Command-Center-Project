@@ -20,7 +20,8 @@ from .config import Config
 from .classify import CATEGORIES
 from .detect import RULES, Detector
 from .geo import Geo
-from .identify import Fingerprints, identify
+from .identify import KINDS, Fingerprints, apply_override, identify
+from .overrides import Overrides
 from .names import NameMemory
 from .oui import MacVendors, normalise_mac
 from .pins import Pins
@@ -131,6 +132,8 @@ class Hub:
         self.mac_of: Dict[str, str] = {}  # LAN address -> MAC
         self.vendors = MacVendors(self.data_dir)  # IEEE MAC vendor registry (bundled snapshot, or refreshed in Setup)
         self.fingerprints = Fingerprints(self.data_dir)  # what each device's traffic revealed about it
+        self.overrides = Overrides(self.data_dir)  # what you said a device is, over MCC's guess
+        self.ident_auto: Dict[str, Dict[str, Any]] = {}  # MAC -> MCC's own guess, before any override
         self._table_off: Dict[str, float] = {}  # optional router tables that errored -> retry after
         self.ip_names: Dict[str, str] = {}
         self.dns_names: Dict[str, str] = {}
@@ -919,15 +922,19 @@ class Hub:
                                           "signal": r.get("signal") or r.get("signal-strength") or r.get("rx-signal") or ""})
         wifi_ifaces = {n for n, i in list(self.ifaces.items()) if i.get("type") in ("wlan", "wifi", "wifiwave2", "cap")}
         self.neighbors = neighbors
+        autos: Dict[str, Dict[str, Any]] = {}
         for mac, d in devs.items():
             d["port"] = port_of.get(mac, "")
             w = wifi.get(mac) or ({"interface": d["port"]} if d["port"] in wifi_ifaces else None)
             nb = nb_mac.get(mac) or nb_ip.get(d.get("ip"))
             d["vendor"] = self.vendors.lookup(mac)
-            d["identity"] = identify(d, d["vendor"], self.fingerprints.hints(mac), nb, w)
+            auto = identify(d, d["vendor"], self.fingerprints.hints(mac), nb, w)
+            autos[mac] = auto
+            d["identity"] = apply_override(auto, self.overrides.get(mac))
         names = {d["ip"]: d["name"] for d in devs.values() if d.get("ip") and d.get("name")}
         with self.lock:
             self.devices = devs
+            self.ident_auto = autos
             self.mac_of = {d["ip"]: mac for mac, d in devs.items() if d.get("ip")}
             self.ip_names = names
         self.name_memory.remember("device", names, now)
@@ -948,9 +955,24 @@ class Hub:
         mac = ":".join(normalise_mac(mac)[i:i + 2] for i in range(0, 12, 2))
         vendor = self.vendors.lookup(mac)
         dev = self.devices.get(mac)
-        ident = dev["identity"] if dev and dev.get("identity") else identify({"mac": mac}, vendor,
-                                                                             self.fingerprints.hints(mac))
+        ident = dev["identity"] if dev and dev.get("identity") else apply_override(
+            identify({"mac": mac}, vendor, self.fingerprints.hints(mac)), self.overrides.get(mac))
         return {"mac": mac, "vendor": vendor, "device": dev, "identity": ident}
+
+    def set_identity(self, mac: str, kind: str = "", label: str = "", brand: str = "", os: str = "",
+                     model: str = "", reset: bool = False) -> Dict[str, Any]:
+        """Say what a device is (or hand it back to MCC's guess). Takes effect at once, and survives restarts."""
+        mac = ":".join(normalise_mac(mac)[i:i + 2] for i in range(0, 12, 2)).upper()
+        if reset:
+            self.overrides.clear(mac)
+        else:
+            self.overrides.set(mac, kind, label, brand, os, model)
+        with self.lock:
+            dev = self.devices.get(mac)
+            auto = self.ident_auto.get(mac)
+            if dev is not None and auto is not None:
+                dev["identity"] = apply_override(auto, self.overrides.get(mac))
+        return self.identify_mac(mac)
 
     def _poll_dns(self, ros: RouterOS, now: float) -> None:
         rows: List[Dict[str, Any]] = []
@@ -1269,7 +1291,7 @@ class Hub:
         return {"snapshot": snap, "history": {"ifaces": hist, "health": health, "switch": sw, "lan": lan},
                 "threats": self.detector.list(), "actions": self.actions.list(), "logs": logs,
                 "entries": self.entries, "config": self.cfg.public(), "rules": RULES,
-                "ignore": self.detector.suppressions_list(), "categories": CATEGORIES, "pins": self.pins_list()}
+                "ignore": self.detector.suppressions_list(), "categories": CATEGORIES, "kinds": KINDS, "pins": self.pins_list()}
 
     def devices_view(self) -> List[Dict[str, Any]]:
         known = self.detector.known_devices()

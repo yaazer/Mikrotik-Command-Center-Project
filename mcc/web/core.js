@@ -124,6 +124,7 @@ function connectStream() {
     S.ignore = st.ignore || [];
     S.pins = st.pins || [];
     S.categories = st.categories || [];
+    S.kinds = st.kinds || [];
     if (onBuild(st.build)) return;
     checkSkew(st);
     S.connected = true;
@@ -529,7 +530,7 @@ const Ident = {
     vm: '<rect x="3" y="3" width="13" height="13" rx="1.5"/><rect x="8" y="8" width="13" height="13" rx="1.5"/>',
     unknown: '<circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .9-1 1.6v.6M12 17h.01"/>',
   },
-  SOURCE: { mac: "MAC", hostname: "Host name", label: "Name", dhcp: "DHCP", neighbor: "Discovery", wifi: "Wi-Fi", traffic: "Traffic", service: "Service" },
+  SOURCE: { you: "You", mac: "MAC", hostname: "Host name", label: "Name", dhcp: "DHCP", neighbor: "Discovery", wifi: "Wi-Fi", traffic: "Traffic", service: "Service" },
   icon(kind) { return `<svg viewBox="0 0 24 24" class="kicon" aria-hidden="true">${this.ICONS[kind] || this.ICONS.unknown}</svg>`; },
   conf(c) {
     const n = { high: 3, medium: 2, low: 1 }[c] || 0;
@@ -539,6 +540,7 @@ const Ident = {
   sub(id) {
     if (!id) return "";
     const bits = [];
+    if (id.overridden) bits.push("set by you");
     if (id.os) bits.push(id.os);
     if (id.random) bits.push("private MAC");
     else if (id.vendor && !(id.brand && id.vendor.toLowerCase().includes(id.brand.toLowerCase()))) bits.push(id.vendor);  // "Giga-byte Technology", not "Wyze Labs" again
@@ -561,6 +563,34 @@ const Ident = {
       <span class="pill ${{ high: "green", medium: "blue", low: "yellow" }[id.confidence] || ""}">${esc(id.confidence === "none" ? "unknown" : id.confidence + " confidence")}</span></div>
       ${this.clues(id.clues)}`;
   },
+  /* "Not right?": MCC's other candidates, each with its own confidence, a manual pick, and a way back to MCC's guess */
+  editor(id, mac) {
+    if (!id || !mac) return "";
+    const word = (c) => ({ high: "High", medium: "Medium", low: "Low" }[c] || "");
+    const alts = id.alternatives || [];
+    const set = id.overridden ? `<div class="ident-set"><span class="pill blue">set by you</span><span>MCC guessed <b>${esc(id.auto.label)}</b> (${esc(word(id.auto.confidence) || "no")} confidence)</span><button class="btn sm" data-id-reset>Use MCC's guess</button></div>` : "";
+    const kinds = (S.kinds || []).map((k) => `<option value="${esc(k.id)}" ${k.id === id.kind ? "selected" : ""}>${esc(k.label)}</option>`).join("");
+    return `${set}<details class="ident-fix"><summary>${id.overridden ? "Change it again" : "Not right? Change what it is"}</summary>
+      ${alts.length ? `<div class="note">It could also be:</div><div class="ident-alts">${alts.map((a, i) => `<button class="ident-alt" data-id-alt="${i}" title="${esc(a.why || "")}">${this.icon(a.kind)}<span class="who"><b>${esc(a.label)}</b><span>${esc(a.auto ? "MCC's own best guess" : a.why || a.kind_label)}</span></span>${this.conf(a.confidence)}<span class="cw">${esc(word(a.confidence))}</span></button>`).join("")}</div>` : '<div class="note">MCC has no other candidates: pick what it is below.</div>'}
+      <div class="ident-manual"><label for="id-kind">Or say what it is</label>
+        <select id="id-kind">${kinds}</select>
+        <input type="text" id="id-label" maxlength="60" placeholder="Name it (optional), e.g. Kitchen tablet" value="${id.overridden ? esc(id.label) : ""}">
+        <button class="btn primary sm" data-id-save>Save</button></div>
+      <div class="note">Your answer wins over every clue and is remembered for this device.</div></details>`;
+  },
+  bindEditor(el, id, mac, done) {
+    const send = async (body, msg) => {
+      try { await api.post("/api/identity", Object.assign({ mac }, body)); toast(msg, ""); const f = $(".ident-fix", el); if (f) f.open = false; done(); }
+      catch (err) { toast("Couldn't save", err.message, { bad: true }); }
+    };
+    $$("[data-id-alt]", el).forEach((b) => (b.onclick = () => {
+      const a = id.alternatives[+b.dataset.idAlt];
+      if (a.auto) send({ reset: true }, "Back to MCC's guess");
+      else send({ kind: a.kind, brand: a.brand || "", model: a.model || "" }, "Set to " + a.label);
+    }));
+    $$("[data-id-reset]", el).forEach((b) => (b.onclick = () => send({ reset: true }, "Back to MCC's guess")));
+    $$("[data-id-save]", el).forEach((b) => (b.onclick = () => send({ kind: $("#id-kind", el).value, label: $("#id-label", el).value }, "Saved")));
+  },
   isMac(q) { return /^[0-9a-f]{2}([:\-]?[0-9a-f]{2}){5}$/i.test(q.trim()) || /^[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}$/i.test(q.trim()); },
   async lookup(mac) {
     let r;
@@ -571,10 +601,12 @@ const Ident = {
         ${v.vendor ? `<dl class="kv"><dt>Prefix</dt><dd>${esc(v.prefix)}</dd><dt>Registry</dt><dd>IEEE ${esc(v.registry)}</dd></dl>` : ""}
         ${r.device ? `<div class="note">On your network now as <b>${esc(r.device.name || r.device.hostname || r.device.ip)}</b> (${esc(r.device.ip || "no address")}).</div>` : '<div class="note">Not on your network right now: this guess comes from the MAC alone.</div>'}
         ${this.block(r.identity)}
+        <div id="ident-sec">${this.editor(r.identity, r.mac)}</div>
       </div>
       <footer><span class="grow"></span>${r.device && r.device.ip ? `<button class="btn" data-open="${esc(r.device.ip)}">Open device</button>` : ""}<button class="btn primary" data-x>Close</button></footer>`,
     (mm) => {
       $$("[data-x]", mm).forEach((b) => (b.onclick = closeModal));
+      this.bindEditor($("#ident-sec", mm), r.identity, r.mac, () => { closeModal(); this.lookup(mac); });
       $$("[data-open]", mm).forEach((b) => (b.onclick = () => { closeModal(); openHost(b.dataset.open); }));
     });
   },
@@ -694,6 +726,7 @@ async function loadHost() {
   let h;
   try { h = await api.get("/api/host?ip=" + encodeURIComponent(ip)); } catch (e) { return; }
   if (ip !== drawerIp) return;
+  if ($("#drawer .ident-fix[open]")) return;  // don't redraw under someone choosing what a device is
   Select.loaded(h);
   const d = $("#drawer");
   const peer = !h.lan;
@@ -741,7 +774,8 @@ async function loadHost() {
         return `<div><h4>Traffic types</h4>${Types.barHtml(cats)}<div style="margin-top:8px">${Types.mixHtml(cats, 8)}</div></div>`; })() : ""}
       ${h.geo ? `<div><h4>Location</h4><dl class="kv"><dt>Where</dt><dd>${esc([h.geo.city, h.geo.region, h.geo.country].filter(Boolean).join(", "))}</dd>
         <dt>Coordinates</dt><dd>${h.geo.lat}, ${h.geo.lon}${h.geo.precision === "country" ? " (country centre)" : ""}</dd></dl></div>` : ""}
-      ${dev.identity ? `<div><h4>What it is</h4>${Ident.block(dev.identity)}
+      ${dev.identity ? `<div id="ident-sec"><h4>What it is</h4>${Ident.block(dev.identity)}
+        ${Ident.editor(dev.identity, dev.mac)}
         <div class="note" style="margin-top:6px">A best guess from what MCC can see. MCC never scans or probes a device to identify it.</div></div>` : ""}
       ${h.device ? `<div><h4>Device</h4><dl class="kv"><dt>MAC</dt><dd>${esc(dev.mac)}</dd>
         <dt>Vendor</dt><dd>${dev.vendor && dev.vendor.vendor ? esc(dev.vendor.vendor + " · " + dev.vendor.prefix) : dev.vendor && dev.vendor.random ? "private (randomized) address" : "—"}</dd>
@@ -769,6 +803,7 @@ async function loadHost() {
       respond(k, params, "from the console");
     };
   });
+  if (dev.identity) Ident.bindEditor($("#ident-sec", d), dev.identity, dev.mac, loadHost);
   $$("tr[data-ip]", d).forEach((tr) => (tr.onclick = () => openHost(tr.dataset.ip)));
   $$("[data-tid]", d).forEach((c) => (c.onclick = () => { closeDrawer(); go("threats", { id: c.dataset.tid }); }));
   const cv = $("#hchart", d);
