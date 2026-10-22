@@ -226,10 +226,12 @@ const Types = {
     const total = rows.reduce((a, [, v]) => a + v, 0) || 1;
     return `<div class="tbar">${rows.map(([k, v]) => `<i style="width:${((v / total) * 100).toFixed(2)}%;background:${this.color(k)}" title="${esc(this.label(k))}: ${fmt.bps(v)} (${Math.round((v / total) * 100)}%)"></i>`).join("")}</div>`;
   },
-  /* the legend shown over the map / globe: types present, clickable to focus */
-  legend(types) {
-    if (this.by === "heat") {
-      return '<span class="heat-grad" title="Colour is how big the link\'s smoothed rate is; the glow is how long it\'s stayed busy">' +
+  /* the legend shown over the map / globe: types present, clickable to focus. heatCapable: false for
+     the globe, which has no heat rendering of its own and falls back to direction colours -- so its
+     legend should say that, not claim a heat gradient it isn't drawing */
+  legend(types, heatCapable) {
+    if (this.by === "heat" && heatCapable) {
+      return '<span class="heat-grad" title="Colour is how big the link\'s smoothed rate is; the glow is how long it\'s stayed busy, this session">' +
         '<i style="background:linear-gradient(90deg,oklch(0.58 0.1 245),oklch(0.65 0.18 140),oklch(0.72 0.23 30))"></i>quiet → sustained & heavy</span>' +
         '<span><i style="background:var(--crit)"></i>threat</span>';
     }

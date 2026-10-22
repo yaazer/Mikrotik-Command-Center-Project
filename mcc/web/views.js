@@ -107,7 +107,9 @@ function legendTypes(el) {
   return Object.values(by).sort((a, b) => b.bps - a.bps);
 }
 function refreshTypeUI() {
-  $$(".type-legend").forEach((el) => { el.innerHTML = Types.legend(legendTypes(el)); });
+  // only a flow map (.map-wrap) actually draws the heat overlay; the globe falls back to direction
+  // colours in heat mode, so its legend should too, rather than describing a gradient it isn't showing
+  $$(".type-legend").forEach((el) => { el.innerHTML = Types.legend(legendTypes(el), !!el.closest(".map-wrap")); });
   $$(".color-by button").forEach((b) => b.classList.toggle("on", b.dataset.by === Types.by));
 }
 document.addEventListener("click", (e) => {

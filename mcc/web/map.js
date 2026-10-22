@@ -96,12 +96,14 @@ const TrafficMap = (() => {
     function histFor(kind, ip) {
       const key = kind + ":" + ip;
       let h = hist.get(key);
-      if (!h) { h = { up: 0, down: 0, active: 0, idle: 0, duration: 0, lastSeen: 0 }; hist.set(key, h); }
+      if (!h) { h = { up: null, down: null, active: 0, idle: 0, duration: 0, lastSeen: 0 }; hist.set(key, h); }
       return h;
     }
     // runs once per real server tick (never per redraw/filter-change call): eases each candidate's
     // rate and tracks how long it's stayed above the floor, so a single noisy sample can't make a
-    // link's width, particle count or on-screen rank jump, and heat reflects sustained use, not a blip
+    // link's width, particle count or on-screen rank jump, and heat reflects sustained use, not a blip.
+    // "duration" is wall-clock time this map instance has watched the link stay busy -- it has no
+    // server-side connection-age to draw on, so it resets on reload and starts over, never longer.
     function ingest(tr, now) {
       const dt = lastIngestT ? Math.min(5, Math.max(0.1, (now - lastIngestT) / 1000)) : 1;
       lastIngestT = now;
@@ -110,7 +112,8 @@ const TrafficMap = (() => {
         const key = kind + ":" + x.ip;
         seen.add(key);
         const h = histFor(kind, x.ip);
-        h.up += ((x.up || 0) - h.up) * a; h.down += ((x.down || 0) - h.down) * a;
+        if (h.up == null) { h.up = x.up || 0; h.down = x.down || 0; }  // seed from the first sample, don't ramp up from 0
+        else { h.up += ((x.up || 0) - h.up) * a; h.down += ((x.down || 0) - h.down) * a; }
         if (h.up + h.down > floor) { if (!h.active) h.active = now; h.idle = 0; }
         else { if (!h.idle) h.idle = now; if (now - h.idle > 5000) h.active = 0; }
         h.duration = h.active ? (now - h.active) / 1000 : 0;
@@ -127,14 +130,18 @@ const TrafficMap = (() => {
       const now = performance.now();
       if (s !== lastSnap) { ingest(tr, now); lastSnap = s; }
       const seen = new Set();
-      // top-N by smoothed rate, with a margin for whatever's already shown: a newcomer has to beat
-      // the weakest incumbent by >25%, not just edge past it for one noisy tick, so the map doesn't
+      // top-N by smoothed rate, pinned first (the server already orders its lists that way; keep it
+      // through the re-sort), with a margin for whatever's already shown: a newcomer has to beat the
+      // weakest incumbent by >25%, not just edge past it for one noisy tick, so the map doesn't
       // shuffle its layout every second over rates that are effectively tied
       const pick = (list, kind, n) => {
         const shown = new Set();
         for (const nd of nodes.values()) if (nd.kind === kind && !nd.dead) shown.add(nd.ip);
-        const scored = list.map((x) => { const h = histFor(kind, x.ip); return { x, rate: h.up + h.down, was: shown.has(x.ip) }; });
-        scored.sort((a, b) => (b.rate * (b.was ? 1 : 0.8)) - (a.rate * (a.was ? 1 : 0.8)));
+        const scored = list.map((x) => {
+          const h = histFor(kind, x.ip);
+          return { x, rate: (h.up || 0) + (h.down || 0), was: shown.has(x.ip), pin: !!x.pinned || Pins.has(x.ip) };
+        });
+        scored.sort((a, b) => (b.pin - a.pin) || (b.rate * (b.was ? 1 : 0.8)) - (a.rate * (a.was ? 1 : 0.8)));
         const top = scored.slice(0, n).map((e) => e.x);
         const topIps = new Set(top.map((x) => x.ip));
         // anything under suspicion is always on the map, even if it's quiet
@@ -142,6 +149,10 @@ const TrafficMap = (() => {
         return top;
       };
       const fit = Math.max(4, Math.floor((H - 90) / 30) + 1);  // two-line labels need ~30px each
+      // singled out, "peers"/"hosts" are per-pair path aggregates, not the devices hist tracks totals
+      // for -- so that mode eases off the raw per-tick numbers instead (still smoothed frame to frame
+      // by r/lw easing, just without the multi-tick history or a meaningful "how long has this been busy")
+      const rawRates = Select.ip && opts.singleOut;
       let peers, hosts, shown = null;
       if (Select.ip && opts.singleOut) {
         // singled out: only this device, on its own side, and everything it talks to on the other
@@ -175,12 +186,15 @@ const TrafficMap = (() => {
         Object.assign(n, { label: x.name || x.ip, name: x.name, up: x.up, down: x.down, conns: x.conns, threat: x.threat || "",
           blocked: !!x.blocked, peers: x.peers, hosts: x.hosts, ports: x.ports, talpha: 1, dead: false,
           cats: x.cats || {}, cat: x.cat || "other", pinned: !!x.pinned || Pins.has(x.ip), sel: x.ip === Select.ip, idle: !!x.idle,
-          sup: h.up, sdown: h.down, duration: h.duration });
+          sup: rawRates ? (x.up || 0) : (h.up || 0), sdown: rawRates ? (x.down || 0) : (h.down || 0),
+          duration: rawRates ? 0 : h.duration });
         const sr = srate(n);
         n.tr = radius(sr);
         n.tlw = 0.6 + Math.min(4, Math.log10(1 + sr / 1e4));
         n.intensity = intensityOf(sr);
-        n.glow = Math.max(0, Math.min(1, n.duration / 30));  // "how long has this been busy" -> halo size
+        // "how long has this been busy" -> halo size, log-scaled so it keeps differentiating minutes
+        // in, not just the first half-minute
+        n.glow = Math.max(0, Math.min(1, Math.log10(1 + n.duration / 30) / Math.log10(21)));
       };
       peers.forEach((p) => add("peer", p));
       hosts.forEach((h) => add("host", h));
@@ -204,17 +218,15 @@ const TrafficMap = (() => {
       // evenly spaced columns that bow toward the router, leaving room for the labels outside
       const R = narrow() ? W / 2 - 24 : Math.max(110, Math.min(VW * 0.36, VW / 2 - 185));
       const place = (kind, side) => {
-        // pinned devices at the top of their column, then the busiest (by smoothed rate, so two
-        // nodes with near-identical traffic don't keep swapping slots tick to tick). A node that just
-        // dropped off the top-N still holds its slot while it fades, so the column settles once when
-        // it's actually gone rather than reflowing the instant it's no longer picked and again as it fades.
-        const list = [...nodes.values()].filter((n) => n.kind === kind && (!n.dead || n.alpha > 0.02))
+        // pinned devices at the top of their column, then the busiest -- by smoothed rate, so two
+        // nodes with near-identical traffic don't keep swapping slots tick to tick (the pick() margin
+        // above keeps membership itself from churning, which is what used to cause a reflow here)
+        const list = [...nodes.values()].filter((n) => n.kind === kind && !n.dead)
           .sort((a, b) => (b.pinned - a.pinned) || srate(b) - srate(a));
         const n = list.length;
         const gap = n > 1 ? Math.min(48, (H - 90) / (n - 1)) : 0;
         const y0 = H / 2 - (gap * (n - 1)) / 2;
         list.forEach((node, i) => {
-          if (node.dead) return;  // frozen at its last position while it fades out
           node.ty = y0 + i * gap;
           const rel = (node.ty - H / 2) / (H / 2);
           node.tx = router.x + side * R * (1 - 0.3 * rel * rel);
@@ -472,7 +484,7 @@ const TrafficMap = (() => {
         ? `talking to ${(n.hosts || []).length} LAN host${(n.hosts || []).length === 1 ? "" : "s"}${n.ports && n.ports.length ? " · ports " + n.ports.join(", ") : ""}`
         : `${n.peers || 0} Internet peer${n.peers === 1 ? "" : "s"} · ${n.conns || 0} conns`;
       tip.show(`<b>${esc(n.label)}</b>${n.name ? `<span class="mono muted">${esc(n.ip)}</span><br>` : ""}<span class="in">↓ ${fmt.bps(n.down)}</span> · <span class="out">↑ ${fmt.bps(n.up)}</span><br><span class="muted">${esc(extra)}</span>` +
-        (n.duration > 4 ? `<br><span class="muted">busy for ${fmt.dur(n.duration)}</span>` : "") +
+        (n.duration > 4 ? `<br><span class="muted">busy ${fmt.dur(n.duration)} this session</span>` : "") +
         Types.mixHtml(n.cats) +
         (n.threat ? `<br><span style="color:var(--crit)">⚠ ${esc(n.threat)} threat</span>` : "") + (n.blocked ? '<br><span class="muted">blocked by MCC</span>' : "") +
         (n.pinned ? '<br><span class="muted">pinned</span>' : "") + `<br><span class="faint">${!opts.singleOut ? "click for details" : n.sel ? "singled out" : "click to single it out"}</span>`, e.clientX, e.clientY);
