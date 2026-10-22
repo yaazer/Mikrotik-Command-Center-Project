@@ -28,6 +28,16 @@ function motionOffNote(ctx, x, y, colors) {
 const TrafficMap = (() => {
   const SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1, info: 0, "": -1 };
 
+  // cool -> hot for the heat overlay: v is how big a node's smoothed rate is (0..1, absolute scale,
+  // not relative to whatever else is on screen, so a quiet network doesn't make everything glow)
+  function heatColor(v) {
+    v = Math.max(0, Math.min(1, v || 0));
+    const light = document.documentElement.dataset.theme === "light";
+    const hue = 245 - v * 215, c = 0.1 + v * 0.13;
+    const l = light ? 0.52 - v * 0.08 : 0.58 + v * 0.14;
+    return `oklch(${l} ${c} ${hue})`;
+  }
+
   function create(wrap, opts) {
     opts = Object.assign({ peers: 14, hosts: 12, captions: ["INTERNET", "LAN"], singleOut: true }, opts || {});
     const cv = document.createElement("canvas");
@@ -41,6 +51,11 @@ const TrafficMap = (() => {
       : (window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches ? "off" : "full"));
     const lite = () => !!(window.Theme && Theme.isLite());
     const nodes = new Map();
+    // smoothed rate + "how long has this been busy" per candidate (kind:ip), kept for everything the
+    // server reports -- not just what's currently drawn -- so a device's heat survives it scrolling
+    // off the top-N and back, and so ranking for the top-N itself is based on settled numbers
+    const hist = new Map();
+    let lastSnap = null, lastIngestT = 0;
     let parts = [];
     let VW = 0, W = 0, H = 0, dpr = 1, colors = {}, hover = null, snap = null, raf = 0, last = 0, alive = true;
     const router = { id: "router", kind: "router", x: 0, y: 0, r: 26, alpha: 1, label: "router" };
@@ -70,16 +85,60 @@ const TrafficMap = (() => {
 
     const narrow = () => W < 640;  // phones: nodes hug the edges, labels point inward
     const rate = (n) => (n.up || 0) + (n.down || 0);
+    const srate = (n) => (n.sup || 0) + (n.sdown || 0);  // smoothed rate, for layout/sort stability
     const radius = (bps) => 4 + Math.min(14, Math.log10(1 + bps / 2e3) * 3.2);
+    // absolute 0..1 scale for the heat colour: fixed thresholds, not "biggest thing on screen right
+    // now", so the map doesn't look hot just because the network is quiet everywhere else. The top of
+    // the scale sits around 30 Mb/s -- a single connection pushing a serious chunk of a home/office
+    // link -- so ordinary browsing reads cool and only real downloads/streaming climb toward hot.
+    const intensityOf = (bps) => Math.max(0, Math.min(1, Math.log10(1 + bps / 1500) / Math.log10(1 + 3e7 / 1500)));
+
+    function histFor(kind, ip) {
+      const key = kind + ":" + ip;
+      let h = hist.get(key);
+      if (!h) { h = { up: 0, down: 0, active: 0, idle: 0, duration: 0, lastSeen: 0 }; hist.set(key, h); }
+      return h;
+    }
+    // runs once per real server tick (never per redraw/filter-change call): eases each candidate's
+    // rate and tracks how long it's stayed above the floor, so a single noisy sample can't make a
+    // link's width, particle count or on-screen rank jump, and heat reflects sustained use, not a blip
+    function ingest(tr, now) {
+      const dt = lastIngestT ? Math.min(5, Math.max(0.1, (now - lastIngestT) / 1000)) : 1;
+      lastIngestT = now;
+      const seen = new Set(), floor = 1500, a = 1 - Math.exp(-dt / 2.5);
+      const step = (kind, x) => {
+        const key = kind + ":" + x.ip;
+        seen.add(key);
+        const h = histFor(kind, x.ip);
+        h.up += ((x.up || 0) - h.up) * a; h.down += ((x.down || 0) - h.down) * a;
+        if (h.up + h.down > floor) { if (!h.active) h.active = now; h.idle = 0; }
+        else { if (!h.idle) h.idle = now; if (now - h.idle > 5000) h.active = 0; }
+        h.duration = h.active ? (now - h.active) / 1000 : 0;
+        h.lastSeen = now;
+      };
+      tr.peers.forEach((x) => step("peer", x));
+      tr.hosts.forEach((x) => step("host", x));
+      for (const [key, h] of hist) if (!seen.has(key) && now - h.lastSeen > 30000) hist.delete(key);
+    }
 
     function update(s) {
       snap = s;
       const tr = s.traffic;
+      const now = performance.now();
+      if (s !== lastSnap) { ingest(tr, now); lastSnap = s; }
       const seen = new Set();
-      const pick = (list, n) => {
-        const top = list.slice(0, n);
+      // top-N by smoothed rate, with a margin for whatever's already shown: a newcomer has to beat
+      // the weakest incumbent by >25%, not just edge past it for one noisy tick, so the map doesn't
+      // shuffle its layout every second over rates that are effectively tied
+      const pick = (list, kind, n) => {
+        const shown = new Set();
+        for (const nd of nodes.values()) if (nd.kind === kind && !nd.dead) shown.add(nd.ip);
+        const scored = list.map((x) => { const h = histFor(kind, x.ip); return { x, rate: h.up + h.down, was: shown.has(x.ip) }; });
+        scored.sort((a, b) => (b.rate * (b.was ? 1 : 0.8)) - (a.rate * (a.was ? 1 : 0.8)));
+        const top = scored.slice(0, n).map((e) => e.x);
+        const topIps = new Set(top.map((x) => x.ip));
         // anything under suspicion is always on the map, even if it's quiet
-        list.slice(n).forEach((x) => { if (x.threat && top.length < n + 2) top.push(x); });
+        scored.forEach((e) => { if (e.x.threat && !topIps.has(e.x.ip) && top.length < n + 2) { top.push(e.x); topIps.add(e.x.ip); } });
         return top;
       };
       const fit = Math.max(4, Math.floor((H - 90) / 30) + 1);  // two-line labels need ~30px each
@@ -100,7 +159,7 @@ const TrafficMap = (() => {
         if (lan) { hosts = [me]; peers = others; } else { peers = [Object.assign({}, me, { hosts: paths.map((x) => x.ip) })]; hosts = others; }
         shown = n;
       } else {
-        peers = pick(tr.peers, Math.min(opts.peers, fit)); hosts = pick(tr.hosts, Math.min(opts.hosts, fit));
+        peers = pick(tr.peers, "peer", Math.min(opts.peers, fit)); hosts = pick(tr.hosts, "host", Math.min(opts.hosts, fit));
       }
       banner.innerHTML = opts.singleOut ? Select.banner(shown) : "";
       banner.classList.toggle("hidden", !Select.ip || !opts.singleOut);
@@ -109,13 +168,19 @@ const TrafficMap = (() => {
         seen.add(id);
         let n = nodes.get(id);
         if (!n) {
-          n = { id, kind, ip: x.ip, x: router.x, y: router.y, alpha: 0, r: 4, acc: { in: 0, out: 0 } };
+          n = { id, kind, ip: x.ip, x: router.x, y: router.y, alpha: 0, r: 4, lw: 0.6, acc: { in: 0, out: 0 } };
           nodes.set(id, n);
         }
+        const h = histFor(kind, x.ip);
         Object.assign(n, { label: x.name || x.ip, name: x.name, up: x.up, down: x.down, conns: x.conns, threat: x.threat || "",
           blocked: !!x.blocked, peers: x.peers, hosts: x.hosts, ports: x.ports, talpha: 1, dead: false,
-          cats: x.cats || {}, cat: x.cat || "other", pinned: !!x.pinned || Pins.has(x.ip), sel: x.ip === Select.ip, idle: !!x.idle });
-        n.tr = radius(rate(n));
+          cats: x.cats || {}, cat: x.cat || "other", pinned: !!x.pinned || Pins.has(x.ip), sel: x.ip === Select.ip, idle: !!x.idle,
+          sup: h.up, sdown: h.down, duration: h.duration });
+        const sr = srate(n);
+        n.tr = radius(sr);
+        n.tlw = 0.6 + Math.min(4, Math.log10(1 + sr / 1e4));
+        n.intensity = intensityOf(sr);
+        n.glow = Math.max(0, Math.min(1, n.duration / 30));  // "how long has this been busy" -> halo size
       };
       peers.forEach((p) => add("peer", p));
       hosts.forEach((h) => add("host", h));
@@ -139,13 +204,17 @@ const TrafficMap = (() => {
       // evenly spaced columns that bow toward the router, leaving room for the labels outside
       const R = narrow() ? W / 2 - 24 : Math.max(110, Math.min(VW * 0.36, VW / 2 - 185));
       const place = (kind, side) => {
-        // pinned devices at the top of their column, then the busiest
-        const list = [...nodes.values()].filter((n) => n.kind === kind && !n.dead)
-          .sort((a, b) => (b.pinned - a.pinned) || rate(b) - rate(a));
+        // pinned devices at the top of their column, then the busiest (by smoothed rate, so two
+        // nodes with near-identical traffic don't keep swapping slots tick to tick). A node that just
+        // dropped off the top-N still holds its slot while it fades, so the column settles once when
+        // it's actually gone rather than reflowing the instant it's no longer picked and again as it fades.
+        const list = [...nodes.values()].filter((n) => n.kind === kind && (!n.dead || n.alpha > 0.02))
+          .sort((a, b) => (b.pinned - a.pinned) || srate(b) - srate(a));
         const n = list.length;
         const gap = n > 1 ? Math.min(48, (H - 90) / (n - 1)) : 0;
         const y0 = H / 2 - (gap * (n - 1)) / 2;
         list.forEach((node, i) => {
+          if (node.dead) return;  // frozen at its last position while it fades out
           node.ty = y0 + i * gap;
           const rel = (node.ty - H / 2) / (H / 2);
           node.tx = router.x + side * R * (1 - 0.3 * rel * rel);
@@ -176,11 +245,15 @@ const TrafficMap = (() => {
       if (last && now - last < 15) return;  // ~60 fps cap (high-refresh screens would draw 2x for nothing)
       const dt = Math.min(0.1, last ? (now - last) / 1000 : 0.016);
       last = now;
-      // ease nodes
-      const k = 1 - Math.pow(0.002, dt);
+      // ease nodes. Time constants close to the ~1s tick interval, not a fraction of it: the old
+      // 1-0.002^dt covered ~95% of the distance in half a second, so everything sprinted to its new
+      // target and then sat still for the rest of each tick -- a lurch-and-hold rhythm that reads as
+      // stutter even though the motion itself was eased. Staying mid-motion through the whole tick looks smoother.
+      const kPos = 1 - Math.exp(-dt / 0.9), kFast = 1 - Math.exp(-dt / 0.5);
       for (const [id, n] of nodes) {
-        n.x += (n.tx - n.x) * k; n.y += (n.ty - n.y) * k;
-        n.r += (n.tr - n.r) * k; n.alpha += (n.talpha - n.alpha) * k;
+        n.x += (n.tx - n.x) * kPos; n.y += (n.ty - n.y) * kPos;
+        n.r += (n.tr - n.r) * kFast; n.alpha += (n.talpha - n.alpha) * kFast;
+        n.lw += ((n.tlw == null ? n.lw : n.tlw) - n.lw) * kFast;
         if (n.dead && n.alpha < 0.02) nodes.delete(id);
       }
       spawn(dt);
@@ -193,7 +266,9 @@ const TrafficMap = (() => {
       for (const n of nodes.values()) {
         if (n.dead || n.blocked) continue;
         for (const dir of ["in", "out"]) {
-          const bps = dir === "in" ? n.down : n.up;
+          // smoothed, not the raw per-tick sample: otherwise particle bursts/droughts follow every
+          // noisy reading instead of the underlying flow
+          const bps = dir === "in" ? n.sdown : n.sup;
           if (!bps || bps < 400) continue;
           const per = Math.min(16, Math.log10(1 + bps / 1e3) * 2.4) * density;
           n.acc[dir] += per * dt;
@@ -238,12 +313,25 @@ const TrafficMap = (() => {
       for (let x = 20; x < W; x += 28) for (let y = 34; y < H; y += 28) ctx.fillRect(x, y, 1, 1);
 
       // links
+      const heatOn = Types.by === "heat";
       for (const n of nodes.values()) {
         const rel = related(n);
         const c = curve(n, 0);
-        const w = 0.6 + Math.min(4, Math.log10(1 + rate(n) / 1e4));
-        ctx.globalAlpha = n.alpha * (rel && focusOK(n) ? (hover && hover !== router ? 0.75 : byType() ? 0.42 : 0.32) : 0.08);
-        ctx.strokeStyle = n.threat ? colors.crit : n.blocked ? colors.faint : byType() ? Types.color(n.cat) : colors.line;
+        const w = n.lw;
+        const baseAlpha = n.alpha * (rel && focusOK(n) ? (hover && hover !== router ? 0.75 : byType() ? 0.42 : 0.32) : 0.08);
+        if (heatOn && !lite() && !n.blocked && n.glow > 0.04) {
+          // a soft halo under the line, not a per-frame shadowBlur: its width/opacity track how long
+          // this link has stayed busy (duration), so a flow that's been steady for a while visibly
+          // glows while a brief spike -- same instantaneous colour -- doesn't
+          ctx.globalAlpha = baseAlpha * n.glow * 0.5;
+          ctx.strokeStyle = heatColor(n.intensity);
+          ctx.lineWidth = w + 2 + n.glow * 9;
+          ctx.setLineDash([]);
+          ctx.beginPath(); ctx.moveTo(c[0], c[1]); ctx.quadraticCurveTo(c[2], c[3], c[4], c[5]); ctx.stroke();
+        }
+        ctx.globalAlpha = baseAlpha;
+        ctx.strokeStyle = n.threat ? colors.crit : n.blocked ? colors.faint
+          : heatOn ? heatColor(n.intensity) : byType() ? Types.color(n.cat) : colors.line;
         ctx.lineWidth = w;
         ctx.setLineDash(n.blocked ? [4, 5] : []);
         ctx.beginPath(); ctx.moveTo(c[0], c[1]); ctx.quadraticCurveTo(c[2], c[3], c[4], c[5]); ctx.stroke();
@@ -271,7 +359,15 @@ const TrafficMap = (() => {
         const rel = related(n) && focusOK(n);
         ctx.globalAlpha = n.alpha * (rel ? 1 : 0.3);
         const col = n.threat ? (n.threat === "critical" || n.threat === "high" ? colors.crit : colors.med)
-          : n.blocked ? colors.faint : byType() ? Types.color(n.cat) : n.kind === "peer" ? colors.in : colors.accent;
+          : n.blocked ? colors.faint : byType() ? Types.color(n.cat)
+          : heatOn ? heatColor(n.intensity) : n.kind === "peer" ? colors.in : colors.accent;
+        if (heatOn && !lite() && !n.blocked && n.glow > 0.04) {
+          ctx.strokeStyle = heatColor(n.intensity);
+          ctx.globalAlpha = n.alpha * n.glow * 0.5;
+          ctx.lineWidth = 3 + n.glow * 6;
+          ctx.beginPath(); ctx.arc(n.x, n.y, n.r + 4 + n.glow * 5, 0, Math.PI * 2); ctx.stroke();
+          ctx.globalAlpha = n.alpha * (rel ? 1 : 0.3);
+        }
         if (n.threat && motion() !== "off") {
           const ph = (t * 1.2) % 1;
           ctx.strokeStyle = colors.crit;
@@ -376,6 +472,7 @@ const TrafficMap = (() => {
         ? `talking to ${(n.hosts || []).length} LAN host${(n.hosts || []).length === 1 ? "" : "s"}${n.ports && n.ports.length ? " · ports " + n.ports.join(", ") : ""}`
         : `${n.peers || 0} Internet peer${n.peers === 1 ? "" : "s"} · ${n.conns || 0} conns`;
       tip.show(`<b>${esc(n.label)}</b>${n.name ? `<span class="mono muted">${esc(n.ip)}</span><br>` : ""}<span class="in">↓ ${fmt.bps(n.down)}</span> · <span class="out">↑ ${fmt.bps(n.up)}</span><br><span class="muted">${esc(extra)}</span>` +
+        (n.duration > 4 ? `<br><span class="muted">busy for ${fmt.dur(n.duration)}</span>` : "") +
         Types.mixHtml(n.cats) +
         (n.threat ? `<br><span style="color:var(--crit)">⚠ ${esc(n.threat)} threat</span>` : "") + (n.blocked ? '<br><span class="muted">blocked by MCC</span>' : "") +
         (n.pinned ? '<br><span class="muted">pinned</span>' : "") + `<br><span class="faint">${!opts.singleOut ? "click for details" : n.sel ? "singled out" : "click to single it out"}</span>`, e.clientX, e.clientY);
@@ -396,7 +493,8 @@ const TrafficMap = (() => {
     raf = requestAnimationFrame(frame);
     // for the UI checks: where each device is drawn, and what is pinned / singled out
     const stats = () => ({ parts: parts.length, nodes: [...nodes.values()].filter((n) => !n.dead)
-      .map((n) => ({ ip: n.ip, kind: n.kind, x: n.x, y: n.y, sel: !!n.sel, pinned: !!n.pinned })) });
+      .map((n) => ({ ip: n.ip, kind: n.kind, x: n.x, y: n.y, sel: !!n.sel, pinned: !!n.pinned,
+        intensity: n.intensity || 0, busyFor: n.duration || 0 })) });
     return { update, destroy, stats };
   }
   return { create, SEV_RANK };

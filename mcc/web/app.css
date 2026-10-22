@@ -162,6 +162,7 @@ table.t tr.sel td { background: oklch(from var(--accent) l c h / 0.08); }
 .map-legend { position: absolute; left: 12px; bottom: 10px; display: flex; gap: 12px; font-size: 11px; color: var(--muted);
               background: oklch(from var(--bg) l c h / 0.6); padding: 4px 9px; border-radius: 8px; pointer-events: none; }
 .map-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: 0; }
+.map-legend .heat-grad i { width: 36px; height: 7px; border-radius: 4px; vertical-align: -1px; }
 .map-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); text-align: center; padding: 20px; }
 
 /* charts */

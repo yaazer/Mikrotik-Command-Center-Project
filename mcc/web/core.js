@@ -228,6 +228,11 @@ const Types = {
   },
   /* the legend shown over the map / globe: types present, clickable to focus */
   legend(types) {
+    if (this.by === "heat") {
+      return '<span class="heat-grad" title="Colour is how big the link\'s smoothed rate is; the glow is how long it\'s stayed busy">' +
+        '<i style="background:linear-gradient(90deg,oklch(0.58 0.1 245),oklch(0.65 0.18 140),oklch(0.72 0.23 30))"></i>quiet → sustained & heavy</span>' +
+        '<span><i style="background:var(--crit)"></i>threat</span>';
+    }
     if (this.by !== "type") {
       return '<span><i style="background:var(--in)"></i>download</span><span><i style="background:var(--out)"></i>upload</span><span><i style="background:var(--crit)"></i>threat</span>';
     }

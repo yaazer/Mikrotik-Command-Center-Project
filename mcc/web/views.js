@@ -336,7 +336,7 @@ VIEWS.overview = {
       <div class="kpis" id="kpis"></div>
       <div class="grid">
         <section class="panel s8" data-pid="overview:live"><header><h2>Live traffic</h2><span class="grow"></span><span class="hint" id="map-src"></span>
-          <div class="seg color-by" title="Colour the traffic by type or by direction"><button data-by="type">Type</button><button data-by="direction">Direction</button></div>
+          <div class="seg color-by" title="Colour the traffic by type, by direction, or by how intense and sustained it's been"><button data-by="type">Type</button><button data-by="direction">Direction</button><button data-by="heat">Heat</button></div>
           <div class="seg" id="live-kind"><button data-k="globe">Globe</button><button data-k="map">Flow map</button></div></header>
           <div id="live" class="globe-wrap"></div></section>
         <section class="panel s4"><header><h2>Threat feed</h2><span class="grow"></span><a class="hint" href="#/threats">all threats →</a></header><div class="feed" id="feed" style="height:470px"></div></section>
@@ -446,7 +446,7 @@ VIEWS.traffic = {
     this.q = "";
     m.innerHTML = `${connectBanner()}${telemetryNudge()}
       <div class="grid">
-        <section class="panel s12"><header><h2>Traffic map</h2><span class="grow"></span><span class="hint" id="t-src"></span><div class="seg color-by" title="Colour the traffic by type or by direction"><button data-by="type">Type</button><button data-by="direction">Direction</button></div></header>
+        <section class="panel s12"><header><h2>Traffic map</h2><span class="grow"></span><span class="hint" id="t-src"></span><div class="seg color-by" title="Colour the traffic by type, by direction, or by how intense and sustained it's been"><button data-by="type">Type</button><button data-by="direction">Direction</button><button data-by="heat">Heat</button></div></header>
           <div class="map-wrap tall" id="map"><div class="map-legend type-legend"></div></div></section>
         <section class="panel s8" data-pid="traffic:globe"><header><h2>Where it goes</h2><span class="grow"></span><span class="hint" id="g-src"></span></header>
           <div class="globe-wrap" id="globe"></div></section>
@@ -815,7 +815,7 @@ VIEWS.lan = {
       <div class="kpis" id="lan-kpis"></div>
       <div class="grid">
         <section class="panel s8" data-pid="lan:map"><header><h2>Device to device</h2><span class="grow"></span><span class="hint" id="lan-src"></span>
-          <div class="seg color-by" title="Colour the traffic by type or by direction"><button data-by="type">Type</button><button data-by="direction">Direction</button></div></header>
+          <div class="seg color-by" title="Colour the traffic by type, by direction, or by how intense and sustained it's been"><button data-by="type">Type</button><button data-by="direction">Direction</button><button data-by="heat">Heat</button></div></header>
           <div class="map-wrap" id="lan-map"><div class="map-legend type-legend"></div></div></section>
         <section class="panel s4" data-pid="lan:services"><header><h2>Services on the LAN</h2><span class="grow"></span><span class="hint">what devices serve each other</span></header>
           <div class="body flush scroll" style="max-height:470px" id="lan-services"></div></section>
@@ -987,7 +987,7 @@ VIEWS.vpn = {
       <div class="kpis" id="vpn-kpis"></div>
       <div class="grid">
         <section class="panel s8" data-pid="vpn:map"><header><h2>Through the tunnel</h2><span class="grow"></span><span class="hint" id="vpn-src"></span>
-          <div class="seg color-by" title="Colour the traffic by type or by direction"><button data-by="type">Type</button><button data-by="direction">Direction</button></div></header>
+          <div class="seg color-by" title="Colour the traffic by type, by direction, or by how intense and sustained it's been"><button data-by="type">Type</button><button data-by="direction">Direction</button><button data-by="heat">Heat</button></div></header>
           <div class="map-wrap" id="vpn-map"><div class="map-legend type-legend"></div></div></section>
         <section class="panel s4" data-pid="vpn:tunnels"><header><h2>Tunnels</h2></header><div class="body scroll" style="max-height:470px" id="vpn-tunnels"></div></section>
         <section class="panel s8" data-pid="vpn:chart"><header><h2>VPN throughput</h2><span class="grow"></span><span class="legend"><span><i style="background:var(--in)"></i>into the LAN</span><span><i style="background:var(--out)"></i>out through the tunnel</span></span></header>
