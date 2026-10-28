@@ -74,6 +74,18 @@ function vpnChip(via) {
   const names = vpnNames(), hit = vias.filter((v) => names.has(v));
   return hit.length ? ` <span class="pill vpn" title="through the VPN tunnel ${esc(hit.join(", "))}">VPN</span>` : "";
 }
+/* qBittorrent torrent states (mcc/qbt.py passes the raw state straight through) */
+const QBT_STATE = {
+  downloading: ["blue", "downloading"], metaDL: ["blue", "fetching metadata"], forcedDL: ["blue", "downloading"],
+  stalledDL: ["amber", "stalled"], queuedDL: ["", "queued"], checkingDL: ["", "checking"],
+  pausedDL: ["", "paused"], stoppedDL: ["", "paused"],
+  uploading: ["green", "seeding"], stalledUP: ["amber", "stalled"], forcedUP: ["green", "seeding"],
+  queuedUP: ["", "queued"], checkingUP: ["", "checking"], pausedUP: ["", "completed"], stoppedUP: ["", "completed"],
+  checkingResumeData: ["", "checking"], moving: ["", "moving"], error: ["red", "error"],
+  missingFiles: ["red", "missing files"], unknown: ["", "unknown"],
+};
+function qbtState(s) { return QBT_STATE[s] || ["", s || "unknown"]; }
+function qbtPaused(s) { return /^(paused|stopped)/i.test(s || ""); }
 function sumSeries(names) {
   const rows = names.map((n) => S.hist.ifaces[n] || []).filter((r) => r.length);
   if (!rows.length) return [[], []];
@@ -999,10 +1011,20 @@ VIEWS.vpn = {
           <div class="body flush scroll" style="max-height:440px" id="vpn-pairs"></div></section>
         <section class="panel s6" data-pid="vpn:outside"><header><h2>Outside the tunnel</h2><span class="grow"></span><span class="hint">direct traffic from VPN devices</span></header>
           <div class="body flush scroll" style="max-height:440px" id="vpn-outside"></div></section>
+        <section class="panel s12" data-pid="vpn:torrents"><header><h2>Torrent downloads</h2><span class="grow"></span>
+          <span class="pill" id="qbt-chip">—</span>
+          <label class="check" style="margin:0 10px 0 14px"><input type="checkbox" id="qbt-all"> seeding &amp; completed too</label>
+          <div class="btnrow"><button class="btn sm ghost" type="button" id="qbt-pause-all" title="Pause every torrent shown below">${ICON.pause} Pause shown</button>
+          <button class="btn sm ghost" type="button" id="qbt-resume-all" title="Resume every torrent shown below">${ICON.play} Resume shown</button>
+          <a class="btn sm ghost" href="#/setup">qBittorrent connection…</a></div></header>
+          <div class="body flush scroll" style="max-height:420px" id="vpn-torrents"></div></section>
         <section class="panel s12" data-pid="vpn:settings"><header><h2>VPN settings</h2></header><div class="body" id="vpn-settings"></div></section>
       </div>`;
     this.map = TrafficMap.create($("#vpn-map", m), { peers: 16, hosts: 12 });
     $("#vpn-q", m).oninput = (e) => { this.q = e.target.value.toLowerCase(); this.tick(); };
+    $("#qbt-all", m).onchange = (e) => { this.qbtAll = e.target.checked; this.tick(); };
+    $("#qbt-pause-all", m).onclick = () => this.bulkTorrents(true);
+    $("#qbt-resume-all", m).onclick = () => this.bulkTorrents(false);
     this.drawSettings();
     this.tick();
   },
@@ -1054,6 +1076,48 @@ VIEWS.vpn = {
     Live.set($("#vpn-pairs"), this.pairsHtml(rows, false, required, "No conversations through the tunnel right now."), bindRows);
     Live.set($("#vpn-outside"), this.pairsHtml(tv.outside, true, required,
       "Nothing from these devices is going around the tunnel."), bindRows);
+    const qst = s.status.qbt || { state: "off", count: 0 };
+    const chip = $("#qbt-chip");
+    if (chip) {
+      chip.className = "pill " + (qst.state === "ok" ? (qst.stale ? "amber" : "green") : qst.state === "error" ? "red" : "");
+      chip.textContent = qst.state === "ok" ? `${qst.count} torrent${qst.count === 1 ? "" : "s"}`
+        : qst.state === "error" ? "qBittorrent error" : "qBittorrent: not connected";
+    }
+    Live.set($("#vpn-torrents"), this.torrentsHtml(s.torrents || [], !!this.qbtAll), (el) => this.bindTorrentRows(el));
+  },
+  torrentsHtml(all, showAll) {
+    const rows = showAll ? all : all.filter((t) => t.progress < 1);
+    this._qbtShown = rows.map((t) => t.hash);
+    if (!all.length) return '<div class="empty"><b>No torrents yet.</b>Connect qBittorrent in <a href="#/setup">Setup</a> to see active downloads here.</div>';
+    if (!rows.length) return '<div class="empty">Nothing downloading right now.<br><span class="faint">Tick "seeding &amp; completed too" to see the rest.</span></div>';
+    return `<table class="t"><thead><tr><th>Name</th><th>Status</th><th style="width:160px">Progress</th><th class="r">↓</th><th class="r">↑</th><th class="r">ETA</th><th class="r">Ratio</th><th></th></tr></thead><tbody>
+      ${rows.map((t) => {
+        const [cls, label] = qbtState(t.state), paused = qbtPaused(t.state), pct = Math.min(100, Math.round(t.progress * 100));
+        return `<tr><td><div class="who"><b>${esc(t.name)}</b>${t.category ? `<span>${esc(t.category)}</span>` : ""}</div></td>
+          <td><span class="pill ${cls}">${esc(label)}</span></td>
+          <td><div class="share"><i style="width:${pct}%"></i></div><span class="faint num" style="font-size:11.5px">${pct}%</span></td>
+          <td class="r num in">${t.dlspeed ? fmt.bytes(t.dlspeed) + "/s" : ""}</td>
+          <td class="r num out">${t.upspeed ? fmt.bytes(t.upspeed) + "/s" : ""}</td>
+          <td class="r num">${t.eta == null ? "∞" : fmt.dur(t.eta)}</td>
+          <td class="r num">${t.ratio.toFixed(2)}</td>
+          <td class="r"><button class="btn sm" data-qbt="${esc(t.hash)}" data-pause="${paused ? 0 : 1}" title="${paused ? "Resume" : "Pause"}">${paused ? ICON.play : ICON.pause}</button></td></tr>`;
+      }).join("")}</tbody></table>`;
+  },
+  bindTorrentRows(el) {
+    $$("[data-qbt]", el).forEach((b) => (b.onclick = async () => {
+      const hash = b.dataset.qbt, pause = b.dataset.pause === "1";
+      b.disabled = true;
+      try { await api.post(pause ? "/api/torrents/pause" : "/api/torrents/resume", { hashes: [hash] }); }
+      catch (err) { toast(pause ? "Not paused" : "Not resumed", err.message, { bad: true }); b.disabled = false; }
+    }));
+  },
+  async bulkTorrents(pause) {
+    const hashes = this._qbtShown || [];
+    if (!hashes.length) return toast("Nothing to " + (pause ? "pause" : "resume"), "", {});
+    try {
+      await api.post(pause ? "/api/torrents/pause" : "/api/torrents/resume", { hashes });
+      toast(pause ? "Paused" : "Resumed", `${hashes.length} torrent${hashes.length === 1 ? "" : "s"}`, { good: true });
+    } catch (err) { toast(pause ? "Not paused" : "Not resumed", err.message, { bad: true }); }
   },
   tunnelsHtml(tunnels) {
     if (!tunnels.length) return '<div class="empty">No tunnel interfaces.</div>';
@@ -1557,6 +1621,7 @@ VIEWS.setup = {
           It can read everything and change firewall/interface settings — what MCC needs to act — but can't log in interactively, reboot or manage users. Restricting it to this PC's address limits damage if the password leaks.</details>
       </div></section>
       <section class="panel s6" data-pid="setup:switches"><header><h2>Switches</h2><span class="grow"></span><span class="hint">read-only · as many as you have</span></header><div class="body" id="sw-panel">${this.switchesPanel()}</div></section>
+      <section class="panel s6" data-pid="setup:qbt"><header><h2>qBittorrent</h2><span class="grow"></span>${this.stateChip(st.qbt && st.qbt.state === "off" ? "disconnected" : (st.qbt || {}).state || "disconnected")}</header><div class="body" id="qbt-panel"></div></section>
 
       <section class="panel s12"><header><h2>Telemetry from the router</h2><span class="grow"></span><span class="hint">nothing changes until you approve</span></header><div class="body" id="plan">
         ${connected() ? '<div class="btnrow"><button class="btn primary" id="plan-load">Review the router changes MCC needs</button><button class="btn ghost" id="plan-remove">Plan removal of everything MCC added…</button></div>' : '<div class="note">Connect the router first.</div>'}
@@ -1573,6 +1638,7 @@ VIEWS.setup = {
     this.drawCollectors();
     this.drawGeo();
     this.drawIdent();
+    this.drawQbtPanel();
   },
   /* your switches, and a form to add one or to connect / edit one of them */
   switchesPanel() {
@@ -1658,6 +1724,57 @@ VIEWS.setup = {
         this.swForm = null;
         setTimeout(redraw, 300);
       } catch (err) { btn.disabled = false; toast(f.mode === "edit" ? "Not saved" : "Couldn't reach the switch", err.message, { bad: true, ms: 12000 }); }
+    };
+  },
+  /* qBittorrent: one connection, read from the VPN page's Torrent downloads panel */
+  qbtPanelHtml() {
+    const st = (S.snap && S.snap.status.qbt) || { state: "off" };
+    const c = S.config.qbt || {};
+    if (st.state === "ok" && !this.qbtEditing) {
+      return `<div class="note" style="display:flex;align-items:center;gap:10px">
+        Connected at <b class="mono">${esc(c.host)}:${esc(c.port || 8080)}</b> as <b>${esc(c.user || "")}</b> · ${st.count} torrent${st.count === 1 ? "" : "s"}<span class="grow"></span>
+        <button class="btn sm ghost" type="button" id="qbt-change">Change</button>
+        <button class="btn sm" type="button" id="qbt-off">Disconnect</button></div>`;
+    }
+    return `<form class="form" id="f-qbt" autocomplete="off">
+      <label for="q-host">Address</label><input type="text" id="q-host" value="${esc(c.host || "")}" placeholder="192.168.88.10" required>
+      <label for="q-port">Port</label><input type="number" id="q-port" value="${esc(c.port || 8080)}" style="max-width:120px">
+      <label for="q-scheme">Protocol</label><select id="q-scheme"><option value="http" ${c.scheme !== "https" ? "selected" : ""}>HTTP</option><option value="https" ${c.scheme === "https" ? "selected" : ""}>HTTPS</option></select>
+      <label for="q-user">User</label><input type="text" id="q-user" value="${esc(c.user || "")}">
+      <label for="q-pass">Password</label><input type="password" id="q-pass" placeholder="kept in memory only">
+      <span></span><div class="btnrow"><button class="btn primary" type="submit">Connect</button>${st.state === "ok" ? '<button class="btn ghost" type="button" id="qbt-cancel">Cancel</button>' : ""}</div>
+      ${st.state === "error" ? `<span></span><div class="callout bad">${esc(st.error)}</div>` : ""}
+      <span></span><div class="note">Its WebUI address, port and login (Tools → Options → Web UI in qBittorrent). The password is kept in memory only, same as the router.</div></form>`;
+  },
+  drawQbtPanel() {
+    const el = $("#qbt-panel");
+    if (!el) return;
+    el.innerHTML = this.qbtPanelHtml();
+    const change = $("#qbt-change", el);
+    if (change) change.onclick = () => { this.qbtEditing = true; this.drawQbtPanel(); };
+    const cancel = $("#qbt-cancel", el);
+    if (cancel) cancel.onclick = () => { this.qbtEditing = false; this.drawQbtPanel(); };
+    const off = $("#qbt-off", el);
+    if (off) off.onclick = async () => {
+      try { await api.post("/api/disconnect", { what: "qbt" }); toast("qBittorrent disconnected", "", {}); }
+      catch (err) { toast("Not disconnected", err.message, { bad: true }); }
+      this.qbtEditing = true;
+      setTimeout(() => this.drawQbtPanel(), 300);
+    };
+    const form = $("#f-qbt", el);
+    if (!form) return;
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const btn = $("button[type=submit]", form);
+      btn.disabled = true;
+      try {
+        const res = await api.post("/api/connect/qbt", { qbt: { host: $("#q-host").value, port: +$("#q-port").value || 0,
+          scheme: $("#q-scheme").value, user: $("#q-user").value, password: $("#q-pass").value } });
+        S.config = (await api.get("/api/state")).config;
+        this.qbtEditing = false;
+        toast("qBittorrent connected", `${res.count} torrent${res.count === 1 ? "" : "s"}`, { good: true });
+        this.drawQbtPanel();
+      } catch (err) { btn.disabled = false; toast("Couldn't connect", err.message, { bad: true, ms: 12000 }); }
     };
   },
   stateChip(s) {

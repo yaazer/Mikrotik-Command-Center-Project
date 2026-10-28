@@ -15,6 +15,7 @@ import json
 import mimetypes
 import os
 import queue
+import re
 import secrets
 import socket
 import sys
@@ -27,9 +28,12 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from .actions import ActionError
 from .config import DEFAULTS
+from .qbt import QbtError
 from .routeros import RouterOSError
 from .swos import SwOSError
 from .util import ip_obj, parse_networks
+
+TORRENT_HASH = re.compile(r"^[0-9a-f]{40}$|^[0-9a-f]{64}$")
 
 WEB = Path(__file__).resolve().parent / "web"
 
@@ -188,7 +192,7 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840, token: Opti
                 return self._static(path, extra)
             except ApiError as e:
                 self._json(e.status, {"error": e.message})
-            except (RouterOSError, SwOSError, ActionError) as e:
+            except (RouterOSError, SwOSError, QbtError, ActionError) as e:
                 self._json(409, {"error": str(e)})
 
         def do_POST(self) -> None:
@@ -216,7 +220,7 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840, token: Opti
                 return self._json(200, api_post(url.path, body))
             except ApiError as e:
                 self._json(e.status, {"error": e.message})
-            except (RouterOSError, SwOSError, ActionError) as e:
+            except (RouterOSError, SwOSError, QbtError, ActionError) as e:
                 self._json(409, {"error": str(e)})
             except (KeyError, TypeError, ValueError) as e:
                 self._json(400, {"error": "bad request: {}".format(e)})
@@ -328,14 +332,31 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840, token: Opti
             return hub.connect_switch(str(s["host"]), str(s.get("user") or "admin"), str(s.get("password") or ""),
                                       str(s.get("scheme") or "http"), str(s.get("kind") or "auto"), sid,
                                       None if s.get("name") is None else str(s["name"]))
+        if path == "/api/connect/qbt":
+            q = b.get("qbt") or {}
+            if not q.get("host"):
+                raise ApiError(400, "qBittorrent address required")
+            return hub.connect_qbt(str(q["host"]), str(q.get("user") or ""), str(q.get("password") or ""),
+                                   str(q.get("scheme") or "http"), int(q.get("port") or 0))
         if path == "/api/disconnect":
             if b.get("what") == "switch":
                 try:
                     hub.disconnect_switch(str(b.get("id") or ""))
                 except KeyError:
                     raise ApiError(404, "no such switch")
+            elif b.get("what") == "qbt":
+                hub.disconnect_qbt()
             else:
                 hub.disconnect_router()
+            return {"ok": True}
+        if path in ("/api/torrents/pause", "/api/torrents/resume"):
+            hashes = [str(h).strip().lower() for h in b.get("hashes") or []]
+            if not hashes:
+                raise ApiError(400, "no torrents given")
+            bad = [h for h in hashes if not TORRENT_HASH.match(h)]
+            if bad:
+                raise ApiError(400, "not a torrent hash: {}".format(", ".join(bad[:5])))
+            hub.set_torrents(hashes, pause=path.endswith("pause"))
             return {"ok": True}
         if len(parts) in (3, 4) and parts[:2] == ["api", "switches"]:
             sid = parts[2]

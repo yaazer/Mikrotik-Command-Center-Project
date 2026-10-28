@@ -45,7 +45,7 @@ It prints the console URL, `http://<vm-ip>:8840/?token=…`. Open it from your d
 
 **Reconnecting after a reboot.** MCC keeps passwords in memory only, so after a restart you'd enter them again in Setup. To have the service reconnect on its own:
 1. Connect once from Setup; that saves the address and user.
-2. Put the password in `/etc/mcc/mcc.env` (`MCC_ROUTER_PASSWORD=…`, `MCC_SWITCH_PASSWORD=…`). The file is root-only. `MCC_SWITCH_PASSWORD` is used for every switch; if your switches have different passwords, set `MCC_SWITCH_PASSWORD_SW2=…` (by the id Setup shows) for that one.
+2. Put the password in `/etc/mcc/mcc.env` (`MCC_ROUTER_PASSWORD=…`, `MCC_SWITCH_PASSWORD=…`, `MCC_QBT_PASSWORD=…`). The file is root-only. `MCC_SWITCH_PASSWORD` is used for every switch; if your switches have different passwords, set `MCC_SWITCH_PASSWORD_SW2=…` (by the id Setup shows) for that one.
 3. Run `systemctl restart mcc`.
 
 MCC itself still never writes a password. Use a dedicated, limited RouterOS user for this. A wrong password is tried once, not retried, so the account doesn't get locked.
@@ -326,6 +326,8 @@ The **VPN** page shows everything going through your VPN tunnel(s), and nothing 
 - **Live connection table only:** the path comes from the live connection table, not from flow records.
 - **Policy-based IPsec:** this has no tunnel interface, so it isn't shown.
 - **No NAT on the tunnel:** a site-to-site tunnel without NAT is recognised only for addresses inside the tunnel's own subnet.
+
+**Torrent downloads:** the same VPN page can show qBittorrent's active torrents — connect it below the list (its WebUI address, user and password; the password stays in memory only, same as the router). Each row shows progress, down/up speed, ETA and ratio, with a Pause/Resume button; "Pause shown"/"Resume shown" act on whatever the "seeding & completed too" toggle currently has visible. MCC talks to qBittorrent's WebUI API directly (v4.x's `pause`/`resume` or 5.0's `stop`/`start`, detected automatically) and never touches your router for this. Reconnect it after a restart the same way as the router, or set `MCC_QBT_PASSWORD` (plus `MCC_QBT_HOST` if it hasn't been connected from the console yet).
 
 ## Singling out a device, and pinning
 

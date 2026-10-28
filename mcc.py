@@ -9,6 +9,7 @@ On a server (see deploy/), settings can come from the environment instead of fla
     MCC_TOKEN                        a fixed access token, so the console URL survives restarts
     MCC_ROUTER_PASSWORD              optional: reconnect to the router (host/user from Setup) at start
     MCC_SWITCH_PASSWORD              optional: the same for your switches (MCC_SWITCH_PASSWORD_SW2: just that one)
+    MCC_QBT_PASSWORD                 optional: the same for qBittorrent (host/user from Setup, or MCC_QBT_HOST/_USER)
 
 Python 3.8+ standard library only. Passwords are kept in memory and never written to disk.
 """
@@ -28,6 +29,7 @@ from pathlib import Path
 from mcc import __version__
 from mcc.config import DATA_DIR, Config
 from mcc.hub import Hub
+from mcc.qbt import QbtError
 from mcc.routeros import RouterOSError
 from mcc.swos import SwOSError
 from mcc.runctl import remove_run_file, stop_existing, write_run_file
@@ -72,6 +74,7 @@ def main(argv=None) -> int:
         world = sim.World(speed=args.speed).start()
         router = sim.serve(sim.make_router(world))
         switches = {sid: sim.serve(sim.make_swos(world, sid=sid)) for sid in sim.SWITCHES}
+        qbt = sim.serve(sim.make_qbt())
         cfg = Config(data_dir)
         cfg.update({"collectors": {"bind": "127.0.0.1", "flow_port": 0, "syslog_port": 0},
                     "blocklist_file": str(data_dir / "blocklist.txt"),
@@ -116,6 +119,7 @@ def main(argv=None) -> int:
         for sid, srv in switches.items():
             hub.connect_switch("127.0.0.1:{}".format(srv.server_address[1]), "admin", "", sid=sid,
                                name=sim.SWITCHES[sid]["identity"])
+        hub.connect_qbt("127.0.0.1", "demo", "demo", scheme="http", port=qbt.server_address[1])
     else:
         auto_connect(hub, cfg)
 
@@ -179,6 +183,18 @@ def auto_connect(hub: Hub, cfg: Config) -> None:
             hub.connect_switch(sw["host"], sw.get("user") or os.environ.get("MCC_SWITCH_USER") or "admin", spw,
                                sw.get("scheme") or "http", sw.get("kind") or "auto", sw.get("id") or "")
         jobs.append(("switch " + sw["host"], switch))
+    qpw = os.environ.get("MCC_QBT_PASSWORD")
+    q = cfg.get("qbt") or {}
+    qhost = os.environ.get("MCC_QBT_HOST") or q.get("host")
+    if qpw is not None and qhost:
+        def qbt() -> None:
+            hub.connect_qbt(qhost, os.environ.get("MCC_QBT_USER") or q.get("user") or "", qpw,
+                            os.environ.get("MCC_QBT_SCHEME") or q.get("scheme") or "http",
+                            int(os.environ.get("MCC_QBT_PORT") or q.get("port") or 0))
+        jobs.append(("qBittorrent " + qhost, qbt))
+    elif qpw is not None:
+        print("  ! MCC_QBT_PASSWORD is set but no qBittorrent address is known yet: connect once from the "
+              "VPN page (or set MCC_QBT_HOST)", file=sys.stderr)
 
     def run() -> None:
         pending = list(jobs)
@@ -190,7 +206,7 @@ def auto_connect(hub: Hub, cfg: Config) -> None:
                     fn()
                     print("  connected to the {}".format(name))
                     pending.remove(item)
-                except (RouterOSError, SwOSError, OSError) as e:
+                except (RouterOSError, SwOSError, QbtError, OSError) as e:
                     print("  ! {}: {} -- retrying in {:.0f}s".format(name, e, delay), file=sys.stderr)
                     if getattr(e, "status", 0) == 401 or "refused the user" in str(e):
                         pending.remove(item)  # a wrong password won't fix itself; don't lock the account out

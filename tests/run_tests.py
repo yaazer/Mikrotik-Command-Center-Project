@@ -10,6 +10,7 @@ import http.client
 import ipaddress
 import os
 import json
+import secrets
 import shutil
 import socket
 import struct
@@ -18,6 +19,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.parse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -2292,6 +2294,232 @@ def t_capture_absent_field():
     eq(rec["restore"][0]["body"], {"address": ""}, "an absent field is restored as empty, not skipped")
     from mcc.actions import _norm
     eq(_norm(None), "", "None compares as empty")
+
+
+# ============================================================================================
+# qBittorrent
+# ============================================================================================
+def _fake_qbt(sess):
+    """A minimal stand-in for the qBittorrent WebUI API, enough to test mcc/qbt.py: login
+    (SID cookie), torrents/info, and stop/start -- only one of which `sess["modern"]` says
+    actually works, so the other 404s and the client must fall back."""
+    import http.server
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def _authed(self):
+            return sess.get("sid") and ("SID=" + sess["sid"]) in (self.headers.get("Cookie") or "")
+
+        def _json(self, status, body):
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            if path == "/api/v2/torrents/info":
+                if not self._authed():
+                    return self._json(403, {})
+                sess["info_calls"] = sess.get("info_calls", 0) + 1
+                return self._json(200, [sess["torrent"]])
+            self._json(404, {})
+
+        def do_POST(self):
+            path = self.path.split("?", 1)[0]
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            if path == "/api/v2/auth/login":
+                sess["logins"] = sess.get("logins", 0) + 1
+                form = urllib.parse.parse_qs(raw.decode())
+                good = (form.get("username", [""])[0] == "demo" and form.get("password", [""])[0] == "good")
+                body = b"Ok." if good else b"Fails."
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                if good:
+                    sess["sid"] = secrets.token_hex(8)
+                    self.send_header("Set-Cookie", "SID={}; path=/".format(sess["sid"]))
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                return self.wfile.write(body)
+            if not self._authed():
+                return self._json(403, {})
+            t = sess["torrent"]
+            modern = path in ("/api/v2/torrents/stop", "/api/v2/torrents/start")
+            legacy = path in ("/api/v2/torrents/pause", "/api/v2/torrents/resume")
+            if (modern and not sess.get("modern")) or (legacy and sess.get("modern")):
+                return self._json(404, {})
+            if path in ("/api/v2/torrents/stop", "/api/v2/torrents/pause"):
+                t["state"], t["dlspeed"] = "pausedDL", 0
+                return self._json(200, "")
+            if path in ("/api/v2/torrents/start", "/api/v2/torrents/resume"):
+                t["state"], t["dlspeed"] = "downloading", 10
+                return self._json(200, "")
+            self._json(404, {})
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _qbt_sess(modern=True):
+    return {"modern": modern, "torrent": {
+        "hash": "a" * 40, "name": "test.iso", "state": "downloading", "progress": 0.5,
+        "size": 1000, "dlspeed": 10, "upspeed": 0, "eta": 50, "downloaded": 500, "uploaded": 0,
+        "ratio": 0.0, "num_seeds": 1, "num_leechs": 1, "category": ""}}
+
+
+@test
+def t_qbt_client():
+    from mcc.qbt import Qbt, QbtError, rows as qbt_rows
+    sess = _qbt_sess(modern=False)  # a pre-5.0 server: only pause/resume exist
+    srv = _fake_qbt(sess)
+    try:
+        port = srv.server_address[1]
+        try:
+            Qbt("127.0.0.1", "demo", "wrong", port=port).login()
+            raise AssertionError("bad password accepted")
+        except QbtError as e:
+            eq(e.status, 401, "wrong credentials refused")
+
+        c = Qbt("127.0.0.1", "demo", "good", port=port)
+        c.login()
+        ok(sess["sid"] and c._cookie == "SID=" + sess["sid"], "the session cookie is echoed back verbatim")
+        info = c.torrents_info()
+        eq(len(info), 1, "one torrent")
+        eq(info[0]["hash"], "a" * 40, "its hash")
+
+        c.set_state("a" * 40, pause=True)  # stop 404s on this legacy server -> falls back to pause
+        eq(sess["torrent"]["state"], "pausedDL", "paused via the legacy endpoint")
+        eq(c._stop_api, False, "remembers the fallback for next time")
+        c.set_state("a" * 40, pause=False)
+        eq(sess["torrent"]["state"], "downloading", "resumed via the legacy endpoint")
+
+        # the session expires server-side; the next call gets 403 and the client re-logs in once
+        sess["sid"] = ""
+        logins_before = sess["logins"]
+        info = c.torrents_info()
+        eq(len(info), 1, "transparently re-authenticated")
+        ok(sess["logins"] > logins_before, "logged in again")
+
+        qr = qbt_rows([{"hash": "b" * 40, "name": "x", "state": "downloading", "progress": 0.1, "dlspeed": 5,
+                        "upspeed": 0, "eta": 8640000, "size": 10, "downloaded": 1, "uploaded": 0, "ratio": 0,
+                        "num_seeds": 0, "num_leechs": 0, "category": ""}])
+        eq(qr[0]["eta"], None, "the 100-day sentinel means no estimate, not 100 days")
+    finally:
+        srv.shutdown()
+
+
+@test
+def t_qbt_stop_start_modern():
+    """A current (5.0+) server: stop/start work first try, no fallback needed."""
+    from mcc.qbt import Qbt
+    sess = _qbt_sess(modern=True)
+    srv = _fake_qbt(sess)
+    try:
+        c = Qbt("127.0.0.1", "demo", "good", port=srv.server_address[1])
+        c.login()
+        c.set_state("a" * 40, pause=True)
+        eq(sess["torrent"]["state"], "pausedDL", "paused via stop")
+        eq(c._stop_api, True, "no fallback needed")
+    finally:
+        srv.shutdown()
+
+
+@test
+def t_qbt_hub():
+    with Env(connect=False) as e:
+        sess = _qbt_sess(modern=True)
+        srv = _fake_qbt(sess)
+        try:
+            res = e.hub.connect_qbt("127.0.0.1", "demo", "good", port=srv.server_address[1])
+            eq(res["count"], 1, "one torrent reported")
+            eq(e.cfg.get("qbt.host"), "127.0.0.1", "host saved")
+            eq(e.cfg.get("qbt.user"), "demo", "user saved (never the password)")
+            with open(e.cfg.path, encoding="utf-8") as f:
+                ok("good" not in f.read(), "the password never reaches disk")
+            st = e.hub.status()["qbt"]
+            eq((st["state"], st["count"]), ("ok", 1), "status reflects the connection")
+            snap_torrents = e.hub.snapshot()["torrents"]
+            eq(snap_torrents[0]["hash"], "a" * 40, "the torrent is in the snapshot")
+
+            e.hub.set_torrents(["a" * 40], pause=True)
+            ok(wait_for(lambda: e.hub.qbt_view()[0]["state"] == "pausedDL", 5), "pause reaches the view")
+
+            e.hub.disconnect_qbt()
+            eq(e.hub.status()["qbt"]["state"], "off", "disconnected")
+            eq(e.hub.qbt_view(), [], "torrents cleared on disconnect")
+        finally:
+            srv.shutdown()
+
+
+@test
+def t_qbt_auth_failure_stops_polling():
+    """If the password stops working, MCC must not keep hammering qBittorrent's login endpoint --
+    that's how a real qBittorrent bans the address for an hour."""
+    with Env(connect=False) as e:
+        sess = _qbt_sess(modern=True)
+        srv = _fake_qbt(sess)
+        try:
+            e.hub.connect_qbt("127.0.0.1", "demo", "good", port=srv.server_address[1])
+            ok(wait_for(lambda: e.hub.qbtlink.status["state"] == "ok", 5), "connected")
+            sess["sid"] = ""  # the session dies, and the password the client holds no longer works either
+            e.hub.qbtlink.client.password = "wrong"
+            logins_before = sess["logins"]
+            ok(wait_for(lambda: e.hub.status()["qbt"]["state"] == "error", 5), "the next poll sees the failure")
+            time.sleep(1.5)
+            logins_after = sess["logins"]
+            ok(logins_after > logins_before, "it tried to log back in once")
+            time.sleep(1.5)
+            eq(sess["logins"], logins_after, "but gave up rather than retrying forever")
+        finally:
+            srv.shutdown()
+
+
+@test
+def t_qbt_http_api():
+    with Env(connect=False) as e:
+        sess = _qbt_sess(modern=True)
+        srv = _fake_qbt(sess)
+        httpd, _tok = make_server(e.hub, "127.0.0.1", 0)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            port = httpd.server_address[1]
+
+            def call(method, path, body=None):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                c.request(method, path, json.dumps(body) if body is not None else None,
+                          {"X-MCC": "1", "Content-Type": "application/json"})
+                r = c.getresponse()
+                return r.status, json.loads(r.read() or b"null")
+
+            st, v = call("POST", "/api/connect/qbt", {"qbt": {"host": "127.0.0.1", "port": srv.server_address[1],
+                                                               "user": "demo", "password": "good"}})
+            eq(st, 200, "connected: {}".format(v))
+            eq(v["count"], 1, "one torrent")
+
+            st, v = call("POST", "/api/torrents/pause", {"hashes": ["not-a-hash"]})
+            eq(st, 400, "a bad hash is refused before it reaches qBittorrent")
+
+            st, v = call("POST", "/api/torrents/pause", {"hashes": ["a" * 40]})
+            eq(st, 200, "pause accepted")
+            ok(wait_for(lambda: sess["torrent"]["state"] == "pausedDL", 5), "the fake server saw it")
+
+            st, v = call("POST", "/api/torrents/resume", {"hashes": ["a" * 40]})
+            eq(st, 200, "resume accepted")
+
+            st, v = call("POST", "/api/disconnect", {"what": "qbt"})
+            eq(st, 200, "disconnected")
+            eq(e.hub.status()["qbt"]["state"], "off", "hub reflects it")
+        finally:
+            httpd.shutdown()
+            srv.shutdown()
 
 
 def main(argv):

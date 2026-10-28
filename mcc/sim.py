@@ -1251,6 +1251,114 @@ def make_swos(world: World, user: str = "admin", password: str = "", bind: str =
     return QuietServer((bind, port), H)
 
 
+def make_qbt(user: str = "demo", password: str = "demo", bind: str = "127.0.0.1",
+             port: int = 0) -> ThreadingHTTPServer:
+    """A stand-in for the qBittorrent WebUI API: a handful of torrents that actually download (their
+    progress advances while running) and actually stop when paused, so the VPN page's panel has
+    something real to show and Pause/Resume have something real to do."""
+    sid = secrets.token_hex(16)
+    lock = threading.Lock()
+    torrents = [
+        {"hash": secrets.token_hex(20), "name": "ubuntu-24.04.1-desktop-amd64.iso", "state": "downloading",
+         "progress": 0.42, "size": 5_800_000_000, "dlspeed": 11_500_000, "upspeed": 300_000, "eta": 320,
+         "downloaded": 2_436_000_000, "uploaded": 120_000_000, "ratio": 0.05, "num_seeds": 34, "num_leechs": 12,
+         "category": "linux"},
+        {"hash": secrets.token_hex(20), "name": "Big Buck Bunny (2008) 1080p", "state": "stalledDL",
+         "progress": 0.88, "size": 1_400_000_000, "dlspeed": 0, "upspeed": 0, "eta": 8640000,
+         "downloaded": 1_232_000_000, "uploaded": 0, "ratio": 0.0, "num_seeds": 1, "num_leechs": 3,
+         "category": "video"},
+        {"hash": secrets.token_hex(20), "name": "debian-12.7.0-amd64-netinst.iso", "state": "pausedDL",
+         "progress": 0.15, "size": 650_000_000, "dlspeed": 0, "upspeed": 0, "eta": 8640000,
+         "downloaded": 97_000_000, "uploaded": 0, "ratio": 0.0, "num_seeds": 8, "num_leechs": 2,
+         "category": "linux"},
+        {"hash": secrets.token_hex(20), "name": "Blender Open Movie Pack", "state": "uploading",
+         "progress": 1.0, "size": 3_200_000_000, "dlspeed": 0, "upspeed": 900_000, "eta": 8640000,
+         "downloaded": 3_200_000_000, "uploaded": 7_680_000_000, "ratio": 2.4, "num_seeds": 0, "num_leechs": 5,
+         "category": "video"},
+    ]
+    last_tick = [time.time()]
+
+    def advance() -> None:
+        now, dt = time.time(), max(0.0, min(5.0, time.time() - last_tick[0]))
+        last_tick[0] = now
+        for t in torrents:
+            if t["state"] == "downloading" and t["dlspeed"]:
+                t["downloaded"] = min(t["size"], t["downloaded"] + int(t["dlspeed"] * dt))
+                t["progress"] = t["downloaded"] / t["size"]
+                if t["progress"] >= 1.0:
+                    t["state"], t["dlspeed"], t["upspeed"] = "uploading", 0, random.randint(200_000, 900_000)
+            elif t["state"] == "uploading" and t["upspeed"]:
+                t["uploaded"] += int(t["upspeed"] * dt)
+                t["ratio"] = round(t["uploaded"] / max(1, t["size"]), 3)
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a: Any) -> None:
+            pass
+
+        def _authed(self) -> bool:
+            return "SID={}".format(sid) in (self.headers.get("Cookie") or "")
+
+        def _json(self, status: int, body: Any) -> None:
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self) -> None:
+            if self.path.startswith("/api/v2/torrents/info"):
+                if not self._authed():
+                    return self._json(403, {})
+                with lock:
+                    advance()
+                    return self._json(200, list(torrents))
+            if self.path.startswith("/api/v2/app/version"):
+                return self._json(200, "v5.0.1")
+            self._json(404, {})
+
+        def do_POST(self) -> None:
+            path, _, query = self.path.partition("?")
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            if path == "/api/v2/auth/login":
+                form = urllib.parse.parse_qs(raw.decode())
+                good = form.get("username", [""])[0] == user and form.get("password", [""])[0] == password
+                body = b"Ok." if good else b"Fails."
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                if good:
+                    self.send_header("Set-Cookie", "SID={}; path=/".format(sid))
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                return self.wfile.write(body)
+            if not self._authed():
+                return self._json(403, {})
+            qs = urllib.parse.parse_qs(query)
+            hashes = (qs.get("hashes", [""])[0]).split("|")
+            with lock:
+                if path in ("/api/v2/torrents/stop", "/api/v2/torrents/pause"):
+                    for t in torrents:
+                        if hashes == ["all"] or t["hash"] in hashes:
+                            advance()
+                            t["state"] = "pausedUP" if t["progress"] >= 1 else "pausedDL"
+                            t["dlspeed"] = t["upspeed"] = 0
+                    return self._json(200, "")
+                if path in ("/api/v2/torrents/start", "/api/v2/torrents/resume"):
+                    for t in torrents:
+                        if hashes == ["all"] or t["hash"] in hashes:
+                            if t["progress"] >= 1.0:
+                                t["state"], t["upspeed"] = "uploading", random.randint(200_000, 900_000)
+                            else:
+                                t["state"], t["dlspeed"] = "downloading", random.randint(2_000_000, 12_000_000)
+                    return self._json(200, "")
+            self._json(404, {})
+
+    return QuietServer((bind, port), H)
+
+
 def serve(server: ThreadingHTTPServer) -> ThreadingHTTPServer:
     threading.Thread(target=server.serve_forever, name="sim-http", daemon=True).start()
     return server

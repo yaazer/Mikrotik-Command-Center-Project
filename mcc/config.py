@@ -34,7 +34,7 @@ DEFAULTS: Dict[str, Any] = {
     # Addresses MCC will refuse to block or quarantine, whatever a threat says.
     "never_block": [],
     "wan": {"interfaces": [], "down_mbps": 0, "up_mbps": 0},
-    "poll": {"router_s": 2, "conns_s": 4, "devices_s": 15, "log_s": 3, "dns_s": 30, "switch_s": 5},
+    "poll": {"router_s": 2, "conns_s": 4, "devices_s": 15, "log_s": 3, "dns_s": 30, "switch_s": 5, "qbt_s": 3},
     "detect": {
         "scan_ports": 15,
         "scan_hosts": 10,
@@ -67,6 +67,8 @@ DEFAULTS: Dict[str, Any] = {
     # VPN tunnels: interfaces (blank = every WireGuard / OpenVPN / L2TP / SSTP / PPTP / GRE / IPIP / EoIP
     # interface) and the devices that must only ever use one (a direct connection from them is a leak)
     "vpn": {"interfaces": [], "required": []},
+    # qBittorrent WebUI: host/port/user, like the router and switches -- the password is never saved
+    "qbt": {"host": "", "scheme": "http", "port": 8080, "user": ""},
     "blocklist_file": "data/blocklist.txt",
     # IP geolocation: a local .mmdb (blank = newest in data/geo). Home blank = locate the router's public IP.
     "geo": {"db": "", "home": {"lat": "", "lon": "", "label": ""}},

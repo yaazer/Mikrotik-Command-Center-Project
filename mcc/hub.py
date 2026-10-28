@@ -25,6 +25,8 @@ from .overrides import Overrides
 from .names import NameMemory
 from .oui import MacVendors, normalise_mac
 from .pins import Pins
+from . import qbt as qbtmod
+from .qbt import Qbt, QbtError
 from .routeros import CertificateChanged, RouterOS, RouterOSError, local_ip_toward
 from .setup_plan import SetupPlanner
 from .rosswitch import RouterOSSwitch, detect_os
@@ -62,6 +64,20 @@ class SwitchLink:
         self.topo: Dict[str, Any] = {"hosts": [], "neighbors": [], "table": None}
         self.topo_at = 0.0
         self.stop = threading.Event()
+
+
+class QbtLink:
+    """qBittorrent: its client, connection state and the torrents list, refreshed by its own poll
+    thread so a slow or unreachable qBittorrent never holds up the router or switches. wake lets a
+    pause/resume get the list refreshed right away instead of waiting out the poll interval."""
+
+    def __init__(self) -> None:
+        self.client: Optional[Qbt] = None
+        self.status: Dict[str, Any] = {"state": "off", "error": "", "last_ok": 0.0}
+        self.torrents: List[Dict[str, Any]] = []
+        self.total = 0  # torrents may outnumber what's kept in self.torrents (qbt.LIST_CAP)
+        self.stop = threading.Event()
+        self.wake = threading.Event()
 
 
 class Broadcaster:
@@ -114,6 +130,7 @@ class Hub:
         self.ros: Optional[RouterOS] = None
         self._ros_slow: Optional[RouterOS] = None
         self.switches: Dict[str, SwitchLink] = {s["id"]: SwitchLink(s["id"]) for s in cfg.get("switches") or []}
+        self.qbtlink = QbtLink()
         self.router_host_ip = ""
         self.router_status: Dict[str, Any] = {"state": "disconnected", "error": "", "last_ok": 0.0, "tasks": {}}
         self.router_info: Dict[str, Any] = {}
@@ -212,6 +229,7 @@ class Hub:
                 r.close()
         for link in list(self.switches.values()):
             self._stop_switch(link)
+        self._stop_qbt(self.qbtlink)
 
     def publish(self, event: str, data: Any) -> None:
         self.bus.publish(event, data)
@@ -392,6 +410,83 @@ class Hub:
         if link is None or link.client is None:
             raise KeyError(sid)
         return link.client.probe()
+
+    # -- qBittorrent: active downloads, shown on the VPN page -------------------------------------
+    def connect_qbt(self, host: str, user: str, password: str, scheme: str = "http", port: int = 0) -> Dict[str, Any]:
+        host = host.strip()
+        if not host:
+            raise QbtError("qBittorrent address is required")
+        client = Qbt(host, user, password, scheme, port or None)
+        try:
+            client.login()
+            torrents = client.torrents_info()
+        except QbtError as e:
+            client.close()
+            self.qbtlink.status.update({"state": "error", "error": str(e)})
+            raise
+        self.cfg.update({"qbt": {"host": host, "scheme": scheme, "port": port, "user": user}})
+        link = self.qbtlink
+        self._stop_qbt(link)
+        link.stop = threading.Event()
+        link.client = client
+        with self.lock:
+            parsed = qbtmod.rows(torrents)
+            link.total = len(parsed)
+            link.torrents = parsed[:qbtmod.LIST_CAP]
+            link.status.update({"state": "ok", "error": "", "last_ok": time.time()})
+        threading.Thread(target=self._qbt_poll, args=(link, link.stop), name="mcc-qbt", daemon=True).start()
+        self.publish("status", self.status())
+        return {"count": link.total}
+
+    @staticmethod
+    def _stop_qbt(link: QbtLink) -> None:
+        link.stop.set()
+        link.wake.set()
+        old, link.client = link.client, None
+        if old is not None:
+            old.close()
+
+    def disconnect_qbt(self) -> None:
+        self._stop_qbt(self.qbtlink)
+        self.qbtlink.status.update({"state": "off", "error": ""})
+        self.qbtlink.torrents = []
+        self.qbtlink.total = 0
+        self.publish("status", self.status())
+
+    def _qbt_poll(self, link: QbtLink, stop: threading.Event) -> None:
+        while not stop.is_set() and not self._stop.is_set():
+            client = link.client
+            if client is None:
+                break
+            try:
+                parsed = qbtmod.rows(client.torrents_info())
+                if stop.is_set():
+                    break
+                with self.lock:
+                    link.total = len(parsed)
+                    link.torrents = parsed[:qbtmod.LIST_CAP]
+                link.status.update({"state": "ok", "error": "", "last_ok": time.time()})
+            except QbtError as e:
+                link.status.update({"state": "error", "error": str(e)})
+                if e.status in (401, 403):
+                    # a stale password won't fix itself -- retrying hammers qBittorrent's login
+                    # endpoint and risks it banning this address; wait for a fresh Connect instead
+                    break
+            except Exception as e:
+                link.status.update({"state": "error", "error": "{}: {}".format(type(e).__name__, e)})
+            link.wake.wait(max(1.0, float(self.cfg.get("poll.qbt_s") or 3)))
+            link.wake.clear()
+
+    def qbt_view(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            return list(self.qbtlink.torrents)
+
+    def set_torrents(self, hashes: List[str], pause: bool) -> None:
+        link = self.qbtlink
+        if link.client is None:
+            raise QbtError("qBittorrent isn't connected")
+        link.client.set_state("|".join(hashes), pause)
+        link.wake.set()
 
     # ------------------------------------------------------------------------------------------
     # knowledge used by the other modules
@@ -1136,8 +1231,13 @@ class Hub:
         r["tasks"] = {k: v for k, v in r.get("tasks", {}).items() if v}
         r["host"] = self.cfg.get("router.host")
         r["stale"] = bool(self.ros) and now - r.get("last_ok", 0) > 15
+        q = dict(self.qbtlink.status)
+        q["host"] = self.cfg.get("qbt.host")
+        q["stale"] = q["state"] == "ok" and now - q.get("last_ok", 0) > 15
+        q["count"] = self.qbtlink.total
         return {
             "router": r,
+            "qbt": q,
             "switch": self._switch_summary(),
             "switches": [{"id": sid, "label": self.switch_label(sid), "host": self.switch_cfg(sid).get("host", ""),
                           **{k: link.status.get(k, "") for k in ("state", "error", "kind")}}
@@ -1187,6 +1287,7 @@ class Hub:
             "switches": switches,
             "traffic": traffic,
             "vpn": self.vpn_status(now),
+            "torrents": self.qbt_view(),
             "lan": self._lan_view(traffic, ifaces, switches),
             "geo": self._geo_view(traffic),
             "counts": {"threats_open": len(open_t),
