@@ -184,6 +184,8 @@ If a mitigated threat shows activity again **after a two-minute grace period**, 
 - **Storage:** rules are kept in `data/ignore.json`. Every addition, removal and expiry is appended to `data/ignore.log.jsonl`.
 - **Ignoring never changes the router.**
 
+**Group by level and bulk actions.** New-device alerts (currently the only low-severity rule) tend to pile up when you set up a batch of devices at once. Tick **Group by level** on the Threats page to bundle threats under one header per severity. The **low** group's header gets its own **Acknowledge**, **Resolve** and **Ignore…** buttons that act on every eligible threat in it at once — nothing high, medium or critical is ever touched by a bulk action, even if a threat's severity climbs between the page rendering and the click. A new-device alert fires once per MAC, ever (it's remembered in `data/devices.json`), so it never recurs and bulk **Resolve** is normally all you need. Bulk **Ignore** instead creates one ordinary *just this alert* ignore rule per threat, listed in Threats › Ignore list like any other — reach for it only for a rule that can actually recur, since each rule is permanent by default and a batch of them adds up.
+
 **Blocklist:** put a list you trust in `data/blocklist.txt`, one IP or CIDR per line, with `#` or `;` comments. Spamhaus DROP and FireHOL level1 both work. The file is re-read whenever it changes.
 
 ## The Advisor: what to improve

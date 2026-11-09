@@ -46,6 +46,44 @@
   --info: oklch(0.55 0.02 250);
   --glow: 0 1px 2px oklch(0.3 0.02 255 / 0.08), 0 6px 20px oklch(0.3 0.02 255 / 0.08);
 }
+/* LCARS: flat near-black panels, oversized pill rounding, colour-blocked header tabs instead of
+ * soft blur -- the OKLCH values themselves come from theme.js, this just changes the shapes. */
+:root[data-theme="lcars"] { --radius: 22px; }
+:root[data-theme="lcars"] .panel > header {
+  border-bottom: 3px solid var(--accent);
+}
+:root[data-theme="lcars"] .panel > header h2 {
+  background: var(--accent);
+  color: var(--bg);
+  padding: 5px 16px;
+  margin: -5px 0;
+  border-radius: 999px;
+  letter-spacing: .04em;
+  font-weight: 700;
+}
+:root[data-theme="lcars"] .btn,
+:root[data-theme="lcars"] .icon-btn,
+:root[data-theme="lcars"] .seg,
+:root[data-theme="lcars"] .level,
+:root[data-theme="lcars"] input,
+:root[data-theme="lcars"] select { border-radius: 999px; }
+:root[data-theme="lcars"] .btn.primary { color: var(--bg); font-weight: 700; }
+/* Antonio (OFL), the usual stand-in for LCARS display type -- vendored under /fonts so it works
+ * offline like the rest of this console. Scoped to chrome only: nav, titles, buttons -- never
+ * data tables, logs or the mono numerals, which stay in the regular stack for legibility. */
+@font-face {
+  font-family: "Antonio";
+  src: url("/fonts/antonio.ttf") format("truetype");
+  font-weight: 100 700;
+  font-style: normal;
+  font-display: swap;
+}
+:root[data-theme="lcars"] .brand-name, :root[data-theme="lcars"] .tabs a, :root[data-theme="lcars"] .panel > header h2,
+:root[data-theme="lcars"] .btn, :root[data-theme="lcars"] .level, :root[data-theme="lcars"] .alert-banner {
+  font-family: "Antonio", "Arial Narrow", var(--sans);
+  letter-spacing: .03em;
+}
+.alert-banner { display: none; }
 
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; }
@@ -217,6 +255,13 @@ table.t .who span { font: 12px var(--mono); color: var(--faint); }
 .tcard .meta { display: flex; gap: 10px; font-size: 12px; color: var(--faint); margin-top: 6px; align-items: center; flex-wrap: wrap; }
 .tcard .acts { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
 .tcard.dim { opacity: .62; }
+.tgroup { display: flex; flex-direction: column; }
+.tgroup-head { display: flex; align-items: center; gap: 8px; padding: 9px 14px; border-bottom: 1px solid var(--line-soft);
+  background: oklch(from var(--bg) l c h / 0.45); cursor: pointer; flex-wrap: wrap; }
+.tgroup-head:hover { background: oklch(from var(--accent) l c h / 0.05); }
+.tgroup-head .grow { flex: 1; }
+.tgroup-head .chev { font-size: 12px; width: 14px; text-align: center; }
+.tgroup-body { display: flex; flex-direction: column; }
 .evidence { font: 12px/1.55 var(--mono); background: var(--bg2); border: 1px solid var(--line-soft); border-radius: 8px;
             padding: 8px 10px; max-height: 210px; overflow: auto; white-space: pre-wrap; word-break: break-all; color: var(--muted); margin-top: 8px; }
 .why { font-size: 13px; color: var(--muted); margin-top: 8px; border-left: 2px solid var(--line); padding-left: 10px; }
@@ -524,6 +569,171 @@ body[data-fx="lite"] .toast, body[data-fx="lite"] .studio { box-shadow: 0 6px 16
 body[data-fx="lite"] .studio { background: var(--bg); }
 body[data-fx="lite"] .brand-mark { box-shadow: none; }
 
+/* LCARS is flat and matte by nature -- same no-blur, no-glow treatment as Lite rendering,
+ * applied by theme rather than by the rendering-quality setting. */
+:root[data-theme="lcars"] *, :root[data-theme="lcars"] *::before, :root[data-theme="lcars"] *::after {
+  backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }
+:root[data-theme="lcars"] #fx-aurora { display: none; }
+:root[data-theme="lcars"] body { background-image: none; }
+:root[data-theme="lcars"] .top { background: var(--bg); }
+:root[data-theme="lcars"] .brand-mark { box-shadow: none; }
+
+/* ---------- LCARS chrome: a left console column, joined to the header by an elbow ----------
+ * .tabs floats left; every OTHER sibling of #frame after .top (.main, and the update-bar that
+ * core.js inserts dynamically) gets pushed clear of it with margin-left. That holds for any
+ * number of such siblings without touching the DOM or JS. */
+:root[data-theme="lcars"] .brand-name {
+  background: var(--lc1);
+  color: var(--bg);
+  padding: 4px 14px;
+  border-radius: 999px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+:root[data-theme="lcars"] .brand-mark { background: var(--bg); }
+
+/* The header stays sticky (base rule); a positioned bar + a separate elbow pseudo-element hang
+ * off its bottom edge instead of a plain border, so the elbow has somewhere to carve into.
+ * Geometry: sidebar is 184px; the elbow's inner (concave) fillet radius is 28px; the colour bar
+ * is 10px thick. The header's own bottom padding (10px) reserves room for the bar to sit in. */
+:root[data-theme="lcars"] .top { padding-bottom: 10px; }
+:root[data-theme="lcars"] .top::before {
+  /* the rest of the header bar, picking up where the elbow's stub (below) leaves off */
+  content: "";
+  position: absolute;
+  left: 212px;
+  right: 0;
+  bottom: 0;
+  height: 10px;
+  background: var(--lc1);
+}
+:root[data-theme="lcars"] .top::after {
+  /* the elbow: a solid vertical arm (sidebar width) + a solid horizontal stub (28px) joined by
+   * a concave quarter-circle fillet carved out of their shared corner with a radial gradient */
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 100%;
+  width: 212px;
+  height: 38px;
+  background-image:
+    radial-gradient(circle at 0% 0%, var(--lc1) 28px, transparent 28.5px),
+    linear-gradient(var(--lc1), var(--lc1)),
+    linear-gradient(var(--lc1), var(--lc1));
+  background-size: 28px 28px, 28px 10px, 184px 100%;
+  background-position: right bottom, right top, left top;
+  background-repeat: no-repeat;
+}
+
+:root[data-theme="lcars"] .tabs {
+  /* #frame is flex-column and float has no effect on a flex item -- position it out of flex
+   * layout instead, fixed to the viewport like the sticky header above it, so .main/.update-bar
+   * (pushed clear via margin-left below) sit beside it instead of below it */
+  position: fixed;
+  left: 0;
+  top: var(--lc-head, 55px);
+  bottom: 0;
+  width: 184px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 38px 0 20px;
+  border-bottom: 0;
+  overflow-y: auto;
+  overflow-x: visible;
+  box-sizing: border-box;
+  z-index: 19;
+}
+:root[data-theme="lcars"] .tabs a {
+  display: block;
+  padding: 9px 16px 9px 10px;
+  margin: 0;
+  color: var(--bg);
+  border-bottom: 0;
+  border-radius: 0 999px 999px 0;
+  font-weight: 700;
+  font-size: 12.5px;
+  letter-spacing: .03em;
+  text-transform: uppercase;
+  text-align: right;
+}
+:root[data-theme="lcars"] .tabs a:hover { text-decoration: none; filter: brightness(1.12); }
+:root[data-theme="lcars"] .tabs a.on { background: var(--text) !important; color: var(--bg); }
+:root[data-theme="lcars"] .tabs a:nth-child(5n+1) { background: var(--lc1); }
+:root[data-theme="lcars"] .tabs a:nth-child(5n+2) { background: var(--lc3); }
+:root[data-theme="lcars"] .tabs a:nth-child(5n+3) { background: var(--lc2); }
+:root[data-theme="lcars"] .tabs a:nth-child(5n+4) { background: var(--lc4); }
+:root[data-theme="lcars"] .tabs a:nth-child(5n+5) { background: var(--lc5); }
+:root[data-theme="lcars"] .tabs .badge { position: relative; top: -1px; }
+
+:root[data-theme="lcars"] .top ~ *:not(.tabs) { margin-left: 204px; }
+
+@media (max-width: 860px) {
+  :root[data-theme="lcars"] .tabs { position: static; width: auto; flex-direction: row; overflow-x: auto;
+    padding: 0 10px; }
+  :root[data-theme="lcars"] .tabs::before { display: none; }
+  :root[data-theme="lcars"] .tabs a { border-radius: 999px; text-align: center; white-space: nowrap; margin: 6px 0; }
+  :root[data-theme="lcars"] .top ~ *:not(.tabs) { margin-left: 0; }
+}
+
+/* Red Alert klaxon strobe -- scoped to that one preset (data-preset, set alongside data-theme),
+ * not the other two LCARS presets. ~0.7Hz, well under the 3Hz photosensitive-flash threshold.
+ * Killed by the OS prefers-reduced-motion query below UNLESS the user explicitly picks Motion:
+ * Full in Theme Studio (that query is written to defer to data-motion="full"), and always killed
+ * by Motion: Off via the data-motion="off" rule above. */
+:root[data-preset="lcars-alert"] .top::before,
+:root[data-preset="lcars-alert"] .top::after,
+:root[data-preset="lcars-alert"] .brand-mark {
+  animation: redalert-strobe 1.4s ease-in-out infinite;
+}
+:root[data-preset="lcars-alert"] .tabs a.on {
+  animation: redalert-tab 1.4s ease-in-out infinite;
+}
+:root[data-preset="lcars-alert"] .frame::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  pointer-events: none;
+  background: radial-gradient(ellipse at center, transparent 45%, var(--crit) 105%);
+  animation: redalert-vignette 1.4s ease-in-out infinite;
+}
+/* brightness, not opacity: these elements sit behind gradients/custom-property fills that CSS
+ * can't smoothly interpolate, but a filter dips any of them to near-black regardless -- a real
+ * on/off strobe instead of a faint brightness bump that barely moves an already-light color. */
+@keyframes redalert-strobe { 0%, 100% { filter: brightness(1); } 50% { filter: brightness(0.15); } }
+@keyframes redalert-tab { 0%, 100% { filter: brightness(1); box-shadow: none; }
+                           50% { filter: brightness(0.3); box-shadow: 0 0 18px 3px var(--crit); } }
+@keyframes redalert-vignette { 0%, 100% { opacity: 0; } 50% { opacity: .65; } }
+
+/* Red Alert sidebar: the reference "red alert" LCARS screens run the nav as alternating solid
+ * red / white blocks, not the five-hue cycle the other two presets use -- high contrast, no
+ * subtlety. Same specificity as the nth-child(5n+N) rules above; wins because it's later. */
+:root[data-preset="lcars-alert"] .tabs a:nth-child(odd) { background: var(--crit); color: var(--text); }
+:root[data-preset="lcars-alert"] .tabs a:nth-child(even) { background: var(--text); color: var(--bg); }
+
+/* Red Alert banner: an inert <span class="alert-banner"> in the header (empty, display:none,
+ * for every other theme) that this preset alone turns into the bold "RED ALERT" placard the
+ * reference screens all carry. Decorative chrome tied to the theme choice, not to the real
+ * threat level -- that's still only .level/.frame.lvl-*. */
+:root[data-preset="lcars-alert"] .alert-banner {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 8px;
+  padding: 5px 16px;
+  background: var(--crit);
+  color: var(--text);
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  border-radius: 999px;
+  white-space: nowrap;
+  animation: redalert-strobe 1.4s ease-in-out infinite;
+}
+:root[data-preset="lcars-alert"] .alert-banner::before { content: "Red Alert"; }
+
 /* Density: Compact */
 body[data-density="compact"] .main { padding-top: 10px; }
 body[data-density="compact"] .grid, body[data-density="compact"] .kpis { gap: 10px; }
@@ -545,7 +755,11 @@ body[data-density="compact"] .tabs a { padding: 8px 12px; }
 body[data-density="compact"] .top { padding-top: 7px; padding-bottom: 7px; }
 
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation: none !important; transition: none !important; }
+  /* OS-level reduce wins by default (theme.js maps it to Motion: Calm), but an explicit
+   * Motion: Full in Theme Studio is a deliberate in-app override, so let it through. */
+  body:not([data-motion="full"]) *,
+  body:not([data-motion="full"]) *::before,
+  body:not([data-motion="full"]) *::after { animation: none !important; transition: none !important; }
 }
 
 /* ---------- pinned devices + one device singled out ---------- */

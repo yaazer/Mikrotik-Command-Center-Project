@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from .actions import ActionError
 from .config import DEFAULTS
+from .detect import SEVERITY
 from .qbt import QbtError
 from .routeros import RouterOSError
 from .swos import SwOSError
@@ -36,6 +37,10 @@ from .util import ip_obj, parse_networks
 TORRENT_HASH = re.compile(r"^[0-9a-f]{40}$|^[0-9a-f]{64}$")
 
 WEB = Path(__file__).resolve().parent / "web"
+
+# stdlib's mimetypes doesn't know font formats on every platform -- the LCARS theme vendors one
+mimetypes.add_type("font/ttf", ".ttf")
+mimetypes.add_type("font/woff2", ".woff2")
 
 
 _DISK = {"sig": None, "build": ""}
@@ -404,6 +409,39 @@ def make_server(hub: Any, bind: str = "127.0.0.1", port: int = 8840, token: Opti
                 if b.get("confirm") is not True:
                     raise ApiError(400, "confirm must be true")
                 return hub.actions.undo(aid)
+        if path == "/api/threats/bulk":
+            ids = b.get("ids")
+            if not isinstance(ids, list) or not ids or not all(isinstance(x, str) for x in ids):
+                raise ApiError(400, "ids must be a non-empty list of threat ids")
+            if len(ids) > 500:
+                raise ApiError(400, "too many ids (max 500)")
+            action = b.get("action")
+            skipped: list = []
+            eligible: list = []
+            for tid in ids:
+                t = hub.detector.threats.get(tid)
+                if t is None:
+                    skipped.append({"id": tid, "reason": "no such threat"})
+                    continue
+                if SEVERITY.get(t.get("severity", "info"), 0) > SEVERITY["low"]:
+                    skipped.append({"id": tid, "reason": "no longer low severity"})
+                    continue
+                eligible.append(tid)
+            if action in ("acknowledged", "resolved"):
+                note = str(b.get("note", "")) or "{} from the console (bulk)".format(action)
+                try:
+                    updated, more_skipped = hub.detector.bulk_set_status(eligible, action, note)
+                except ValueError as e:
+                    raise ApiError(400, str(e))
+                return {"updated": updated, "skipped": skipped + more_skipped}
+            if action == "ignore":
+                try:
+                    results, more_skipped = hub.detector.bulk_ignore(
+                        eligible, duration=str(b.get("duration") or "0"), note=str(b.get("note") or ""))
+                except ValueError as e:
+                    raise ApiError(400, str(e))
+                return {"results": results, "skipped": skipped + more_skipped}
+            raise ApiError(400, "action must be acknowledged, resolved or ignore")
         if len(parts) == 4 and parts[:2] == ["api", "threats"] and parts[3] == "status":
             status = b.get("status")
             if status not in ("acknowledged", "resolved", "open"):

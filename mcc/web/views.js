@@ -326,6 +326,47 @@ async function stopIgnoring(id) {
     toast(`Stopped ignoring (${r.id})`, "It alerts again if it recurs.", { good: true });
   } catch (err) { toast("Couldn't remove", err.message, { bad: true }); }
 }
+
+/* ---------------- bulk actions (low-severity threat groups) ---------------- */
+async function bulkSetStatus(ids, status) {
+  if (!ids.length) return;
+  try {
+    const r = await api.post("/api/threats/bulk", { ids, action: status });
+    (r.updated || []).forEach((t) => S.threats.set(t.id, t));
+    const skipped = (r.skipped || []).length;
+    toast(`${r.updated.length} ${status}`, skipped ? `${skipped} skipped — no longer eligible` : "", { good: true });
+    if (r.updated.length) emit("threats", r.updated[r.updated.length - 1]);
+  } catch (err) { toast("Couldn't update", err.message, { bad: true }); }
+}
+function bulkIgnoreGroup(ids, sev) {
+  if (!ids.length) return;
+  openModal(`<header><div class="grow"><div class="faint" style="font-size:12px;letter-spacing:.1em;text-transform:uppercase">Bulk ignore · ${esc(sev)}</div><h2>Mark ${ids.length} threats as false positives</h2></div>
+      <button class="icon-btn" data-x aria-label="Close">${ICON.x}</button></header>
+    <div class="mbody">
+      <div class="muted">Each becomes its own ignore rule for its exact case. Anything else from the same address, or a new case, still alerts.</div>
+      <div class="btnrow"><span class="muted">For</span><div class="seg" id="idur">${Object.entries(IGNORE_FOR).map(([k, l]) => `<button type="button" data-d="${k}" class="${k === "0" ? "on" : ""}">${l}</button>`).join("")}</div></div>
+      <div><label class="muted" for="inote" style="font-size:13px">Why are these false positives?</label>
+        <textarea id="inote" rows="2" placeholder="e.g. new-device alerts for a batch of devices you just set up" style="margin-top:6px"></textarea></div>
+      <div class="note">Matching events are still counted against each rule. Review or remove them any time in Threats › Ignore list. The router is not changed.</div>
+    </div>
+    <footer><span class="grow"></span><button class="btn" data-x>Cancel</button><button class="btn primary" data-go autofocus>${ICON.check} Ignore ${ids.length}</button></footer>`,
+  (m) => {
+    $$("[data-x]", m).forEach((b) => (b.onclick = closeModal));
+    let dur = "0";
+    $("#idur", m).onclick = (e) => { const b = e.target.closest("[data-d]"); if (!b) return; dur = b.dataset.d; $$("#idur button", m).forEach((x) => x.classList.toggle("on", x === b)); };
+    $("[data-go]", m).onclick = async (e) => {
+      e.target.disabled = true;
+      try {
+        const r = await api.post("/api/threats/bulk", { ids, action: "ignore", duration: dur, note: $("#inote", m).value });
+        (r.results || []).forEach((x) => S.threats.set(x.threat.id, x.threat));
+        closeModal();
+        const skipped = (r.skipped || []).length;
+        toast(`Ignoring ${r.results.length} threats`, (dur === "0" ? "Until you remove them." : `For ${IGNORE_FOR[dur]}.`) + (skipped ? ` ${skipped} skipped.` : ""), { good: true });
+        if (r.results.length) emit("threats", r.results[r.results.length - 1].threat);
+      } catch (err) { e.target.disabled = false; toast("Couldn't ignore", err.message, { bad: true, ms: 9000 }); }
+    };
+  });
+}
 function chooseResponse(t) {
   if (!t) return;
   const props = t.proposals || [];
@@ -1220,17 +1261,23 @@ VIEWS.threats = {
     this.filter = this.filter || "active";
     this.q = "";
     this.focus = params.id || "";
+    if (this.bundle === undefined) this.bundle = localStorage.getItem("mcc.threats.bundle") === "1";
+    this.collapsed = this.collapsed || new Set(["low", "info"]);
     m.innerHTML = `<div class="toolbar"><div class="seg" id="tf">${[["active", "Active"], ["mitigated", "Mitigated"], ["quiet", "Quiet / resolved"], ["ignored", "Ignored"], ["all", "All"], ["rules", "Ignore list"]]
       .map(([k, l]) => `<button data-f="${k}" class="${this.filter === k ? "on" : ""}">${l}${k === "rules" ? ' <b class="badge info" id="nb-ign"></b>' : ""}</button>`).join("")}</div>
-      <input type="text" id="tq" placeholder="Search threats, IPs…"><span class="grow"></span>
+      <input type="text" id="tq" placeholder="Search threats, IPs…">
+      <label class="check" style="font-size:12.5px;white-space:nowrap"><input type="checkbox" id="tbundle" ${this.bundle ? "checked" : ""}>Group by level</label>
+      <span class="grow"></span>
       <span class="note">MCC suggests responses; nothing changes on the router until you confirm one.</span></div>
       <div class="panel"><div class="feed" id="tlist"></div></div>`;
     $("#tf", m).onclick = (e) => { const b = e.target.closest("[data-f]"); if (!b) return; this.filter = b.dataset.f; $$("#tf button").forEach((x) => x.classList.toggle("on", x === b)); this.draw(); };
     $("#tq", m).oninput = (e) => { this.q = e.target.value.toLowerCase(); this.draw(); };
+    $("#tbundle", m).onchange = (e) => { this.bundle = e.target.checked; localStorage.setItem("mcc.threats.bundle", this.bundle ? "1" : "0"); this.draw(); };
     this.draw();
     if (this.focus) {
       const t = S.threats.get(this.focus);
       if (t && !this.match(t)) { this.filter = "all"; $$("#tf button").forEach((x) => x.classList.toggle("on", x.dataset.f === "all")); this.draw(); }
+      if (t && this.bundle) { this.collapsed.delete(SEV_ORDER[t.severity] !== undefined ? t.severity : "info"); this.draw(); }
       const el = $("#th-" + this.focus);
       if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("fresh"); }
     }
@@ -1252,10 +1299,56 @@ VIEWS.threats = {
     const list = sortedThreats((t) => this.match(t));
     const top = el.scrollTop;
     const nIgn = [...S.threats.values()].filter((t) => t.status === "ignored").length;
-    el.innerHTML = list.length ? list.map((t) => threatCard(t, true)).join("") :
+    el.innerHTML = list.length ? (this.bundle ? this.drawGroups(list) : list.map((t) => threatCard(t, true)).join("")) :
       `<div class="empty"><b>${this.filter === "active" ? "Nothing active" : "Nothing here"}</b>${this.filter === "active" ? "No open threats right now." + (nIgn ? ` ${nIgn} ignored as false positives.` : "") : ""}</div>`;
     el.scrollTop = top;
     bindThreatCards(el);
+    if (this.bundle && list.length) this.bindGroups(el);
+  },
+  drawGroups(list) {
+    const order = ["critical", "high", "medium", "low", "info"];
+    const groups = new Map();
+    for (const t of list) {
+      const sev = SEV_ORDER[t.severity] !== undefined ? t.severity : "info";
+      if (!groups.has(sev)) groups.set(sev, []);
+      groups.get(sev).push(t);
+    }
+    return order.filter((sev) => groups.has(sev)).map((sev) => {
+      const items = groups.get(sev);
+      const collapsed = this.collapsed.has(sev);
+      // bulk actions only ever apply to low (and info) severity — never to anything the server
+      // would consider escalated, since raise_threat() can bump a threat's severity at any time.
+      const eligible = items.filter((t) => t.status !== "ignored" && SEV_ORDER[t.severity] <= SEV_ORDER.low);
+      const ackable = eligible.filter((t) => t.status === "open");
+      const resolvable = eligible.filter((t) => t.status === "open" || t.status === "acknowledged" || t.status === "quiet");
+      const bulk = eligible.length ? `${ackable.length ? `<button class="btn sm" data-bulk="acknowledged" data-sev="${sev}">${ICON.check} Acknowledge ${ackable.length}</button>` : ""}
+        ${resolvable.length ? `<button class="btn sm ghost" data-bulk="resolved" data-sev="${sev}">Resolve ${resolvable.length}</button>` : ""}
+        <button class="btn sm ghost" data-bulk="ignore" data-sev="${sev}">${ICON.x} Ignore ${eligible.length}…</button>` : "";
+      return `<div class="tgroup">
+        <div class="tgroup-head" data-togrp="${sev}"><span class="sev sv-${sev}">${sev}</span><b>${items.length}</b><span class="faint" style="font-size:12px">threat${items.length === 1 ? "" : "s"}</span>
+          <span class="grow"></span>${bulk}<span class="chev faint">${collapsed ? "▸" : "▾"}</span></div>
+        ${collapsed ? "" : `<div class="tgroup-body">${items.map((t) => threatCard(t, true)).join("")}</div>`}
+      </div>`;
+    }).join("");
+  },
+  bindGroups(el) {
+    $$("[data-togrp]", el).forEach((h) => (h.onclick = (e) => {
+      if (e.target.closest("[data-bulk]")) return;
+      const sev = h.dataset.togrp;
+      if (this.collapsed.has(sev)) this.collapsed.delete(sev); else this.collapsed.add(sev);
+      this.draw();
+    }));
+    $$("[data-bulk]", el).forEach((b) => (b.onclick = (e) => {
+      e.stopPropagation();
+      const sev = b.dataset.sev, action = b.dataset.bulk;
+      const base = [...S.threats.values()].filter((t) => this.match(t) &&
+        (SEV_ORDER[t.severity] !== undefined ? t.severity : "info") === sev &&
+        SEV_ORDER[t.severity] <= SEV_ORDER.low && t.status !== "ignored");
+      const ids = base.filter((t) => action === "acknowledged" ? t.status === "open" :
+        action === "resolved" ? (t.status === "open" || t.status === "acknowledged" || t.status === "quiet") : true)
+        .map((t) => t.id);
+      if (action === "ignore") bulkIgnoreGroup(ids, sev); else bulkSetStatus(ids, action);
+    }));
   },
   drawRules(el) {
     const now = Date.now() / 1000;

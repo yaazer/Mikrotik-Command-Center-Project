@@ -535,6 +535,88 @@ def t_ignore_false_positives():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+@test
+def t_bulk_threat_actions():
+    tmp = tempfile.mkdtemp()
+    try:
+        d, _ = _detector(tmp)
+        now = time.time()
+        d.on_devices([], now)  # establish the baseline so the next call's devices count as "new"
+        d.on_devices([{"mac": "AA:00:00:00:00:0{}".format(i + 1), "ip": "192.168.88.{}".format(10 + i)}
+                     for i in range(3)], now)
+        lows = [t["id"] for t in d.list() if t["rule"] == "new_device"]
+        eq(len(lows), 3, "three new-device (low) threats")
+        med = d.raise_threat("cpu", "router", "medium", "Router CPU high", "x", now)
+        # the Detector's own bulk primitives don't filter by severity -- that's the HTTP layer's job (see t_server_security)
+        updated, skipped = d.bulk_set_status(lows + [med["id"]], "acknowledged")
+        eq(len(updated), 4, "bulk acknowledge updates every eligible (open) threat")
+        ok(all(d.threats[i]["status"] == "acknowledged" for i in lows), "lows acknowledged")
+        eq(d.threats[med["id"]]["status"], "acknowledged", "medium one too, at this layer")
+        updated2, skipped2 = d.bulk_set_status(lows, "acknowledged")
+        eq((len(updated2), len(skipped2)), (0, 3), "already-acknowledged threats are skipped, not re-applied")
+        updated3, _ = d.bulk_set_status(lows, "resolved")
+        eq(len(updated3), 3, "bulk resolve")
+        ok(all(d.threats[i]["status"] == "resolved" for i in lows), "all resolved")
+        # bulk ignore: one exact rule per threat, a single suppressions save/broadcast
+        d.on_devices([{"mac": "AA:00:00:00:00:1{}".format(i + 1), "ip": "192.168.88.{}".format(20 + i)}
+                     for i in range(3)], now)
+        fresh = [t["id"] for t in d.list() if t["rule"] == "new_device" and t["status"] == "open"]
+        eq(len(fresh), 3, "three fresh new-device threats")
+        results, skipped4 = d.bulk_ignore(fresh, note="known devices, added in bulk")
+        eq((len(results), len(skipped4)), (3, 0), "one ignore rule created per threat")
+        eq(len(d.suppressions), 3, "three new exact ignore rules")
+        ok(all(x["scope"] == "exact" for x in d.suppressions), "bulk ignore only ever uses scope 'exact'")
+        ok(all(d.threats[i]["status"] == "ignored" for i in fresh), "all three now ignored")
+        results2, skipped5 = d.bulk_ignore(fresh)
+        eq((len(results2), len(skipped5)), (0, 3), "already-ignored threats are skipped on a second bulk ignore")
+        # unknown ids are reported, not raised
+        _, skipped6 = d.bulk_set_status(["T99999"], "resolved")
+        eq(skipped6, [{"id": "T99999", "reason": "no such threat"}], "unknown id reported")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def t_threats_bulk_api():
+    with Env() as e:
+        httpd, _ = make_server(e.hub, "127.0.0.1", 0)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        port = httpd.server_address[1]
+        try:
+            now = time.time()
+            low1 = e.hub.detector.raise_threat("new_device", "AA:00:00:00:00:21", "low", "New device", "x", now,
+                                               subject="192.168.88.41", target="AA:00:00:00:00:21")
+            low2 = e.hub.detector.raise_threat("new_device", "AA:00:00:00:00:22", "low", "New device", "x", now,
+                                               subject="192.168.88.42", target="AA:00:00:00:00:22")
+            med = e.hub.detector.raise_threat("watchport", "192.168.88.21:6667", "medium", "IRC", "x", now,
+                                              subject="192.168.88.21", role="host")
+            ids = [low1["id"], low2["id"], med["id"]]
+            st, _, _ = _req(port, "POST", "/api/threats/bulk", {"ids": ids, "action": "acknowledged"})
+            eq(st, 403, "bulk needs X-MCC like every other change")
+            st, r, _ = _req(port, "POST", "/api/threats/bulk", {"ids": ids, "action": "acknowledged"}, {"X-MCC": "1"})
+            eq(st, 200, "bulk acknowledge")
+            eq(len(r["updated"]), 2, "only the two low threats are acknowledged")
+            eq({t["id"] for t in r["updated"]}, {low1["id"], low2["id"]}, "the medium one is left alone")
+            eq(r["skipped"], [{"id": med["id"], "reason": "no longer low severity"}], "medium one reported as skipped")
+            eq(e.hub.detector.threats[med["id"]]["status"], "open", "medium threat untouched by the bulk action")
+            st, r2, _ = _req(port, "POST", "/api/threats/bulk",
+                             {"ids": [low1["id"], low2["id"]], "action": "ignore", "duration": "7d", "note": "batch"},
+                             {"X-MCC": "1"})
+            eq(st, 200, "bulk ignore")
+            eq(len(r2["results"]), 2, "two ignore rules created")
+            ok(all(x["ignore"]["scope"] == "exact" and x["ignore"]["note"] == "batch" for x in r2["results"]),
+               "exact scope, note carried through")
+            st, lst, _ = _req(port, "GET", "/api/ignore")
+            eq(len(lst["rules"]), 2, "both rules listed")
+            st, _, _ = _req(port, "POST", "/api/threats/bulk", {"ids": [], "action": "acknowledged"}, {"X-MCC": "1"})
+            eq(st, 400, "empty ids rejected")
+            st, _, _ = _req(port, "POST", "/api/threats/bulk", {"ids": [med["id"]], "action": "nope"}, {"X-MCC": "1"})
+            eq(st, 400, "bad action rejected")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
 def _mmdb_bytes(prefixes):
     """A minimal MaxMind DB (IPv4 tree, 24-bit records) for the reader tests.
     prefixes: [(cidr, record dict | ('ptr', index of an earlier record))]"""

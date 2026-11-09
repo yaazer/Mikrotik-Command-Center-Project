@@ -303,9 +303,9 @@ class Detector:
                 return x
         return None
 
-    def suppress(self, *, rule: str, scope: str, key: str = "", subject: str = "", note: str = "",
-                 duration: str = "0", threat_id: str = "", title: str = "") -> Dict[str, Any]:
-        """Stop raising a confirmed false positive. Returns the new ignore rule."""
+    def _add_suppression(self, *, rule: str, scope: str, key: str = "", subject: str = "", note: str = "",
+                          duration: str = "0", threat_id: str = "", title: str = "") -> Dict[str, Any]:
+        """Build and record one ignore rule. Caller holds self.lock and must save + broadcast afterward."""
         if scope not in IGNORE_SCOPES:
             raise ValueError("scope must be one of {}".format(", ".join(IGNORE_SCOPES)))
         if duration not in IGNORE_DURATIONS:
@@ -321,28 +321,89 @@ class Detector:
             if scope == "subject" and rule not in RULES:
                 raise ValueError("unknown rule {!r}".format(rule))
         now = time.time()
+        self._sup_seq += 1
+        every = scope == "subject_any"
+        sup = {"id": "I{:04d}".format(self._sup_seq), "rule": "*" if every else rule,
+               "rule_name": "all rules" if every else RULES.get(rule, {}).get("name", rule),
+               "scope": scope, "key": key if scope == "exact" else "", "subject": subject,
+               "note": (note or "").strip()[:300], "title": (title or "")[:200], "threat_id": threat_id,
+               "created": now_iso(), "created_ts": now,
+               "expires": now + IGNORE_DURATIONS[duration] if IGNORE_DURATIONS[duration] else 0,
+               "hits": 0, "last_hit": 0}
+        self.suppressions.append(sup)
+        self._sup_log("added", sup)
+        # anything already raised that this covers is set aside too
+        for t in list(self.threats.values()):
+            if t["status"] in ("open", "acknowledged", "quiet") and \
+                    self._suppressed(t["rule"], t["key"], t.get("subject", ""), now) is sup:
+                t["ignored_by"] = sup["id"]
+                self.set_status(t["id"], "ignored", "ignored as a false positive ({}){}".format(
+                    sup["id"], ": " + sup["note"] if sup["note"] else ""))
+        return sup
+
+    def suppress(self, *, rule: str, scope: str, key: str = "", subject: str = "", note: str = "",
+                 duration: str = "0", threat_id: str = "", title: str = "") -> Dict[str, Any]:
+        """Stop raising a confirmed false positive. Returns the new ignore rule."""
         with self.lock:
-            self._sup_seq += 1
-            every = scope == "subject_any"
-            sup = {"id": "I{:04d}".format(self._sup_seq), "rule": "*" if every else rule,
-                   "rule_name": "all rules" if every else RULES.get(rule, {}).get("name", rule),
-                   "scope": scope, "key": key if scope == "exact" else "", "subject": subject,
-                   "note": (note or "").strip()[:300], "title": (title or "")[:200], "threat_id": threat_id,
-                   "created": now_iso(), "created_ts": now,
-                   "expires": now + IGNORE_DURATIONS[duration] if IGNORE_DURATIONS[duration] else 0,
-                   "hits": 0, "last_hit": 0}
-            self.suppressions.append(sup)
+            sup = self._add_suppression(rule=rule, scope=scope, key=key, subject=subject, note=note,
+                                         duration=duration, threat_id=threat_id, title=title)
             self._save_suppressions()
-            self._sup_log("added", sup)
-            # anything already raised that this covers is set aside too
-            for t in list(self.threats.values()):
-                if t["status"] in ("open", "acknowledged", "quiet") and \
-                        self._suppressed(t["rule"], t["key"], t.get("subject", ""), now) is sup:
-                    t["ignored_by"] = sup["id"]
-                    self.set_status(t["id"], "ignored", "ignored as a false positive ({}){}".format(
-                        sup["id"], ": " + sup["note"] if sup["note"] else ""))
             self.on_suppressions(self.suppressions_list())
             return dict(sup)
+
+    def bulk_set_status(self, ids: List[str], status: str,
+                         note: str = "") -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+        """Acknowledge or resolve several threats at once. Returns (updated, skipped)."""
+        if status not in ("acknowledged", "resolved", "open"):
+            raise ValueError("status must be acknowledged, resolved or open")
+        updated: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, str]] = []
+        with self.lock:
+            for tid in ids:
+                t = self.threats.get(tid)
+                if t is None:
+                    skipped.append({"id": tid, "reason": "no such threat"})
+                    continue
+                if status == "acknowledged" and t["status"] != "open":
+                    skipped.append({"id": tid, "reason": "not open"})
+                    continue
+                if status == "resolved" and t["status"] not in ("open", "acknowledged", "quiet"):
+                    skipped.append({"id": tid, "reason": "not active"})
+                    continue
+                updated.append(self.set_status(tid, status, note))
+        return updated, skipped
+
+    def bulk_ignore(self, ids: List[str], duration: str = "0",
+                     note: str = "") -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+        """Ignore several threats at once: one 'exact' ignore rule per threat. Returns (results, skipped),
+        where each result is {"ignore": <rule>, "threat": <updated threat>}."""
+        if duration not in IGNORE_DURATIONS:
+            raise ValueError("duration must be 24h, 7d, 30d or 0 (forever)")
+        results: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, str]] = []
+        created_any = False
+        with self.lock:
+            for tid in ids:
+                t = self.threats.get(tid)
+                if t is None:
+                    skipped.append({"id": tid, "reason": "no such threat"})
+                    continue
+                if t["status"] == "ignored":
+                    skipped.append({"id": tid, "reason": "already ignored"})
+                    continue
+                try:
+                    sup = self._add_suppression(rule=t["rule"], scope="exact", key=t["key"],
+                                                  subject=t.get("subject", ""), note=note, duration=duration,
+                                                  threat_id=t["id"], title=t.get("title", ""))
+                except ValueError as e:
+                    skipped.append({"id": tid, "reason": str(e)})
+                    continue
+                created_any = True
+                results.append({"ignore": sup, "threat": dict(self.threats[tid])})
+            if created_any:
+                self._save_suppressions()
+                self.on_suppressions(self.suppressions_list())
+        return results, skipped
 
     def unsuppress(self, sid: str, reason: str = "removed from the console") -> Dict[str, Any]:
         with self.lock:

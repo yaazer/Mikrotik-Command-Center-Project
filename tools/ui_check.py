@@ -226,6 +226,60 @@ def sc_ignore(d: Demo, c: Check) -> None:
         c(not b.errors, "no console errors: {}".format(b.errors[:3]))
 
 
+def sc_threats_bulk(d: Demo, c: Check) -> None:
+    now = time.time()
+    macs = ["AA:00:00:00:00:C{}".format(i) for i in range(3)]
+    for i, mac in enumerate(macs):
+        d.hub.detector.raise_threat("new_device", mac, "low", "New device", "joined the network", now,
+                                    subject="192.168.88.9{}".format(i), role="device", target=mac)
+    med = d.hub.detector.raise_threat("watchport", "192.168.88.21:6667", "medium", "IRC", "x", now,
+                                      subject="192.168.88.21", role="host")
+    with Browser(1600, 1000) as b:
+        b.nav(d.url + "#/threats")
+        c(b.until("document.querySelectorAll('#tlist [data-tid]').length > 0", 15), "threats listed")
+        c(b.eval("document.querySelector('#tbundle') !== null"), "Group by level toggle is present")
+        click(b, "#tbundle")
+        c(b.until("document.querySelector('.tgroup [data-togrp=\"low\"]') !== null", 10), "a low-severity group renders")
+        ok_med = b.until("document.querySelector('.tgroup [data-togrp=\"medium\"]') !== null", 5)
+        if ok_med:
+            c(b.eval("document.querySelector('.tgroup [data-togrp=\"medium\"] [data-bulk]') === null"),
+              "the medium group offers no bulk actions")
+        shot(b, "threats-grouped")
+        ok = b.until("document.querySelector('.tgroup [data-togrp=\"low\"] [data-bulk=\"acknowledged\"]') !== null", 5)
+        c(ok, "low group offers a bulk Acknowledge button")
+        if not ok:
+            return
+        click(b, '.tgroup [data-togrp="low"] [data-bulk="acknowledged"]')
+        c(b.until("[...document.querySelectorAll('.toast')].some(t => /acknowledged/.test(t.innerText))", 5),
+          "a toast confirms the bulk acknowledge")
+        c(all(d.hub.detector.threats[tid]["status"] == "acknowledged" for mac in macs
+              for tid in [d.hub.detector.by_key.get(("new_device", mac))] if tid),
+          "the server shows all three low threats acknowledged")
+        c(d.hub.detector.threats[med["id"]]["status"] == "open", "the medium threat was left alone")
+        ok2 = b.until("document.querySelector('.tgroup [data-togrp=\"low\"] [data-bulk=\"ignore\"]') !== null", 5)
+        c(ok2, "low group still offers bulk Ignore after acknowledging")
+        if not ok2:
+            return
+        click(b, '.tgroup [data-togrp="low"] [data-bulk="ignore"]')
+        c(b.until("document.querySelectorAll('.modal #idur button').length >= 1", 5), "bulk-ignore dialog opens")
+        b.eval("document.querySelector('#idur [data-d=\"7d\"]').click()")
+        b.eval("document.querySelector('#inote').value = 'bulk-confirmed in ui_check'")
+        shot(b, "threats-bulk-ignore-dialog")
+        click(b, ".modal [data-go]")
+        c(b.until("!document.querySelector('#modal').classList.contains('open')", 5), "dialog closes")
+        c(b.until("[...document.querySelectorAll('.toast')].some(t => /^Ignoring \\d+ threats/.test(t.innerText))", 5),
+          "a toast confirms the threats were ignored")
+        c(all(d.hub.detector.threats[d.hub.detector.by_key[("new_device", mac)]]["status"] == "ignored" for mac in macs),
+          "the server marks all three new_device threats ignored")
+        c(sum(1 for s in d.hub.detector.suppressions if s["threat_id"] in
+              {d.hub.detector.by_key[("new_device", mac)] for mac in macs}) == 3,
+          "one exact ignore rule per threat")
+        b.eval("document.querySelector('#tf [data-f=all]').click()")
+        c(b.until("document.querySelector('.tgroup [data-togrp=\"low\"]') !== null", 5), "ignored lows still group under All")
+        shot(b, "threats-grouped-ignored")
+        c(not b.errors, "no console errors: {}".format(b.errors[:3]))
+
+
 def drag(b: Browser, x0: float, y0: float, x1: float, y1: float) -> None:
     b.call("Input.dispatchMouseEvent", type="mouseMoved", x=x0, y=y0)
     b.call("Input.dispatchMouseEvent", type="mousePressed", x=x0, y=y0, button="left", clickCount=1)
@@ -919,7 +973,8 @@ def sc_advisor(d: Demo, c: Check) -> None:
 SCENARIOS = {"pages": sc_pages, "advisor": sc_advisor, "identify": sc_identify, "identity-override": sc_identity_override, "setup": sc_setup, "respond": sc_respond, "ignore": sc_ignore, "layout": sc_layout, "globe-fade": sc_globe_fade, "theme": sc_theme, "update": sc_update, "types": sc_types, "drawer": sc_drawer, "phone": sc_phone,
              "light": sc_light, "offscreen": sc_offscreen,
              "single-out": sc_single_out, "globe-fit": sc_globe_fit,
-             "vpn": sc_vpn, "lan": sc_lan, "topology": sc_topology}
+             "vpn": sc_vpn, "lan": sc_lan, "topology": sc_topology,
+             "threats-bulk": sc_threats_bulk}  # last: leaves ack'd/ignored threats and ignore rules behind
 
 
 def main(argv) -> int:
